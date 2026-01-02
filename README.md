@@ -136,10 +136,6 @@ Contributions are welcome! To add support for additional device types:
 2. Add the device type to the appropriate platform file
 3. Submit a pull request
 
-## Did I use an AI tool to build this in two hours?
-
-Hell yes I did!
-
 ## License
 
 GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
