@@ -136,7 +136,10 @@ class YoLinkMQTTClient:
             event = DeviceEvent.from_payload(payload)
             for callback in self._callbacks:
                 try:
-                    callback(event)
+                    if self._loop:
+                        self._loop.call_soon_threadsafe(callback, event)
+                    else:
+                        callback(event)
                 except Exception:
                     _LOGGER.exception("Error in event callback")
         except json.JSONDecodeError:
