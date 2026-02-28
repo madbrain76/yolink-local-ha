@@ -105,11 +105,67 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     def _on_device_event(self, event: DeviceEvent) -> None:
         """Handle a device event from MQTT."""
         device_id = event.device_id
-        if device_id not in self._devices:
+        device = self._devices.get(device_id)
+        if device is None:
             _LOGGER.debug("Ignoring event for unknown device: %s", device_id)
             return
 
-        self._states[device_id] = event.data
+        # TH/Temp: merge MQTT report into existing API state so partial reports do
+        # not drop diagnostic fields (e.g. firmware/version).
+        if device.device_type == "THSensor":
+            existing_state = self._states.get(device_id, {})
+            event_data = event.data if isinstance(event.data, dict) else {}
+
+            new_state = {**existing_state, **event_data}
+
+            merged_state_obj: dict[str, Any] = {}
+            if isinstance(existing_state.get("state"), dict):
+                merged_state_obj.update(existing_state["state"])
+
+            event_state_obj = event_data.get("state")
+            if isinstance(event_state_obj, dict):
+                merged_state_obj.update(event_state_obj)
+            elif event_state_obj is not None:
+                merged_state_obj["state"] = event_state_obj
+
+            # TH reports often publish flat keys at top-level (temperature, humidity, mode...)
+            # Fold them into nested state while keeping top-level copies for fallback readers.
+            for key, value in event_data.items():
+                if key in {"state", "online", "reportAt"}:
+                    continue
+                if value is None and key in {"temperature", "humidity", "mode", "version"}:
+                    continue
+                merged_state_obj[key] = value
+
+            if merged_state_obj:
+                new_state["state"] = merged_state_obj
+
+            self._states[device_id] = new_state
+            self.async_set_updated_data(self._states.copy())
+            return
+
+        # Deep merge event data with existing state to preserve diagnostic info
+        existing_state = self._states.get(device_id, {})
+        new_state = {**existing_state, **event.data}
+
+        # Merge nested "state" object if present in both
+        # Handle both formats: state as dict {"state": {...}} or flat {"state": "alert"}
+        if "state" in existing_state and "state" in event.data:
+            existing_state_obj = existing_state["state"]
+            event_state_obj = event.data["state"]
+
+            # Both are dicts - merge them
+            if isinstance(existing_state_obj, dict) and isinstance(event_state_obj, dict):
+                new_state["state"] = {**existing_state_obj, **event_state_obj}
+            # Event has dict, existing has string - use event's dict
+            elif isinstance(event_state_obj, dict):
+                new_state["state"] = event_state_obj
+            # Event has string, existing has dict - update the nested "state" field
+            elif isinstance(existing_state_obj, dict):
+                new_state["state"] = {**existing_state_obj, "state": event_state_obj}
+            # Both are strings - just use the event's value (already in new_state)
+
+        self._states[device_id] = new_state
         self.async_set_updated_data(self._states.copy())
 
     def get_state(self, device_id: str) -> dict[str, Any]:
@@ -159,4 +215,3 @@ async def create_coordinator(
     except Exception:
         await session.close()
         raise
-

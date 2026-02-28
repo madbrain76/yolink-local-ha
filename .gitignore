@@ -211,3 +211,6 @@ __marimo__/
 
 # Local dashboard file (not part of the integration)
 security.yaml
+
+cr/
+

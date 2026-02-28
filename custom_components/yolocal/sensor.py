@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -11,6 +13,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity import EntityCategory
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import YoLocalCoordinator
@@ -27,13 +31,135 @@ async def async_setup_entry(
 
     entities: list[SensorEntity] = []
     for device in coordinator.devices.values():
+        # All devices get battery, firmware, and last reported sensors
+        entities.append(YoLocalBatterySensor(coordinator, device))
+        entities.append(YoLocalFirmwareSensor(coordinator, device))
+        entities.append(YoLocalLastReportedSensor(coordinator, device))
+        # Device-specific sensors
         if device.device_type == "THSensor":
+            has_threshold_sensors = device.model not in {"YS8003-UC", "YS8004-UC"}
             entities.append(YoLocalTemperatureSensor(coordinator, device))
-            entities.append(YoLocalHumiditySensor(coordinator, device))
-            entities.append(YoLocalBatterySensor(coordinator, device))
+            # YS8003-UC has an LCD that can toggle C/F display.
+            if device.display_type == "THSensor":
+                entities.append(YoLocalTHModeSensor(coordinator, device))
+            entities.append(YoLocalTHIntervalSensor(coordinator, device))
+            entities.append(YoLocalTHCorrectionSensor(coordinator, device, "temperature"))
+            # Threshold entities are disabled for models with broken/sentinel limits.
+            if has_threshold_sensors:
+                entities.append(YoLocalTHLimitSensor(coordinator, device, "temperature", "max"))
+                entities.append(YoLocalTHLimitSensor(coordinator, device, "temperature", "min"))
+            # YS8004-UC is temperature-only.
+            if device.display_type != "TempSensor":
+                entities.append(YoLocalHumiditySensor(coordinator, device))
+                entities.append(YoLocalTHCorrectionSensor(coordinator, device, "humidity"))
+                if has_threshold_sensors:
+                    entities.append(YoLocalTHLimitSensor(coordinator, device, "humidity", "max"))
+                    entities.append(YoLocalTHLimitSensor(coordinator, device, "humidity", "min"))
+        elif device.device_type == "MotionSensor":
+            entities.append(YoLocalDeviceTemperatureSensor(coordinator, device))
+            entities.append(YoLocalMotionSensitivitySensor(coordinator, device))
+            entities.append(YoLocalMotionNoMotionDelaySensor(coordinator, device))
+            entities.append(YoLocalMotionAlertIntervalSensor(coordinator, device))
+        elif device.device_type == "LeakSensor":
+            entities.append(YoLocalDeviceTemperatureSensor(coordinator, device))
+            entities.append(YoLocalLeakSensorModeSensor(coordinator, device))
+            entities.append(YoLocalLeakIntervalSensor(coordinator, device))
+        elif device.device_type == "DoorSensor":
+            entities.append(YoLocalDoorDelaySensor(coordinator, device))
+            entities.append(YoLocalDoorOpenRemindDelaySensor(coordinator, device))
+            entities.append(YoLocalDoorAlertIntervalSensor(coordinator, device))
 
     async_add_entities(entities)
 
+
+# ============================================================================
+# Universal Sensors (all devices)
+# ============================================================================
+
+class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
+    """Battery sensor for YoLink devices."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Battery"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_battery"
+
+    @property
+    def available(self) -> bool:
+        """Battery sensor is always available - shows 0% when device unavailable."""
+        return True
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the battery level as percentage."""
+        # Return 0% if parent entity would be unavailable
+        if not super().available:
+            return 0
+
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            level = state.get("battery")
+        else:
+            level = self.device_state.get("battery")
+
+        if level is None:
+            return None
+        # YoLink reports 0-4, convert to percentage
+        return min(level * 25, 100)
+
+
+class YoLocalFirmwareSensor(YoLocalEntity, SensorEntity):
+    """Firmware version sensor for YoLink devices."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Firmware"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_firmware"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the firmware version."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            value = state.get("version")
+            if value is not None:
+                return value
+        return self.device_state.get("version")
+
+
+class YoLocalLastReportedSensor(YoLocalEntity, SensorEntity):
+    """Last reported timestamp sensor for YoLink devices."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Last reported"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_last_reported"
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return the last reported timestamp."""
+        report_at = self.device_state.get("reportAt")
+        if report_at:
+            return dt_util.parse_datetime(report_at)
+        return None
+
+
+# ============================================================================
+# THSensor-specific sensors
+# ============================================================================
 
 class YoLocalTemperatureSensor(YoLocalEntity, SensorEntity):
     """Temperature sensor for YoLink THSensor."""
@@ -53,7 +179,9 @@ class YoLocalTemperatureSensor(YoLocalEntity, SensorEntity):
         """Return the temperature."""
         state = self.device_state.get("state", {})
         if isinstance(state, dict):
-            return state.get("temperature")
+            value = state.get("temperature")
+            if value is not None:
+                return value
         return self.device_state.get("temperature")
 
 
@@ -75,34 +203,368 @@ class YoLocalHumiditySensor(YoLocalEntity, SensorEntity):
         """Return the humidity."""
         state = self.device_state.get("state", {})
         if isinstance(state, dict):
-            return state.get("humidity")
+            value = state.get("humidity")
+            if value is not None:
+                return value
         return self.device_state.get("humidity")
 
 
-class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
-    """Battery sensor for YoLink devices."""
+class YoLocalTHModeSensor(YoLocalEntity, SensorEntity):
+    """Temperature unit mode sensor for YoLink THSensor."""
 
-    _attr_device_class = SensorDeviceClass.BATTERY
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = PERCENTAGE
-    _attr_name = "Battery"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "LCD temperature unit"
 
     def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, device)
-        self._attr_unique_id = f"{device.device_id}_battery"
+        self._attr_unique_id = f"{device.device_id}_temp_unit"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the LCD display temperature unit (C/F)."""
+        state = self.device_state.get("state", {})
+        mode = None
+        if isinstance(state, dict):
+            # Different firmware payloads may use different keys/encodings.
+            mode = (
+                state.get("mode")
+                or state.get("tempUnit")
+                or state.get("temperatureUnit")
+                or state.get("unit")
+            )
+        if mode is None:
+            mode = (
+                self.device_state.get("mode")
+                or self.device_state.get("tempUnit")
+                or self.device_state.get("temperatureUnit")
+                or self.device_state.get("unit")
+            )
+        if mode is None:
+            return None
+
+        normalized = str(mode).strip().lower()
+        if normalized in {"c", "0", "celsius", "centigrade", "cel"}:
+            return "C"
+        if normalized in {"f", "1", "fahrenheit", "fahr"}:
+            return "F"
+        return str(mode).upper()
+
+
+class YoLocalTHIntervalSensor(YoLocalEntity, SensorEntity):
+    """Reporting interval sensor for YoLink THSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "min"
+    _attr_name = "Reporting interval"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_interval"
 
     @property
     def native_value(self) -> int | None:
-        """Return the battery level as percentage."""
+        """Return the reporting interval."""
         state = self.device_state.get("state", {})
         if isinstance(state, dict):
-            level = state.get("battery")
+            value = state.get("interval")
+            if value is not None:
+                return value
+        return self.device_state.get("interval")
+
+
+class YoLocalTHCorrectionSensor(YoLocalEntity, SensorEntity):
+    """Calibration correction sensor for YoLink THSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: YoLocalCoordinator, device, measurement_type: str) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._measurement_type = measurement_type
+        if measurement_type == "temperature":
+            self._attr_name = "Temperature correction"
+            self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+            # This is an offset, not an absolute temperature reading.
+            # Keep it as a plain numeric value to avoid C->F +32 conversion.
+            self._attr_unique_id = f"{device.device_id}_temp_correction"
         else:
-            level = self.device_state.get("battery")
+            self._attr_name = "Humidity correction"
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_device_class = SensorDeviceClass.HUMIDITY
+            self._attr_unique_id = f"{device.device_id}_humidity_correction"
 
-        if level is None:
-            return None
-        # YoLink reports 0-4, convert to percentage
-        return min(level * 25, 100)
+    @property
+    def native_value(self) -> int | None:
+        """Return the calibration correction value."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            if self._measurement_type == "temperature":
+                value = state.get("tempCorrection")
+                if value is not None:
+                    return value
+                return self.device_state.get("tempCorrection")
+            value = state.get("humidityCorrection")
+            if value is not None:
+                return value
+            return self.device_state.get("humidityCorrection")
+        if self._measurement_type == "temperature":
+            return self.device_state.get("tempCorrection")
+        return self.device_state.get("humidityCorrection")
 
+
+class YoLocalTHLimitSensor(YoLocalEntity, SensorEntity):
+    """Alarm threshold limit sensor for YoLink THSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: YoLocalCoordinator, device, measurement_type: str, limit_type: str) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._measurement_type = measurement_type
+        self._limit_type = limit_type
+        limit_name = "max" if limit_type == "max" else "min"
+        if measurement_type == "temperature":
+            self._attr_name = f"Temperature {limit_name} threshold"
+            self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+            self._attr_device_class = SensorDeviceClass.TEMPERATURE
+            self._attr_unique_id = f"{device.device_id}_temp_{limit_type}"
+        else:
+            self._attr_name = f"Humidity {limit_name} threshold"
+            self._attr_native_unit_of_measurement = PERCENTAGE
+            self._attr_device_class = SensorDeviceClass.HUMIDITY
+            self._attr_unique_id = f"{device.device_id}_humidity_{limit_type}"
+
+    @property
+    def native_value(self) -> int | float | None:
+        """Return the alarm threshold."""
+        state = self.device_state.get("state", {})
+        if self._measurement_type == "temperature":
+            limits = state.get("tempLimit", {}) if isinstance(state, dict) else {}
+            if not isinstance(limits, dict):
+                limits = self.device_state.get("tempLimit", {})
+        else:
+            limits = state.get("humidityLimit", {}) if isinstance(state, dict) else {}
+            if not isinstance(limits, dict):
+                limits = self.device_state.get("humidityLimit", {})
+
+        if isinstance(limits, dict):
+            value = limits.get(self._limit_type)
+            # Filter out sentinel values that indicate disabled/unset limits
+            # Temperature: < -100 or > 100 Celsius are unrealistic
+            # Humidity: < 0 or > 100 are invalid
+            if value is not None:
+                if self._measurement_type == "temperature":
+                    if value < -100 or value > 100:
+                        return None
+                else:
+                    if value < 0 or value > 100:
+                        return None
+            return value
+        return None
+
+
+# ============================================================================
+# MotionSensor/LeakSensor device temperature sensor
+# ============================================================================
+
+class YoLocalDeviceTemperatureSensor(YoLocalEntity, SensorEntity):
+    """Device internal temperature sensor for YoLink sensors."""
+
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Device temperature"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_dev_temperature"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the device temperature."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("devTemperature")
+        return None
+
+
+# ============================================================================
+# MotionSensor-specific sensors
+# ============================================================================
+
+class YoLocalMotionSensitivitySensor(YoLocalEntity, SensorEntity):
+    """Sensitivity sensor for YoLink MotionSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Sensitivity"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_sensitivity"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the sensitivity level (1-5)."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("sensitivity")
+        return None
+
+
+class YoLocalMotionNoMotionDelaySensor(YoLocalEntity, SensorEntity):
+    """No-motion delay sensor for YoLink MotionSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "min"
+    _attr_name = "No-motion delay"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_nomotion_delay"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the no-motion delay in minutes."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("nomotionDelay")
+        return None
+
+
+class YoLocalMotionAlertIntervalSensor(YoLocalEntity, SensorEntity):
+    """Alert interval sensor for YoLink MotionSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "min"
+    _attr_name = "Alert interval"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_alert_interval"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the alert interval."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("alertInterval")
+        return None
+
+
+# ============================================================================
+# LeakSensor-specific sensors
+# ============================================================================
+
+class YoLocalLeakSensorModeSensor(YoLocalEntity, SensorEntity):
+    """Sensor mode sensor for YoLink LeakSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Sensor mode"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_sensor_mode"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the sensor mode."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("sensorMode")
+        return None
+
+
+class YoLocalLeakIntervalSensor(YoLocalEntity, SensorEntity):
+    """Reporting interval sensor for YoLink LeakSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "min"
+    _attr_name = "Reporting interval"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_interval"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the reporting interval."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("interval")
+        return None
+
+
+# ============================================================================
+# DoorSensor-specific sensors
+# ============================================================================
+
+class YoLocalDoorDelaySensor(YoLocalEntity, SensorEntity):
+    """Delay sensor for YoLink DoorSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "s"
+    _attr_name = "Delay"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_delay"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the delay in seconds."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("delay")
+        return None
+
+
+class YoLocalDoorOpenRemindDelaySensor(YoLocalEntity, SensorEntity):
+    """Open remind delay sensor for YoLink DoorSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "min"
+    _attr_name = "Open remind delay"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_open_remind_delay"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the open remind delay in minutes."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("openRemindDelay")
+        return None
+
+
+class YoLocalDoorAlertIntervalSensor(YoLocalEntity, SensorEntity):
+    """Alert interval sensor for YoLink DoorSensor."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "min"
+    _attr_name = "Alert interval"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_alert_interval"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the alert interval."""
+        state = self.device_state.get("state", {})
+        if isinstance(state, dict):
+            return state.get("alertInterval")
+        return None
