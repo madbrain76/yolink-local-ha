@@ -7,11 +7,22 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import paho.mqtt.client as mqtt
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_mqtt_time(timestamp_ms: Any) -> str | None:
+    """Convert hub MQTT `time` (epoch milliseconds) to ISO-8601 UTC."""
+    if timestamp_ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(timestamp_ms) / 1000, UTC).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 @dataclass
@@ -26,15 +37,36 @@ class DeviceEvent:
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> DeviceEvent:
         """Create a DeviceEvent from MQTT payload."""
+        raw_data = payload.get("data")
+        if raw_data is None and isinstance(payload.get("params"), dict):
+            params = payload["params"]
+            raw_data = params.get("data", params)
+        if raw_data is None and "state" in payload:
+            raw_data = {"state": payload.get("state")}
+
+        if isinstance(raw_data, dict):
+            event_data = dict(raw_data)
+        elif raw_data is not None:
+            event_data = {"state": raw_data}
+        else:
+            event_data = {}
+
+        if mqtt_time := _normalize_mqtt_time(payload.get("time")):
+            # MQTT reports use top-level `time`; they do not include `reportAt`.
+            event_data["lastReportedAt"] = mqtt_time
+        if "online" not in event_data and "online" in payload:
+            event_data["online"] = payload.get("online")
+
         return cls(
             device_id=payload.get("deviceId", ""),
             event=payload.get("event", ""),
-            data=payload.get("data", {}),
+            data=event_data,
             raw=payload,
         )
 
 
 EventCallback = Callable[[DeviceEvent], None]
+DisconnectCallback = Callable[[], None]
 
 
 class YoLinkMQTTClient:
@@ -56,6 +88,7 @@ class YoLinkMQTTClient:
         self._access_token = access_token
         self._client: mqtt.Client | None = None
         self._callbacks: list[EventCallback] = []
+        self._disconnect_callbacks: list[DisconnectCallback] = []
         self._connected = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -68,6 +101,11 @@ class YoLinkMQTTClient:
         """Subscribe to device events. Returns unsubscribe function."""
         self._callbacks.append(callback)
         return lambda: self._callbacks.remove(callback)
+
+    def on_disconnect(self, callback: DisconnectCallback) -> Callable[[], None]:
+        """Subscribe to disconnect notifications. Returns unsubscribe function."""
+        self._disconnect_callbacks.append(callback)
+        return lambda: self._disconnect_callbacks.remove(callback)
 
     async def connect(self) -> None:
         """Connect to the MQTT broker."""
@@ -123,6 +161,14 @@ class YoLinkMQTTClient:
         """Handle disconnection."""
         _LOGGER.warning("Disconnected from MQTT broker: %s", rc)
         self._connected.clear()
+        for callback in self._disconnect_callbacks:
+            try:
+                if self._loop:
+                    self._loop.call_soon_threadsafe(callback)
+                else:
+                    callback()
+            except Exception:
+                _LOGGER.exception("Error in disconnect callback")
 
     def _on_message(
         self,
@@ -146,4 +192,3 @@ class YoLinkMQTTClient:
             _LOGGER.error("Failed to decode MQTT message: %s", msg.payload)
         except Exception:
             _LOGGER.exception("Error processing MQTT message")
-

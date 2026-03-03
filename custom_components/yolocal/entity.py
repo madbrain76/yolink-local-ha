@@ -63,7 +63,7 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
         if not state.get("online", True):
             return False
         # Check if device has reported within last 12 hours
-        report_at = state.get("reportAt")
+        report_at = state.get("lastReportedAt")
         if report_at:
             try:
                 last_report = dt_util.parse_datetime(report_at)

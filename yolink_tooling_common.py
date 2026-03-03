@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -53,12 +54,22 @@ def normalize_event_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any
     else:
         event_data = {}
 
-    if "reportAt" not in event_data and payload.get("time"):
-        event_data["reportAt"] = payload.get("time")
+    if mqtt_time := normalize_mqtt_time(payload.get("time")):
+        event_data["lastReportedAt"] = mqtt_time
     if "online" not in event_data and "online" in payload:
         event_data["online"] = payload.get("online")
 
     return device_id, event_data
+
+
+def normalize_mqtt_time(timestamp_ms: Any) -> str | None:
+    """Convert hub MQTT `time` (epoch milliseconds) to ISO-8601 UTC."""
+    if timestamp_ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(timestamp_ms) / 1000, UTC).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def merge_state(existing_state: dict[str, Any], event_data: dict[str, Any]) -> dict[str, Any]:
@@ -77,7 +88,7 @@ def merge_state(existing_state: dict[str, Any], event_data: dict[str, Any]) -> d
             merged_state_obj["state"] = event_state_obj
 
         for key, value in event_data.items():
-            if key in {"online", "reportAt", "state"}:
+            if key in {"online", "reportAt", "lastReportedAt", "state"}:
                 continue
             merged_state_obj[key] = value
             new_state.pop(key, None)

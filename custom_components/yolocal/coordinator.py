@@ -19,6 +19,7 @@ from .api import (
     YoLinkMQTTClient,
 )
 from .api.auth import AuthenticationError
+from .const import STATE_REFRESH_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             hass,
             _LOGGER,
             name="YoLink Local",
+            update_interval=STATE_REFRESH_INTERVAL,
         )
         self._client = client
         self._token_manager = token_manager
@@ -53,6 +55,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._mqtt_client: YoLinkMQTTClient | None = None
         self._devices: dict[str, Device] = {}
         self._states: dict[str, dict[str, Any]] = {}
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._shutdown = False
 
     @property
     def devices(self) -> dict[str, Device]:
@@ -67,15 +71,30 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device in devices:
             try:
                 state = await self._client.get_state(device)
+                # HTTP `getState` uses `reportAt`; store a normalized internal field
+                # that later MQTT `time` updates can overwrite consistently.
+                if state.get("reportAt") and "lastReportedAt" not in state:
+                    state["lastReportedAt"] = state["reportAt"]
                 self._states[device.device_id] = state
             except Exception:
                 _LOGGER.warning("Failed to get initial state for %s", device.name)
                 self._states[device.device_id] = {}
 
-        await self._connect_mqtt()
+        try:
+            await self._connect_mqtt()
+        except Exception:
+            _LOGGER.warning(
+                "Initial MQTT connection failed; reconnecting in background",
+                exc_info=True,
+            )
+            self._on_mqtt_disconnect()
 
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
+        self._shutdown = True
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         if self._mqtt_client:
             await self._mqtt_client.disconnect()
             self._mqtt_client = None
@@ -86,20 +105,27 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         token = await self._token_manager.get_token()
         host = self._client.host
 
-        self._mqtt_client = YoLinkMQTTClient(
+        mqtt_client = YoLinkMQTTClient(
             host=host,
             net_id=self._net_id,
             client_id=self._token_manager.client_id,
             access_token=token,
             port=self._mqtt_port,
         )
-        self._mqtt_client.subscribe(self._on_device_event)
+        mqtt_client.subscribe(self._on_device_event)
+        mqtt_client.on_disconnect(self._on_mqtt_disconnect)
 
         try:
-            await self._mqtt_client.connect()
+            await mqtt_client.connect()
+            self._mqtt_client = mqtt_client
             _LOGGER.info("Connected to YoLink MQTT broker")
         except Exception:
+            try:
+                await mqtt_client.disconnect()
+            except Exception:
+                _LOGGER.debug("Error while cleaning up failed MQTT client", exc_info=True)
             _LOGGER.exception("Failed to connect to MQTT broker")
+            raise
 
     @callback
     def _on_device_event(self, event: DeviceEvent) -> None:
@@ -131,7 +157,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             # TH reports often publish flat keys at top-level (temperature, humidity, mode...)
             # Fold them into nested state while keeping top-level copies for fallback readers.
             for key, value in event_data.items():
-                if key in {"state", "online", "reportAt"}:
+                if key in {"state", "online", "reportAt", "lastReportedAt"}:
                     continue
                 if value is None and key in {"temperature", "humidity", "mode", "version"}:
                     continue
@@ -167,6 +193,36 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         self._states[device_id] = new_state
         self.async_set_updated_data(self._states.copy())
+
+    @callback
+    def _on_mqtt_disconnect(self) -> None:
+        """Reconnect MQTT when the broker disconnects."""
+        if self._shutdown:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self.hass.async_create_task(self._async_reconnect_mqtt())
+
+    async def _async_reconnect_mqtt(self) -> None:
+        """Reconnect the MQTT client with backoff and a refreshed token."""
+        backoff_seconds = 5
+        while not self._shutdown:
+            try:
+                if self._mqtt_client:
+                    await self._mqtt_client.disconnect()
+                    self._mqtt_client = None
+                await self._connect_mqtt()
+                if self._mqtt_client is not None:
+                    return
+            except Exception:
+                _LOGGER.exception("Failed to reconnect MQTT broker")
+
+            await asyncio.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 300)
+
+    async def _async_update_data(self) -> dict[str, dict[str, Any]]:
+        """Republish cached state so availability can age out silent devices."""
+        return self._states.copy()
 
     def get_state(self, device_id: str) -> dict[str, Any]:
         """Get the current state for a device."""

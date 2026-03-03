@@ -92,13 +92,12 @@ class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        """Battery sensor is always available - shows 0% when device unavailable."""
+        """Battery sensor is always available with the last known value."""
         return True
 
     @property
     def native_value(self) -> int | None:
         """Return the battery level as percentage."""
-        # Return 0% if parent entity would be unavailable
         if not super().available:
             return 0
 
@@ -149,9 +148,14 @@ class YoLocalLastReportedSensor(YoLocalEntity, SensorEntity):
         self._attr_unique_id = f"{device.device_id}_last_reported"
 
     @property
+    def available(self) -> bool:
+        """Keep the diagnostic timestamp available when a value exists."""
+        return self.native_value is not None
+
+    @property
     def native_value(self) -> datetime | None:
         """Return the last reported timestamp."""
-        report_at = self.device_state.get("reportAt")
+        report_at = self.device_state.get("lastReportedAt")
         if report_at:
             return dt_util.parse_datetime(report_at)
         return None
