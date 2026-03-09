@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import Any
 
 import aiohttp
@@ -22,12 +23,16 @@ from .api.auth import AuthenticationError
 
 _LOGGER = logging.getLogger(__name__)
 
+# Polling interval as fallback when MQTT events are missed
+UPDATE_INTERVAL = timedelta(minutes=5)
+
 
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     """Coordinator for YoLink Local devices.
 
     Manages MQTT subscription for real-time updates and provides
-    device state to entities.
+    device state to entities. Falls back to HTTP polling every 5 minutes
+    to ensure state stays current if MQTT events are missed.
     """
 
     def __init__(
@@ -44,6 +49,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             hass,
             _LOGGER,
             name="YoLink Local",
+            update_interval=UPDATE_INTERVAL,
         )
         self._client = client
         self._token_manager = token_manager
@@ -64,15 +70,27 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         devices = await self._client.get_devices()
         self._devices = {d.device_id: d for d in devices}
 
-        for device in devices:
+        await self._fetch_all_states()
+        await self._connect_mqtt()
+
+    async def _fetch_all_states(self) -> None:
+        """Fetch current state for all devices via HTTP API."""
+        for device in self._devices.values():
             try:
                 state = await self._client.get_state(device)
                 self._states[device.device_id] = state
             except Exception:
-                _LOGGER.warning("Failed to get initial state for %s", device.name)
-                self._states[device.device_id] = {}
+                _LOGGER.warning("Failed to get state for %s", device.name)
+                self._states.setdefault(device.device_id, {})
 
-        await self._connect_mqtt()
+    async def _async_update_data(self) -> dict[str, dict[str, Any]]:
+        """Poll device states via HTTP as a fallback.
+
+        This runs periodically (every 5 minutes) to ensure state stays
+        current even if MQTT events are missed or the connection drops.
+        """
+        await self._fetch_all_states()
+        return self._states.copy()
 
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
@@ -103,13 +121,19 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     @callback
     def _on_device_event(self, event: DeviceEvent) -> None:
-        """Handle a device event from MQTT."""
+        """Handle a device event from MQTT.
+
+        Merges incoming event data with the existing device state so that
+        partial events (e.g. connectivity-only updates) don't wipe out
+        previously known sensor readings like temperature and humidity.
+        """
         device_id = event.device_id
         if device_id not in self._devices:
             _LOGGER.debug("Ignoring event for unknown device: %s", device_id)
             return
 
-        self._states[device_id] = event.data
+        existing = self._states.get(device_id, {})
+        self._states[device_id] = {**existing, **event.data}
         self.async_set_updated_data(self._states.copy())
 
     def get_state(self, device_id: str) -> dict[str, Any]:
