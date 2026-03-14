@@ -59,6 +59,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._mqtt_client: YoLinkMQTTClient | None = None
         self._devices: dict[str, Device] = {}
         self._states: dict[str, dict[str, Any]] = {}
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._shutdown = False
 
     @property
     def devices(self) -> dict[str, Device]:
@@ -71,14 +73,23 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._devices = {d.device_id: d for d in devices}
 
         await self._fetch_all_states()
-        await self._connect_mqtt()
+        try:
+            await self._connect_mqtt()
+        except Exception:
+            _LOGGER.warning(
+                "Initial MQTT connection failed; reconnecting in background",
+                exc_info=True,
+            )
+            self._on_mqtt_disconnect()
+
+        self.async_set_updated_data(self._states.copy())
 
     async def _fetch_all_states(self) -> None:
         """Fetch current state for all devices via HTTP API."""
         for device in self._devices.values():
             try:
                 state = await self._client.get_state(device)
-                self._states[device.device_id] = state
+                self._states[device.device_id] = self._normalize_http_state(state)
             except Exception:
                 _LOGGER.warning("Failed to get state for %s", device.name)
                 self._states.setdefault(device.device_id, {})
@@ -94,6 +105,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
+        self._shutdown = True
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         if self._mqtt_client:
             await self._mqtt_client.disconnect()
             self._mqtt_client = None
@@ -104,20 +119,30 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         token = await self._token_manager.get_token()
         host = self._client.host
 
-        self._mqtt_client = YoLinkMQTTClient(
+        mqtt_client = YoLinkMQTTClient(
             host=host,
             net_id=self._net_id,
             client_id=self._token_manager.client_id,
             access_token=token,
             port=self._mqtt_port,
         )
-        self._mqtt_client.subscribe(self._on_device_event)
+        mqtt_client.subscribe(self._on_device_event)
+        mqtt_client.on_disconnect(self._on_mqtt_disconnect)
 
         try:
-            await self._mqtt_client.connect()
+            await mqtt_client.connect()
+            self._mqtt_client = mqtt_client
             _LOGGER.info("Connected to YoLink MQTT broker")
         except Exception:
+            try:
+                await mqtt_client.disconnect()
+            except Exception:
+                _LOGGER.debug(
+                    "Error while cleaning up failed MQTT client",
+                    exc_info=True,
+                )
             _LOGGER.exception("Failed to connect to MQTT broker")
+            raise
 
     @callback
     def _on_device_event(self, event: DeviceEvent) -> None:
@@ -133,8 +158,60 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return
 
         existing = self._states.get(device_id, {})
-        self._states[device_id] = {**existing, **event.data}
+        self._states[device_id] = self._merge_event_data(existing, event.data)
         self.async_set_updated_data(self._states.copy())
+
+    def _merge_event_data(
+        self,
+        existing_state: dict[str, Any],
+        event_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge an MQTT event into cached state and restore online status on reports."""
+        merged_state = {**existing_state, **event_data}
+        reported_at = event_data.get("lastReportedAt")
+        if (
+            "online" not in event_data
+            and reported_at
+            and reported_at != existing_state.get("lastReportedAt")
+        ):
+            merged_state["online"] = True
+        return merged_state
+
+    def _normalize_http_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Normalize an HTTP getState payload to the coordinator's internal shape."""
+        normalized_state = dict(state)
+        if (
+            normalized_state.get("reportAt")
+            and "lastReportedAt" not in normalized_state
+        ):
+            normalized_state["lastReportedAt"] = normalized_state["reportAt"]
+        return normalized_state
+
+    @callback
+    def _on_mqtt_disconnect(self) -> None:
+        """Reconnect MQTT when the broker disconnects."""
+        if self._shutdown:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self.hass.async_create_task(self._async_reconnect_mqtt())
+
+    async def _async_reconnect_mqtt(self) -> None:
+        """Reconnect the MQTT client with backoff."""
+        backoff_seconds = 5
+        while not self._shutdown:
+            try:
+                if self._mqtt_client:
+                    await self._mqtt_client.disconnect()
+                    self._mqtt_client = None
+                await self._connect_mqtt()
+                if self._mqtt_client is not None:
+                    return
+            except Exception:
+                _LOGGER.exception("Failed to reconnect MQTT broker")
+
+            await asyncio.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 300)
 
     def get_state(self, device_id: str) -> dict[str, Any]:
         """Get the current state for a device."""
@@ -183,4 +260,3 @@ async def create_coordinator(
     except Exception:
         await session.close()
         raise
-

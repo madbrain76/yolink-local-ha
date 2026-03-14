@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .api import Device
 from .const import DOMAIN
@@ -45,6 +47,21 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        state = self.device_state
-        return state.get("online", True)
+        if not super().available:
+            return False
 
+        state = self.device_state
+        if not state.get("online", True):
+            return False
+
+        report_at = state.get("lastReportedAt")
+        if report_at:
+            try:
+                last_report = dt_util.parse_datetime(report_at)
+                if last_report is not None:
+                    if dt_util.utcnow() - last_report > timedelta(hours=12):
+                        return False
+            except Exception:
+                pass
+
+        return True
