@@ -25,14 +25,46 @@ async def async_setup_entry(
     """Set up YoLink sensors from a config entry."""
     coordinator: YoLocalCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities: list[SensorEntity] = []
-    for device in coordinator.devices.values():
-        if device.device_type == "THSensor":
-            entities.append(YoLocalTemperatureSensor(coordinator, device))
-            entities.append(YoLocalHumiditySensor(coordinator, device))
-            entities.append(YoLocalBatterySensor(coordinator, device))
+    entities_by_device_id: dict[str, list[SensorEntity]] = {}
 
-    async_add_entities(entities)
+    def build_entities(device) -> list[SensorEntity]:
+        if device.device_type != "THSensor":
+            return []
+        return [
+            YoLocalTemperatureSensor(coordinator, device),
+            YoLocalHumiditySensor(coordinator, device),
+            YoLocalBatterySensor(coordinator, device),
+        ]
+
+    def add_devices(devices) -> None:
+        new_entities: list[SensorEntity] = []
+        for device in devices:
+            if device.device_id in entities_by_device_id:
+                continue
+            built = build_entities(device)
+            if not built:
+                continue
+            entities_by_device_id[device.device_id] = built
+            new_entities.extend(built)
+        if new_entities:
+            async_add_entities(new_entities)
+
+    async def remove_devices(device_ids: list[str]) -> None:
+        for device_id in device_ids:
+            for entity in entities_by_device_id.pop(device_id, []):
+                if isinstance(entity, YoLocalEntity):
+                    await entity.async_remove_from_hass()
+
+    def handle_registry_change(added_devices, removed_devices) -> None:
+        add_devices(added_devices)
+        removed_ids = [device.device_id for device in removed_devices]
+        if removed_ids:
+            hass.async_create_task(remove_devices(removed_ids))
+
+    entry.async_on_unload(
+        coordinator.register_device_registry_listener(handle_registry_change)
+    )
+    add_devices(coordinator.devices.values())
 
 
 class YoLocalTemperatureSensor(YoLocalEntity, SensorEntity):
@@ -105,4 +137,3 @@ class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
             return None
         # YoLink reports 0-4, convert to percentage
         return min(level * 25, 100)
-
