@@ -95,13 +95,24 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 self._states.setdefault(device.device_id, {})
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
-        """Poll device states via HTTP as a fallback.
+        """Refresh device state from the hub and merge it into the cache."""
+        refreshed_states = self._states.copy()
 
-        This runs periodically (every 5 minutes) to ensure state stays
-        current even if MQTT events are missed or the connection drops.
-        """
-        await self._fetch_all_states()
-        return self._states.copy()
+        for device_id, device in self._devices.items():
+            try:
+                state = await self._client.get_state(device)
+            except Exception:
+                _LOGGER.warning("Failed to refresh state for %s", device.name)
+                continue
+
+            normalized_state = self._normalize_http_state(state)
+            refreshed_states[device_id] = self._merge_state_payload(
+                refreshed_states.get(device_id, {}),
+                normalized_state,
+            )
+
+        self._states = refreshed_states
+        return refreshed_states.copy()
 
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
@@ -146,46 +157,129 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     @callback
     def _on_device_event(self, event: DeviceEvent) -> None:
-        """Handle a device event from MQTT.
-
-        Merges incoming event data with the existing device state so that
-        partial events (e.g. connectivity-only updates) don't wipe out
-        previously known sensor readings like temperature and humidity.
-        """
+        """Handle a device event from MQTT."""
         device_id = event.device_id
-        if device_id not in self._devices:
+        device = self._devices.get(device_id)
+        if device is None:
             _LOGGER.debug("Ignoring event for unknown device: %s", device_id)
             return
 
-        existing = self._states.get(device_id, {})
-        self._states[device_id] = self._merge_event_data(existing, event.data)
+        event_data = event.data if isinstance(event.data, dict) else {}
+        normalized_event = self._normalize_mqtt_event(device, event_data)
+        self._update_device_state(
+            device_id,
+            self._merge_state_payload(self._states.get(device_id, {}), normalized_event),
+        )
+
+    def _update_device_state(self, device_id: str, state: dict[str, Any]) -> None:
+        """Store updated device state and notify listeners."""
+        self._states[device_id] = state
         self.async_set_updated_data(self._states.copy())
 
-    def _merge_event_data(
+    def _normalize_http_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Normalize an HTTP getState payload to the coordinator's canonical shape."""
+        normalized_state = self._sanitize_state_payload(state)
+        if normalized_state.get("reportAt") and "lastReportedAt" not in normalized_state:
+            normalized_state["lastReportedAt"] = normalized_state["reportAt"]
+        return normalized_state
+
+    def _normalize_mqtt_event(
+        self,
+        device: Device,
+        event_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize a flat MQTT event into the nested HTTP-like state shape."""
+        normalized: dict[str, Any] = {}
+
+        for key in ("online", "reportAt", "lastReportedAt"):
+            if key in event_data:
+                normalized[key] = event_data[key]
+
+        nested_state: dict[str, Any] = {}
+        event_state = event_data.get("state")
+        if isinstance(event_state, dict):
+            nested_state.update(event_state)
+        elif event_state is not None:
+            nested_state["state"] = event_state
+
+        for key, value in event_data.items():
+            if key in {"state", "online", "reportAt", "lastReportedAt"}:
+                continue
+            if (
+                device.device_type == "THSensor"
+                and value is None
+                and key in {"temperature", "humidity", "mode", "version"}
+            ):
+                continue
+            nested_state[key] = value
+
+        if nested_state:
+            normalized["state"] = nested_state
+
+        return self._sanitize_state_payload(normalized)
+
+    def _merge_state_payload(
+        self,
+        existing_state: dict[str, Any],
+        incoming_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge canonical state payloads while preserving nested HTTP shape."""
+        merged_state = self._sanitize_state_payload({**existing_state, **incoming_state})
+        merged_nested_state = self._merge_nested_state(
+            existing_state.get("state"),
+            incoming_state.get("state"),
+        )
+        if isinstance(merged_nested_state, dict):
+            merged_state["state"] = self._sanitize_nested_state(merged_nested_state)
+        elif merged_nested_state is not None:
+            merged_state["state"] = merged_nested_state
+        self._apply_event_availability(existing_state, incoming_state, merged_state)
+        return merged_state
+
+    def _apply_event_availability(
         self,
         existing_state: dict[str, Any],
         event_data: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Merge an MQTT event into cached state and restore online status on reports."""
-        merged_state = {**existing_state, **event_data}
-        reported_at = event_data.get("lastReportedAt")
-        if (
-            "online" not in event_data
-            and reported_at
-            and reported_at != existing_state.get("lastReportedAt")
-        ):
-            merged_state["online"] = True
-        return merged_state
+        merged_state: dict[str, Any],
+    ) -> None:
+        """Mark a device online again when a fresh report arrives."""
+        if "online" in event_data:
+            return
 
-    def _normalize_http_state(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Normalize an HTTP getState payload to the coordinator's internal shape."""
-        normalized_state = dict(state)
-        if (
-            normalized_state.get("reportAt")
-            and "lastReportedAt" not in normalized_state
-        ):
-            normalized_state["lastReportedAt"] = normalized_state["reportAt"]
-        return normalized_state
+        reported_at = event_data.get("lastReportedAt")
+        if reported_at and reported_at != existing_state.get("lastReportedAt"):
+            merged_state["online"] = True
+
+    def _sanitize_state_payload(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Remove inaccurate fields from a state payload."""
+        sanitized = dict(state)
+        sanitized.pop("batteryType", None)
+        nested_state = sanitized.get("state")
+        if isinstance(nested_state, dict):
+            sanitized["state"] = self._sanitize_nested_state(nested_state)
+        return sanitized
+
+    def _sanitize_nested_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Remove inaccurate fields from a nested state object."""
+        sanitized = dict(state)
+        sanitized.pop("batteryType", None)
+        return sanitized
+
+    def _merge_nested_state(
+        self,
+        existing_state: Any,
+        event_state: Any,
+    ) -> Any | None:
+        """Merge the payload's nested `state` field while preserving prior details."""
+        if event_state is None:
+            return None
+        if isinstance(event_state, dict):
+            if isinstance(existing_state, dict):
+                return {**existing_state, **event_state}
+            return event_state
+        if isinstance(existing_state, dict):
+            return {**existing_state, "state": event_state}
+        return event_state
 
     @callback
     def _on_mqtt_disconnect(self) -> None:
