@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import aiohttp
@@ -33,6 +34,7 @@ class TokenManager:
         self._session = session
         self._token: str | None = None
         self._expires_at: float = 0
+        self._refresh_lock = asyncio.Lock()
 
     @property
     def base_url(self) -> str:
@@ -46,11 +48,17 @@ class TokenManager:
 
     async def get_token(self) -> str:
         """Return a valid token, refreshing if needed."""
-        if self._is_expired():
+        if not self._is_expired():
+            return self._token
+
+        async with self._refresh_lock:
+            if not self._is_expired():
+                return self._token
             await self._refresh()
-        if self._token is None:
-            raise AuthenticationError("No token available")
-        return self._token
+
+            if self._token is None:
+                raise AuthenticationError("No token available")
+            return self._token
 
     def _is_expired(self) -> bool:
         """Check if the token is expired or about to expire."""
@@ -60,6 +68,9 @@ class TokenManager:
 
     async def _refresh(self) -> None:
         """Obtain a new token from the hub."""
+        if not self._is_expired():
+            return
+
         url = f"{self.base_url}/open/yolink/token"
         data = {
             "grant_type": "client_credentials",
@@ -77,4 +88,3 @@ class TokenManager:
         # Token expires_in is in seconds
         expires_in = result.get("expires_in", 7200)
         self._expires_at = time.time() + expires_in
-
