@@ -71,6 +71,10 @@ class YoLocalLock(YoLocalEntity, LockEntity):
         state = self.device_state.get("state")
         if state is None:
             return None
+        if isinstance(state, dict):
+            state = state.get("state")
+            if state is None:
+                return None
         return state == "locked"
 
     async def async_lock(self, **kwargs: Any) -> None:
