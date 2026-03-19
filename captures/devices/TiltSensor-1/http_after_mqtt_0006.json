@@ -1,0 +1,51 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-03-14T00:58:20.712515+00:00",
+  "device_id": "TiltSensor-1",
+  "device_name": "TiltSensor-1",
+  "display_type": "TiltSensor",
+  "env_name": "YOLINK_TILT_7706_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alertType": "normal",
+      "battery": 4,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "state": "open",
+      "version": "060f"
+    },
+    "deviceId": "TiltSensor-1",
+    "event": "DoorSensor.Alert",
+    "msgid": "1773449901168",
+    "time": 1773449901169
+  },
+  "raw_type": "DoorSensor",
+  "request": {
+    "method": "DoorSensor.getState",
+    "targetDevice": "TiltSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-14T00:58:21.160Z",
+      "state": {
+        "alertInterval": 0,
+        "battery": 4,
+        "delay": 0,
+        "openRemindDelay": 0,
+        "state": "open",
+        "version": "060f"
+      }
+    },
+    "desc": "Success",
+    "method": "DoorSensor.getState",
+    "msgid": 1773449901179,
+    "time": 1773449901179
+  },
+  "sequence": 6
+}

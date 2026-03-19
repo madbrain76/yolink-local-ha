@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-03-14T00:57:23.358967+00:00",
+  "device_id": "TiltSensor-1",
+  "device_name": "TiltSensor-1",
+  "display_type": "TiltSensor",
+  "env_name": "YOLINK_TILT_7706_SERIAL",
+  "raw_type": "DoorSensor",
+  "request": {
+    "method": "DoorSensor.getState",
+    "targetDevice": "TiltSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-13T22:50:13.544Z",
+      "state": {
+        "alertInterval": 0,
+        "battery": 4,
+        "delay": 0,
+        "openRemindDelay": 0,
+        "state": "closed",
+        "version": "060f"
+      }
+    },
+    "desc": "Success",
+    "method": "DoorSensor.getState",
+    "msgid": 1773449843379,
+    "time": 1773449843379
+  }
+}

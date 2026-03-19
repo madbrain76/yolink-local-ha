@@ -1,0 +1,57 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-03-14T00:57:54.381275+00:00",
+  "device_id": "MotionSensor-2",
+  "device_name": "MotionSensor-2",
+  "display_type": "MotionSensor",
+  "env_name": "YOLINK_MOTION_7805_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alertInterval": 1,
+      "battery": 4,
+      "ledAlarm": true,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "nomotionDelay": 1,
+      "sensitivity": 3,
+      "state": "alert",
+      "version": "0512"
+    },
+    "deviceId": "MotionSensor-2",
+    "event": "MotionSensor.Alert",
+    "msgid": "1773449874361",
+    "time": 1773449874364
+  },
+  "raw_type": "MotionSensor",
+  "request": {
+    "method": "MotionSensor.getState",
+    "targetDevice": "MotionSensor-2"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-14T00:57:54.350Z",
+      "state": {
+        "alertInterval": 1,
+        "battery": 4,
+        "batteryType": "Li",
+        "devTemperature": 28,
+        "ledAlarm": true,
+        "nomotionDelay": 1,
+        "sensitivity": 3,
+        "state": "alert",
+        "version": "0512"
+      }
+    },
+    "desc": "Success",
+    "method": "MotionSensor.getState",
+    "msgid": 1773449874390,
+    "time": 1773449874390
+  },
+  "sequence": 1
+}

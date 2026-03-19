@@ -1,0 +1,93 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-03-14T00:58:09.114594+00:00",
+  "device_id": "THSensor-1",
+  "device_name": "THSensor-1",
+  "display_type": "THSensor",
+  "env_name": "YOLINK_TH_8003_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alarm": {
+        "code": 0,
+        "highHumidity": false,
+        "highTemp": false,
+        "lowBattery": false,
+        "lowHumidity": false,
+        "lowTemp": false,
+        "period": false
+      },
+      "battery": 4,
+      "humidity": 48.1,
+      "humidityCorrection": 0,
+      "humidityLimit": {
+        "max": 100,
+        "min": 0
+      },
+      "interval": 0,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "mode": "f",
+      "state": "normal",
+      "tempCorrection": 0,
+      "tempLimit": {
+        "max": 1000,
+        "min": -1000
+      },
+      "temperature": 22.4,
+      "version": "03bb"
+    },
+    "deviceId": "THSensor-1",
+    "event": "THSensor.Report",
+    "msgid": "1773449889470",
+    "time": 1773449889472
+  },
+  "raw_type": "THSensor",
+  "request": {
+    "method": "THSensor.getState",
+    "targetDevice": "THSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-14T00:58:09.462Z",
+      "state": {
+        "alarm": {
+          "code": 0,
+          "highHumidity": false,
+          "highTemp": false,
+          "lowBattery": false,
+          "lowHumidity": false,
+          "lowTemp": false,
+          "period": false
+        },
+        "battery": 4,
+        "humidity": 48.1,
+        "humidityCorrection": 0,
+        "humidityLimit": {
+          "max": 100,
+          "min": 0
+        },
+        "interval": 0,
+        "mode": "f",
+        "state": "normal",
+        "tempCorrection": 0,
+        "tempLimit": {
+          "max": 1000,
+          "min": -1000
+        },
+        "temperature": 22.4,
+        "version": "03bb"
+      }
+    },
+    "desc": "Success",
+    "method": "THSensor.getState",
+    "msgid": 1773449889482,
+    "time": 1773449889482
+  },
+  "sequence": 4
+}

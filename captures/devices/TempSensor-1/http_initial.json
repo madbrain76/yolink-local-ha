@@ -1,0 +1,52 @@
+{
+  "captured_at": "2026-03-14T00:57:23.342372+00:00",
+  "device_id": "TempSensor-1",
+  "device_name": "TempSensor-1",
+  "display_type": "TempSensor",
+  "env_name": "YOLINK_TEMP_8004_SERIAL",
+  "raw_type": "THSensor",
+  "request": {
+    "method": "THSensor.getState",
+    "targetDevice": "TempSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-14T00:40:10.107Z",
+      "state": {
+        "alarm": {
+          "code": 0,
+          "highHumidity": false,
+          "highTemp": false,
+          "lowBattery": false,
+          "lowHumidity": false,
+          "lowTemp": false,
+          "period": false
+        },
+        "battery": 2,
+        "batteryType": "Li",
+        "humidity": 0,
+        "humidityCorrection": 0,
+        "humidityLimit": {
+          "max": 0,
+          "min": 0
+        },
+        "interval": 0,
+        "mode": "f",
+        "state": "normal",
+        "tempCorrection": 0,
+        "tempLimit": {
+          "max": 1000,
+          "min": -1000
+        },
+        "temperature": -20.3,
+        "version": "0460"
+      }
+    },
+    "desc": "Success",
+    "method": "THSensor.getState",
+    "msgid": 1773449843362,
+    "time": 1773449843362
+  }
+}

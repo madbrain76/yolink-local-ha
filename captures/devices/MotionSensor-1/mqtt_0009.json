@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-03-14T00:59:02.141242+00:00",
+  "device_id": "MotionSensor-1",
+  "device_name": "MotionSensor-1",
+  "display_type": "MotionSensor",
+  "env_name": "YOLINK_MOTION_7804_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alertInterval": 1,
+      "battery": 4,
+      "ledAlarm": true,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "nomotionDelay": 1,
+      "sensitivity": 3,
+      "state": "alert",
+      "version": "0474"
+    },
+    "deviceId": "MotionSensor-1",
+    "event": "MotionSensor.Alert",
+    "msgid": "1773449942177",
+    "time": 1773449942179
+  },
+  "raw_type": "MotionSensor",
+  "sequence": 9,
+  "topic": "ylsubnet/REDACTED_NET_ID/MotionSensor-1/report"
+}

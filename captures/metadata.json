@@ -1,0 +1,52 @@
+{
+  "captured_at": "2026-03-14T00:57:23.298345+00:00",
+  "duration_seconds": 300,
+  "host": "REDACTED_HOST",
+  "net_id": "REDACTED_NET_ID",
+  "serial_env": {
+    "YOLINK_DOOR_7704_SERIAL": "DoorSensor-1",
+    "YOLINK_LEAK_7903_SERIAL": "LeakSensor-1",
+    "YOLINK_MOTION_7804_SERIAL": "MotionSensor-1",
+    "YOLINK_MOTION_7805_SERIAL": "MotionSensor-2",
+    "YOLINK_TEMP_8004_SERIAL": "TempSensor-1",
+    "YOLINK_TH_8003_SERIAL": "THSensor-1",
+    "YOLINK_TILT_7706_SERIAL": "TiltSensor-1"
+  },
+  "tracked_devices": [
+    {
+      "alias": "DoorSensor-1",
+      "display_type": "DoorSensor",
+      "env_name": "YOLINK_DOOR_7704_SERIAL"
+    },
+    {
+      "alias": "LeakSensor-1",
+      "display_type": "LeakSensor",
+      "env_name": "YOLINK_LEAK_7903_SERIAL"
+    },
+    {
+      "alias": "MotionSensor-1",
+      "display_type": "MotionSensor",
+      "env_name": "YOLINK_MOTION_7804_SERIAL"
+    },
+    {
+      "alias": "MotionSensor-2",
+      "display_type": "MotionSensor",
+      "env_name": "YOLINK_MOTION_7805_SERIAL"
+    },
+    {
+      "alias": "TempSensor-1",
+      "display_type": "TempSensor",
+      "env_name": "YOLINK_TEMP_8004_SERIAL"
+    },
+    {
+      "alias": "THSensor-1",
+      "display_type": "THSensor",
+      "env_name": "YOLINK_TH_8003_SERIAL"
+    },
+    {
+      "alias": "TiltSensor-1",
+      "display_type": "TiltSensor",
+      "env_name": "YOLINK_TILT_7706_SERIAL"
+    }
+  ]
+}

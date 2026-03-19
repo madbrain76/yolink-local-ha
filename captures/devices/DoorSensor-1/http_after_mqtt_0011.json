@@ -1,0 +1,51 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-03-14T00:59:07.972709+00:00",
+  "device_id": "DoorSensor-1",
+  "device_name": "DoorSensor-1",
+  "display_type": "DoorSensor",
+  "env_name": "YOLINK_DOOR_7704_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alertType": "normal",
+      "battery": 3,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "state": "closed",
+      "version": "0420"
+    },
+    "deviceId": "DoorSensor-1",
+    "event": "DoorSensor.Alert",
+    "msgid": "1773449948098",
+    "time": 1773449948101
+  },
+  "raw_type": "DoorSensor",
+  "request": {
+    "method": "DoorSensor.getState",
+    "targetDevice": "DoorSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-14T00:59:08.088Z",
+      "state": {
+        "alertInterval": 0,
+        "battery": 3,
+        "delay": 0,
+        "openRemindDelay": 0,
+        "state": "closed",
+        "version": "0420"
+      }
+    },
+    "desc": "Success",
+    "method": "DoorSensor.getState",
+    "msgid": 1773449948118,
+    "time": 1773449948118
+  },
+  "sequence": 11
+}

@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-03-14T00:57:23.307886+00:00",
+  "device_id": "DoorSensor-1",
+  "device_name": "DoorSensor-1",
+  "display_type": "DoorSensor",
+  "env_name": "YOLINK_DOOR_7704_SERIAL",
+  "raw_type": "DoorSensor",
+  "request": {
+    "method": "DoorSensor.getState",
+    "targetDevice": "DoorSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-13T22:18:52.081Z",
+      "state": {
+        "alertInterval": 0,
+        "battery": 3,
+        "delay": 0,
+        "openRemindDelay": 0,
+        "state": "closed",
+        "version": "0420"
+      }
+    },
+    "desc": "Success",
+    "method": "DoorSensor.getState",
+    "msgid": 1773449843328,
+    "time": 1773449843328
+  }
+}

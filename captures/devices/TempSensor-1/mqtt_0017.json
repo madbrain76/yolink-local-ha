@@ -1,0 +1,51 @@
+{
+  "captured_at": "2026-03-14T01:00:33.933428+00:00",
+  "device_id": "TempSensor-1",
+  "device_name": "TempSensor-1",
+  "display_type": "TempSensor",
+  "env_name": "YOLINK_TEMP_8004_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alarm": {
+        "code": 0,
+        "highHumidity": false,
+        "highTemp": false,
+        "lowBattery": false,
+        "lowHumidity": false,
+        "lowTemp": false,
+        "period": false
+      },
+      "battery": 2,
+      "batteryType": "Li",
+      "humidity": 0,
+      "humidityCorrection": 0,
+      "humidityLimit": {
+        "max": 0,
+        "min": 0
+      },
+      "interval": 0,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "mode": "f",
+      "state": "normal",
+      "tempCorrection": 0,
+      "tempLimit": {
+        "max": 1000,
+        "min": -1000
+      },
+      "temperature": -19.3,
+      "version": "0460"
+    },
+    "deviceId": "TempSensor-1",
+    "event": "THSensor.Report",
+    "msgid": "1773450034376",
+    "time": 1773450034378
+  },
+  "raw_type": "THSensor",
+  "sequence": 17,
+  "topic": "ylsubnet/REDACTED_NET_ID/TempSensor-1/report"
+}

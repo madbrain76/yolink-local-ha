@@ -1,0 +1,35 @@
+{
+  "captured_at": "2026-03-14T00:59:25.279687+00:00",
+  "device_id": "LeakSensor-1",
+  "device_name": "LeakSensor-1",
+  "display_type": "LeakSensor",
+  "env_name": "YOLINK_LEAK_7903_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alarmState": {
+        "detectorError": false,
+        "freezeError": false,
+        "reminder": false,
+        "stayError": false
+      },
+      "battery": 4,
+      "devTemperature": 21,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "sensorMode": "WaterLeak",
+      "state": "alert",
+      "version": "0313"
+    },
+    "deviceId": "LeakSensor-1",
+    "event": "LeakSensor.Alert",
+    "msgid": "1773449965670",
+    "time": 1773449965671
+  },
+  "raw_type": "LeakSensor",
+  "sequence": 12,
+  "topic": "ylsubnet/REDACTED_NET_ID/LeakSensor-1/report"
+}

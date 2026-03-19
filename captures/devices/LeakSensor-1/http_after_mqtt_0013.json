@@ -1,0 +1,65 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-03-14T00:59:27.047906+00:00",
+  "device_id": "LeakSensor-1",
+  "device_name": "LeakSensor-1",
+  "display_type": "LeakSensor",
+  "env_name": "YOLINK_LEAK_7903_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alarmState": {
+        "detectorError": false,
+        "freezeError": false,
+        "reminder": false,
+        "stayError": false
+      },
+      "battery": 4,
+      "devTemperature": 22,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "sensorMode": "WaterLeak",
+      "state": "normal",
+      "version": "0313"
+    },
+    "deviceId": "LeakSensor-1",
+    "event": "LeakSensor.StatusChange",
+    "msgid": "1773449967450",
+    "time": 1773449967452
+  },
+  "raw_type": "LeakSensor",
+  "request": {
+    "method": "LeakSensor.getState",
+    "targetDevice": "LeakSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-14T00:59:27.444Z",
+      "state": {
+        "alarmState": {
+          "detectorError": false,
+          "freezeError": false,
+          "reminder": false,
+          "stayError": false
+        },
+        "battery": 4,
+        "devTemperature": 22,
+        "interval": 20,
+        "sensorMode": "WaterLeak",
+        "state": "normal",
+        "supportChangeMode": false,
+        "version": "0313"
+      }
+    },
+    "desc": "Success",
+    "method": "LeakSensor.getState",
+    "msgid": 1773449967462,
+    "time": 1773449967462
+  },
+  "sequence": 13
+}

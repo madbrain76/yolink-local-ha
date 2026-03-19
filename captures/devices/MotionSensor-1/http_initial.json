@@ -1,0 +1,33 @@
+{
+  "captured_at": "2026-03-14T00:57:23.325328+00:00",
+  "device_id": "MotionSensor-1",
+  "device_name": "MotionSensor-1",
+  "display_type": "MotionSensor",
+  "env_name": "YOLINK_MOTION_7804_SERIAL",
+  "raw_type": "MotionSensor",
+  "request": {
+    "method": "MotionSensor.getState",
+    "targetDevice": "MotionSensor-1"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-03-14T00:28:05.081Z",
+      "state": {
+        "alertInterval": 1,
+        "battery": 4,
+        "devTemperature": 21,
+        "ledAlarm": true,
+        "nomotionDelay": 1,
+        "sensitivity": 3,
+        "state": "normal",
+        "version": "0474"
+      }
+    },
+    "desc": "Success",
+    "method": "MotionSensor.getState",
+    "msgid": 1773449843345,
+    "time": 1773449843345
+  }
+}

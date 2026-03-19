@@ -1,0 +1,17 @@
+{
+  "devices_without_mqtt_events": [],
+  "duration_seconds": 300,
+  "event_counts": {
+    "DoorSensor-1": 2,
+    "LeakSensor-1": 2,
+    "MotionSensor-1": 4,
+    "MotionSensor-2": 4,
+    "THSensor-1": 4,
+    "TempSensor-1": 2,
+    "TiltSensor-1": 2
+  },
+  "finished_at": "2026-03-14T01:02:28.661295+00:00",
+  "host": "REDACTED_HOST",
+  "net_id": "REDACTED_NET_ID",
+  "output_dir": "/home/madbrain/projects/yolink-local-ha/captures"
+}
