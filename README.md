@@ -2,7 +2,7 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 
-A Home Assistant integration for YoLink devices using the **Local API** — no cloud required.
+A Home Assistant integration for YoLink devices using the **Local API** - no cloud required.
 
 This integration communicates directly with your YoLink Local Hub over your LAN using HTTP and MQTT, providing fast, reliable, and private control of your YoLink devices.
 
@@ -23,9 +23,12 @@ By installing this integration, you acknowledge that you understand these risks 
 
 The YoLink Local Hub supports both Matter and a native Local API. While Matter works, the Local API offers:
 
-- **Full device information** — temperature, humidity, battery levels, signal strength
-- **Faster response times** — direct HTTP/MQTT vs Matter's abstraction layer
-- **Richer entity types** — sensors, binary sensors, switches, locks, sirens all with proper device classes
+- **Full device information** - temperature, humidity, battery levels
+- **Network state** - periodic check-ins are tracked and devices are marked offline if they stop reporting
+- **Faster response times** - direct HTTP/MQTT vs Matter's abstraction layer
+- **Richer entity types** - sensors, binary sensors, switches, locks, sirens all with proper device classes
+
+Matter can leave YoLink sensors stale when battery runs out, which can cause incorrect motion/status reporting and disrupt automations. YoLink devices are expected to check in periodically with the hub. This integration marks devices offline after 12 hours without reports, matching YoLink cloud integration behavior.
 
 ## Supported Devices
 
@@ -34,11 +37,38 @@ The YoLink Local Hub supports both Matter and a native Local API. While Matter w
 | THSensor | Sensor | Temperature, humidity, battery |
 | DoorSensor | Binary Sensor | Open/closed state, battery |
 | LeakSensor | Binary Sensor | Leak detected, battery |
+| MotionSensor | Binary Sensor | Motion detected, battery |
+| VibrationSensor | Binary Sensor | Vibration detected, battery |
 | Outlet | Switch | On/off control |
 | Lock | Lock | Lock/unlock control |
 | Siren | Siren | Trigger/stop alarm |
 
-Additional device types can be added — contributions welcome!
+Additional device types can be added -- contributions welcome.
+
+## Tested Models
+
+The following device type/model combinations were tested:
+
+| Device type  | Model     |
+|--------------|-----------|
+| DoorSensor   | YS7704-UC |
+| LeakSensor   | YS7903-UC |
+| MotionSensor | YS7804-UC |
+| MotionSensor | YS7805-UC |
+| THSensor     | YS8003-UC |
+| TempSensor   | YS8004-UC |
+| TiltSensor   | YS7706-UC |
+
+## Additional Exposed Entities/Diagnostics
+
+This branch includes additional entities and diagnostics, including:
+
+- All devices: `Firmware`, `Last reported`
+- THSensor: `LCD temperature unit`, `Reporting interval`, `Temperature correction`, `Humidity correction`, alarm entities for low/high temperature and humidity, low battery
+- MotionSensor: `Device temperature`, `Sensitivity`, `No-motion delay`, `Alert interval`, `LED alarm`
+- LeakSensor: `Device temperature`, `Sensor mode`, `Reporting interval`, alarm entities for detector/freeze/stay/reminder errors
+- DoorSensor: `Delay`, `Open remind delay`, `Alert interval`
+- Model/type normalization: `7706 -> TiltSensor`, `8004 -> TempSensor`
 
 ## Prerequisites
 
@@ -78,14 +108,6 @@ You'll need four pieces of information from the YoLink app:
 
 ## Installation
 
-### HACS (Recommended)
-
-1. Open HACS in Home Assistant
-2. Click the **⋮** menu → **Custom repositories**
-3. Add `https://github.com/dbborens/yolink-local-ha` with category **Integration**
-4. Search for "YoLink Local" and install
-5. Restart Home Assistant
-
 ### Manual Installation
 
 1. Download or clone this repository
@@ -94,13 +116,13 @@ You'll need four pieces of information from the YoLink app:
 
 ## Configuration
 
-1. Go to **Settings → Devices & Services**
+1. Go to **Settings -> Devices & Services**
 2. Click **Add Integration**
 3. Search for **YoLink Local**
 4. Enter your credentials:
    - **Hub IP**: Your hub's IP address
    - **Client ID**: From the Integrations tab
-   - **Client Secret**: From the Integrations tab  
+   - **Client Secret**: From the Integrations tab
    - **Net ID**: From the General tab
 
 ## How It Works
@@ -109,6 +131,84 @@ You'll need four pieces of information from the YoLink app:
 - **Initial State**: Each device's current state is fetched via HTTP
 - **Real-time Updates**: MQTT subscription receives instant state changes (door opens, temperature changes, etc.)
 - **Commands**: Lock/unlock, on/off, and other commands are sent via HTTP
+
+## Test Scripts
+
+The `tests/` folder includes standalone test and diagnostics scripts that are not part of the Home Assistant runtime integration:
+
+- `tests/wait_for_yolink_change.py` and wrappers:
+  - `tests/wait_for_th.sh`
+  - `tests/wait_for_temp.sh`
+  - `tests/wait_for_motion.sh`
+  - `tests/wait_for_door.sh`
+  - `tests/wait_for_tilt.sh`
+  - `tests/wait_for_leak.sh`
+  - `tests/wait_for_lock.sh`
+  - `tests/list_yolink_device_types.py`
+  - `tests/capture_yolink_payloads.py`
+
+### Test Environment Variables
+
+Set these before running tests:
+
+Required connection/auth:
+
+- `YOLINK_HOST` (hub host or URL)
+- `YOLINK_CLIENT_ID`
+- `YOLINK_CLIENT_SECRET`
+- `YOLINK_NET` or `YOLINK_NET_ID`
+
+Required device serials for full live type coverage:
+
+- `YOLINK_MOTION_7804_SERIAL` or `YOLINK_MOTION_7805_SERIAL`
+- `YOLINK_TH_8003_SERIAL`
+- `YOLINK_DOOR_7704_SERIAL`
+- `YOLINK_LEAK_7903_SERIAL`
+- `YOLINK_TEMP_8004_SERIAL`
+- `YOLINK_TILT_7706_SERIAL`
+- `YOLINK_LOCK_MODEL_NUMBER_SERIAL`
+
+Optional:
+
+- `YOLINK_TIMEOUT` (wait script timeout, default `900`)
+- `YOLINK_FIELD` (for TH waits: `temperature`, `humidity`, `unit`, `both`)
+
+### Example Setup
+
+```bash
+export YOLINK_HOST=
+export YOLINK_NET=
+export YOLINK_CLIENT_ID="..."
+export YOLINK_CLIENT_SECRET="..."
+
+export YOLINK_MOTION_7805_SERIAL=
+export YOLINK_TH_8003_SERIAL=
+export YOLINK_DOOR_7704_SERIAL=
+export YOLINK_LEAK_7903_SERIAL=
+export YOLINK_TEMP_8004_SERIAL=
+export YOLINK_TILT_7706_SERIAL=
+export YOLINK_LOCK_MODEL_NUMBER_SERIAL=
+```
+
+### Run Test Scripts
+
+List detected type/model pairs:
+
+```bash
+python3 tests/list_yolink_device_types.py
+```
+
+Wait for TH unit change:
+
+```bash
+./tests/wait_for_th.sh --field unit --timeout 120
+```
+
+Capture payloads for configured devices:
+
+```bash
+python3 tests/capture_yolink_payloads.py --duration 300
+```
 
 ## Troubleshooting
 
@@ -130,7 +230,7 @@ Real-time updates require MQTT. If updates only happen on HA restart, check that
 
 ## Contributing
 
-Contributions are welcome! To add support for additional device types:
+Contributions are welcome. To add support for additional device types:
 
 1. Check the [YoLink Local API documentation](https://doc.yosmart.com/docs/protocol/local_hub/localHubMethods)
 2. Add the device type to the appropriate platform file
@@ -138,7 +238,7 @@ Contributions are welcome! To add support for additional device types:
 
 ## License
 
-GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
+GNU General Public License v3.0 -- see [LICENSE](LICENSE) for details.
 
 ## Credits
 
