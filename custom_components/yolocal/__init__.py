@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import logging
 
+import aiohttp
+
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.core import HomeAssistant
 
+from .api import AuthenticationError
 from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -25,11 +29,12 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up YoLink Local from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+    host = entry.data[CONF_HUB_IP]
 
     try:
         coordinator = await create_coordinator(
             hass=hass,
-            host=entry.data[CONF_HUB_IP],
+            host=host,
             client_id=entry.data[CONF_CLIENT_ID],
             client_secret=entry.data[CONF_CLIENT_SECRET],
             config_entry_id=entry.entry_id,
@@ -37,15 +42,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             http_port=DEFAULT_HTTP_PORT,
             mqtt_port=DEFAULT_MQTT_PORT,
         )
+        # Perform the first data refresh so the coordinator (and therefore
+        # all entities) have valid state before platforms are set up.
+        await coordinator.async_config_entry_first_refresh()
+    except AuthenticationError as err:
+        raise ConfigEntryAuthFailed("YoLink Local authentication failed") from err
+    except (aiohttp.ClientError, OSError, TimeoutError) as err:
+        raise ConfigEntryNotReady(
+            f"Cannot connect to YoLink hub at {host}"
+        ) from err
     except Exception:
         _LOGGER.exception("Failed to set up YoLink Local")
         return False
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
-
-    # Perform the first data refresh so the coordinator (and therefore
-    # all entities) have valid state before platforms are set up.
-    await coordinator.async_config_entry_first_refresh()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
