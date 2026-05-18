@@ -19,14 +19,14 @@ By installing this integration, you acknowledge that you understand these risks 
 
 **If you are not comfortable with these risks, do not use this software.**
 
-## Why Use This Instead of Matter?
+## Why use this instead of Matter or Yolink cloud integrations ?
 
-The YoLink Local Hub supports both Matter and a native Local API. While Matter works, the Local API offers:
+The YoLink Local Hub supports both Matter and a native Local API, as well as the cloud API. While both Matter and Cloud works, the local API offers:
 
 - **Full device information** - temperature, humidity, battery levels
-- **Network state** - periodic check-ins are tracked and devices are marked offline if they stop reporting
+- **Network state** - periodic check-ins are tracked and devices are marked offline if they stop reporting. The Yolink cloud integration does so, but the Matter integration does not, which was a showstopper for me, and the primary reason I started working on this project.
 - **Faster response times** - direct HTTP/MQTT vs Matter's abstraction layer
-- **Richer entity types** - sensors, binary sensors, switches, locks, sirens all with proper device classes
+- **Richer entity types** - sensors, binary sensors, and diagnostic entities
 
 Matter can leave YoLink sensors stale when battery runs out, which can cause incorrect motion/status reporting and disrupt automations. YoLink devices are expected to check in periodically with the hub. This integration marks devices offline after 12 hours without reports, matching YoLink cloud integration behavior.
 
