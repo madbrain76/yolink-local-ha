@@ -57,6 +57,9 @@ This project includes additional entities and diagnostics, not available in the 
 - THSensor 8005 : `High humidity`, `High temperature`, `Humidity correction`, `Humidity max threshold`, `Humidity min threshold`, `LCD temperature unit` (bug), `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`, `Temperature max threshold`, `Temperature min threshold`
 - TiltSensor: `Alert interval`, `Delay`, `Open remind delay`
 
+Diagnostics entities listed as "bug" are being returned from the Yolink local API in JSON responses, but not actually applicable to the specific models. This integration merely exposes them. The values are bogus, and should be ignored.
+This bug would be best fixed by Yolink in their local API implementation, rather than manually blacklisted in this project.
+
 ## Prerequisites
 
 Before installing this integration, you need:
