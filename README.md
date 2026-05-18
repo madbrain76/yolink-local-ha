@@ -30,45 +30,32 @@ The YoLink Local Hub supports both Matter and a native Local API. While Matter w
 
 Matter can leave YoLink sensors stale when battery runs out, which can cause incorrect motion/status reporting and disrupt automations. YoLink devices are expected to check in periodically with the hub. This integration marks devices offline after 12 hours without reports, matching YoLink cloud integration behavior.
 
-## Supported Devices
+## Tested devices
 
-| Device Type | Entity Type | Features |
-|-------------|-------------|----------|
-| THSensor | Sensor | Temperature, humidity, battery |
-| DoorSensor | Binary Sensor | Open/closed state, battery |
-| LeakSensor | Binary Sensor | Leak detected, battery |
-| MotionSensor | Binary Sensor | Motion detected, battery |
-| VibrationSensor | Binary Sensor | Vibration detected, battery |
-| Outlet | Switch | On/off control |
-| Lock | Lock | Lock/unlock control |
-| Siren | Siren | Trigger/stop alarm |
+| Device Type | Entity Type | Features | Models               |
+|-------------|-------------|----------|----------------------|
+| DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
+| LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
+| MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
+| TempSensor | Sensor Sensor | Temperature, battery | YS8004-UC
+| THSensor | Sensor | Temperature, humidity, battery | YS8003-UC, YS8005-UC
+| TiltSensor | Binary Sensor | Temperature, battery | YS7706-UC
 
 Additional device types can be added -- contributions welcome.
 
-## Tested Models
+## Additional exposed entities/diagnostics
 
-The following device type/model combinations were tested:
-
-| Device type  | Model     |
-|--------------|-----------|
-| DoorSensor   | YS7704-UC |
-| LeakSensor   | YS7903-UC |
-| MotionSensor | YS7804-UC |
-| MotionSensor | YS7805-UC |
-| THSensor     | YS8003-UC |
-| TempSensor   | YS8004-UC |
-| TiltSensor   | YS7706-UC |
-
-## Additional Exposed Entities/Diagnostics
-
-This branch includes additional entities and diagnostics, including:
+This project includes additional entities and diagnostics, not available in the Yolink cloud integration :
 
 - All devices: `Firmware`, `Last reported`
-- THSensor: `LCD temperature unit`, `Reporting interval`, `Temperature correction`, `Humidity correction`, alarm entities for low/high temperature and humidity, low battery
-- MotionSensor: `Device temperature`, `Sensitivity`, `No-motion delay`, `Alert interval`, `LED alarm`
-- LeakSensor: `Device temperature`, `Sensor mode`, `Reporting interval`, alarm entities for detector/freeze/stay/reminder errors
-- DoorSensor: `Delay`, `Open remind delay`, `Alert interval`
-- Model/type normalization: `7706 -> TiltSensor`, `8004 -> TempSensor`
+- Battery-powered devices: `Battery`, `Low battery`
+- DoorSensor: `Alert interval`, `Delay`, `Open remind delay`
+- LeakSensor: `Detector error`, `Device temperature`, `Freeze error`, `Reminder`
+- MotionSensor : `Alert interval`, `Device temperature`, `LED alarm`, `No-motion delay`, `Sensitivity`
+- TempSensor : `High humidity` (bug), `High temperature`, `Low humidity` (bug), `Low temperature`, `Reporting interval`, `Temperature correction`
+- THSensor 8003 : `High humidity`, `High temperature`, `Humidity correction`, `LCD temperature unit`, `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`
+- THSensor 8005 : `High humidity`, `High temperature`, `Humidity correction`, `Humidity max threshold`, `Humidity min threshold`, `LCD temperature unit` (bug), `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`, `Temperature max threshold`, `Temperature min threshold`
+- TiltSensor: `Alert interval`, `Delay`, `Open remind delay`
 
 ## Prerequisites
 
@@ -81,7 +68,7 @@ Before installing this integration, you need:
 
 For detailed setup instructions, see the excellent [YoLink Local Hub Setup Guide](https://community.home-assistant.io/t/yolink-local-hub-matter-integration-guide/911359) on the Home Assistant Community forums.
 
-## Finding Your Credentials
+## Finding your credentials
 
 You'll need four pieces of information from the YoLink app:
 
@@ -90,7 +77,8 @@ You'll need four pieces of information from the YoLink app:
 1. Open the YoLink app
 2. Tap on your **YoLink Local Hub** device
 3. Tap the **⋮** menu (top right)
-4. Find the **IP Address** under the Ethernet section
+4. Find the **IP Address** under the Ethernet or Wi-fi section. Make sure you have a DHCP reservation for the hub with this IP address in your router/DHCP server.
+5. If your router has local DNS for DHCP reservations, you may also use the FQDN, which is what I do.
 
 ![Hub main screen](images/IMG_2021.PNG)
 
