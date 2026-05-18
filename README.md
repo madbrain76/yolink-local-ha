@@ -252,5 +252,6 @@ GNU General Public License v3.0 -- see [LICENSE](LICENSE) for details.
 
 ## Credits
 
+- [David Bruce Borenstein](https://github.com/borenstein) for the [original integration](https://github.com/borenstein/yolink-local-ha)
 - [YoLink](https://www.yosmart.com/) for the Local Hub and API
 - The Home Assistant community for testing and feedback
