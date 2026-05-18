@@ -121,7 +121,7 @@ You'll need four pieces of information from the YoLink app:
 2. Click **Add Integration**
 3. Search for **YoLink Local**
 4. Enter your credentials:
-   - **Hub IP**: Your hub's IP address
+   - **Hub IP**: Your hub's IP address or hostname
    - **Client ID**: From the Integrations tab
    - **Client Secret**: From the Integrations tab
    - **Net ID**: From the General tab
