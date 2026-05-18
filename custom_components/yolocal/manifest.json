@@ -4,11 +4,11 @@
   "codeowners": ["David Bruce Borenstein <open.source@borenstein.me>"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/dbborens/yolink-local-ha",
+  "documentation": "https://github.com/madbrain76/yolink-local-ha",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/dbborens/yolink-local-ha/issues",
+  "issue_tracker": "https://github.com/madbrain76/yolink-local-ha/issues",
   "requirements": ["paho-mqtt>=2.0.0"],
-  "version": "0.1.0",
+  "version": "0.1.1",
   "icon": "mdi:router-wireless"
 }
 

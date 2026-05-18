@@ -108,6 +108,16 @@ You'll need four pieces of information from the YoLink app:
 
 ## Installation
 
+### HACS Installation (Recommended)
+
+1. Open **HACS** in your Home Assistant instance
+2. Click on the three dots in the top right corner and select **Custom repositories**
+3. Paste `https://github.com/madbrain76/yolink-local-ha` into the **Repository** field
+4. Select **Integration** as the **Category**
+5. Click **Add**
+6. Once added, search for **YoLink Local** and click **Download**
+7. Restart Home Assistant
+
 ### Manual Installation
 
 1. Download or clone this repository
