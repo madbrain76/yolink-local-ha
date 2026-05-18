@@ -13,6 +13,7 @@ from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import YoLocalCoordinator
 from custom_components.yolocal.entity import YoLocalEntity
 from custom_components.yolocal.sensor import YoLocalTHLimitSensor
+from capture_yolink_payloads import sanitize_value
 
 
 def make_device_id(label: str = "device") -> str:
@@ -71,6 +72,52 @@ def make_coordinator() -> YoLocalCoordinator:
         config_entry_id="entry",
         net_id="net",
     )
+
+
+def test_capture_sanitizer_redacts_tokens_and_aliases_identifiers() -> None:
+    """Capture artifacts should not persist hub secrets or device identifiers."""
+    sanitized = sanitize_value(
+        {
+            "host": "hub.local",
+            "net_id": "net-123",
+            "request": {
+                "targetDevice": "real-device-id",
+                "token": "device-token",
+            },
+            "response": {
+                "data": {
+                    "devices": [
+                        {
+                            "deviceId": "real-device-id",
+                            "name": "Kitchen Sensor",
+                            "appEui": "0000008003000000",
+                            "token": "device-list-token",
+                        }
+                    ]
+                }
+            },
+            "topic": "ylsubnet/net-123/real-device-id/report",
+        },
+        device_aliases={
+            "real-device-id": "THSensor-1",
+            "Kitchen Sensor": "THSensor-1",
+        },
+        host="hub.local",
+        net_id="net-123",
+    )
+
+    assert sanitized["host"] == "REDACTED_HOST"
+    assert sanitized["net_id"] == "REDACTED_NET_ID"
+    assert sanitized["request"] == {
+        "targetDevice": "THSensor-1",
+        "token": "REDACTED",
+    }
+    device = sanitized["response"]["data"]["devices"][0]
+    assert device["deviceId"] == "THSensor-1"
+    assert device["name"] == "THSensor-1"
+    assert device["appEui"] == "REDACTED"
+    assert device["token"] == "REDACTED"
+    assert sanitized["topic"] == "ylsubnet/REDACTED_NET_ID/THSensor-1/report"
 
 
 def test_merge_nested_state_covers_all_shapes() -> None:

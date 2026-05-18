@@ -81,6 +81,23 @@ def extract_motion(state: dict[str, Any]) -> str | None:
     return None
 
 
+def diff_states(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """Compute a human-readable diff between two state dicts."""
+    changes: list[str] = []
+    for key in sorted(set(old) | set(new)):
+        old_val = old.get(key)
+        new_val = new.get(key)
+        if old_val == new_val:
+            continue
+        if old_val is None:
+            changes.append(f"  +{key}: {new_val}")
+        elif new_val is None:
+            changes.append(f"  -{key}: {old_val}")
+        else:
+            changes.append(f"  {key}: {old_val} -> {new_val}")
+    return changes
+
+
 async def get_token(
     session: aiohttp.ClientSession,
     host: str,
@@ -167,6 +184,7 @@ async def run(args: argparse.Namespace) -> int:
     host = normalize_host(args.host)
     kind = args.kind
     expected_type_map = {
+        "any": None,
         "th": "THSensor",
         "temp": "THSensor",
         "motion": "MotionSensor",
@@ -176,7 +194,6 @@ async def run(args: argparse.Namespace) -> int:
         "lock": "Lock",
     }
     expected_type = expected_type_map[kind]
-    get_state_method = f"{expected_type}.getState"
 
     session = aiohttp.ClientSession()
     mqtt_client: mqtt.Client | None = None
@@ -208,15 +225,26 @@ async def run(args: argparse.Namespace) -> int:
             )
 
         if device is None:
-            print(f"ERROR: {expected_type} not found (check --device-id/--device-name)")
+            if expected_type is None:
+                print("ERROR: Device not found (check --device-id/--device-name)")
+                print("Available devices:")
+                for candidate in devices:
+                    print(
+                        f"  {candidate.get('deviceId')} "
+                        f"{candidate.get('type')} {candidate.get('name')}"
+                    )
+            else:
+                print(f"ERROR: {expected_type} not found (check --device-id/--device-name)")
             return 2
-        if device.get("type") != expected_type:
+        if expected_type is not None and device.get("type") != expected_type:
             print(
                 f"ERROR: Device {device.get('deviceId')} is {device.get('type')}, expected {expected_type}"
             )
             return 2
 
         device_id = device.get("deviceId")
+        device_type = device.get("type")
+        get_state_method = f"{device_type}.getState"
         state = await api_request(
             session=session,
             host=host,
@@ -247,6 +275,11 @@ async def run(args: argparse.Namespace) -> int:
             print(f"Watching device: {device.get('name')} ({device_id})")
             print(f"Initial motion state={baseline_motion}")
             print(f"Waiting up to {args.timeout}s for motion state change...")
+        elif kind == "any":
+            print(f"Watching device: {device.get('name')} ({device_id})")
+            print(f"Device type: {device_type}")
+            print(f"Initial state keys: {sorted(current_state.keys())}")
+            print(f"Waiting up to {args.timeout}s for any state change...")
         else:
             baseline_state = extract_motion(current_state)
             print(f"Watching device: {device.get('name')} ({device_id})")
@@ -270,6 +303,7 @@ async def run(args: argparse.Namespace) -> int:
             if event_device_id != device_id:
                 return
 
+            old_state = dict(current_state)
             current_state = merge_state(current_state, event_data)
 
             if kind in {"th", "temp"}:
@@ -305,6 +339,13 @@ async def run(args: argparse.Namespace) -> int:
                     print("CHANGE DETECTED")
                     print(f"motion_state: {baseline_motion} -> {now_motion}")
                     loop.call_soon_threadsafe(done.set)
+            elif kind == "any":
+                changes = diff_states(old_state, current_state)
+                if changes:
+                    print("CHANGE DETECTED")
+                    for change in changes:
+                        print(change)
+                    loop.call_soon_threadsafe(done.set)
             else:
                 now_state = extract_motion(current_state)
                 if now_state != baseline_state:
@@ -337,11 +378,11 @@ async def run(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     """Parse command line args with env var fallbacks."""
     parser = argparse.ArgumentParser(
-        description="Wait for YoLink TH or motion MQTT state change",
+        description="Wait for YoLink MQTT state changes",
     )
     parser.add_argument(
         "--kind",
-        choices=("th", "temp", "motion", "door", "tilt", "leak", "lock"),
+        choices=("any", "th", "temp", "motion", "door", "tilt", "leak", "lock"),
         default=os.getenv("YOLINK_KIND", "th"),
     )
     parser.add_argument(
@@ -383,7 +424,8 @@ def parse_args() -> argparse.Namespace:
     if not args.device_id and not args.device_name:
         parser.error(
             "Provide --device-id/--device-name or set kind-specific env vars "
-            "(YOLINK_*_SERIAL)."
+            "(YOLINK_*_SERIAL). Use --kind any with --device-id/--device-name "
+            "for device types without a dedicated wrapper."
         )
     return args
 

@@ -26,6 +26,15 @@ from yolink_tooling_common import (
 
 
 SERIAL_SUFFIX = "_SERIAL"
+REDACTED = "REDACTED"
+SENSITIVE_KEYS = {
+    "accesstoken",
+    "authorization",
+    "clientsecret",
+    "refreshtoken",
+    "token",
+    "secret",
+}
 
 
 @dataclass(slots=True)
@@ -38,6 +47,7 @@ class TrackedDevice:
     raw_type: str
     display_type: str
     token: str
+    alias: str
 
     @property
     def http_method(self) -> str:
@@ -66,6 +76,61 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     """Append one JSON record to a jsonl file."""
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True, default=json_default) + "\n")
+
+
+def alias_for_device(display_type: str, index: int) -> str:
+    """Return a stable, non-secret alias for captured device artifacts."""
+    safe_type = "".join(char for char in display_type if char.isalnum()) or "Device"
+    return f"{safe_type}-{index}"
+
+
+def sanitize_value(
+    value: Any,
+    *,
+    device_aliases: dict[str, str],
+    host: str,
+    net_id: str,
+) -> Any:
+    """Remove credentials and local identifiers from capture output."""
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = key.replace("_", "").replace("-", "").lower()
+            if normalized_key in SENSITIVE_KEYS:
+                sanitized[key] = REDACTED
+            elif key in {"host", "hub", "hub_host"}:
+                sanitized[key] = "REDACTED_HOST"
+            elif key in {"net_id", "netId", "net"}:
+                sanitized[key] = "REDACTED_NET_ID"
+            elif key in {"deviceId", "targetDevice", "device_id"} and isinstance(item, str):
+                sanitized[key] = device_aliases.get(item, REDACTED)
+            elif key in {"name", "device_name"} and isinstance(item, str):
+                sanitized[key] = device_aliases.get(item, REDACTED)
+            elif key in {"appEui"}:
+                sanitized[key] = REDACTED
+            else:
+                sanitized[key] = sanitize_value(
+                    item,
+                    device_aliases=device_aliases,
+                    host=host,
+                    net_id=net_id,
+                )
+        return sanitized
+    if isinstance(value, list):
+        return [
+            sanitize_value(item, device_aliases=device_aliases, host=host, net_id=net_id)
+            for item in value
+        ]
+    if isinstance(value, str):
+        sanitized = value
+        for raw_value, alias in device_aliases.items():
+            sanitized = sanitized.replace(raw_value, alias)
+        if host:
+            sanitized = sanitized.replace(host, "REDACTED_HOST")
+        if net_id:
+            sanitized = sanitized.replace(net_id, "REDACTED_NET_ID")
+        return sanitized
+    return value
 
 
 def configured_serials() -> dict[str, str]:
@@ -127,23 +192,27 @@ def resolve_devices(
     by_id = {device.get("deviceId"): device for device in devices}
     tracked: list[TrackedDevice] = []
     missing: list[dict[str, str]] = []
+    type_counts: dict[str, int] = {}
 
     for env_name, device_id in serial_map.items():
         device = by_id.get(device_id)
         if device is None:
             missing.append({"env_name": env_name, "device_id": device_id})
             continue
+        display_type = normalize_display_type(
+            device.get("type", ""),
+            device.get("appEui"),
+        )
+        type_counts[display_type] = type_counts.get(display_type, 0) + 1
         tracked.append(
             TrackedDevice(
                 env_name=env_name,
                 device_id=device_id,
                 name=device.get("name", ""),
                 raw_type=device.get("type", ""),
-                display_type=normalize_display_type(
-                    device.get("type", ""),
-                    device.get("appEui"),
-                ),
+                display_type=display_type,
                 token=device.get("token", ""),
+                alias=alias_for_device(display_type, type_counts[display_type]),
             )
         )
 
@@ -157,8 +226,11 @@ async def fetch_http_state(
     *,
     session: aiohttp.ClientSession,
     host: str,
+    output_host: str,
+    net_id: str,
     oauth_token: str,
     tracked: TrackedDevice,
+    device_aliases: dict[str, str],
 ) -> dict[str, Any]:
     """Fetch one device state and return a capture record."""
     api_payload = {
@@ -167,24 +239,32 @@ async def fetch_http_state(
         "token": tracked.token,
     }
     response = await api_request(session, host, oauth_token, api_payload)
-    return {
-        "captured_at": iso_now(),
-        "device_id": tracked.device_id,
-        "device_name": tracked.name,
-        "env_name": tracked.env_name,
-        "display_type": tracked.display_type,
-        "raw_type": tracked.raw_type,
-        "request": api_payload,
-        "response": response,
-    }
+    return sanitize_value(
+        {
+            "captured_at": iso_now(),
+            "device_id": tracked.device_id,
+            "device_name": tracked.name,
+            "env_name": tracked.env_name,
+            "display_type": tracked.display_type,
+            "raw_type": tracked.raw_type,
+            "request": api_payload,
+            "response": response,
+        },
+        device_aliases=device_aliases,
+        host=output_host,
+        net_id=net_id,
+    )
 
 
 async def capture_http_baseline(
     *,
     session: aiohttp.ClientSession,
     host: str,
+    output_host: str,
+    net_id: str,
     oauth_token: str,
     tracked_devices: list[TrackedDevice],
+    device_aliases: dict[str, str],
     out_dir: Path,
 ) -> list[dict[str, Any]]:
     """Capture one initial HTTP state snapshot per device."""
@@ -193,11 +273,14 @@ async def capture_http_baseline(
         record = await fetch_http_state(
             session=session,
             host=host,
+            output_host=output_host,
+            net_id=net_id,
             oauth_token=oauth_token,
             tracked=tracked,
+            device_aliases=device_aliases,
         )
         baselines.append(record)
-        device_dir = out_dir / "devices" / tracked.device_id
+        device_dir = out_dir / "devices" / tracked.alias
         device_dir.mkdir(parents=True, exist_ok=True)
         write_json(device_dir / "http_initial.json", record)
         append_jsonl(out_dir / "http_events.jsonl", {**record, "capture_kind": "initial"})
@@ -238,32 +321,48 @@ async def run_capture(args: argparse.Namespace) -> int:
         devices = device_list_response.get("data", {}).get("devices", [])
         tracked_devices = resolve_devices(devices, serial_map)
         tracked_by_id = {device.device_id: device for device in tracked_devices}
-
-        metadata = {
-            "captured_at": iso_now(),
-            "host": host,
-            "net_id": args.net_id,
-            "duration_seconds": args.duration,
-            "serial_env": serial_map,
-            "tracked_devices": [
-                {
-                    "env_name": device.env_name,
-                    "device_id": device.device_id,
-                    "name": device.name,
-                    "raw_type": device.raw_type,
-                    "display_type": device.display_type,
-                }
-                for device in tracked_devices
-            ],
-            "device_list_response": device_list_response,
+        device_aliases = {
+            device.device_id: device.alias for device in tracked_devices
+        } | {
+            device.name: device.alias
+            for device in tracked_devices
+            if device.name
         }
+
+        metadata = sanitize_value(
+            {
+                "captured_at": iso_now(),
+                "host": host,
+                "net_id": args.net_id,
+                "duration_seconds": args.duration,
+                "serial_env": serial_map,
+                "tracked_devices": [
+                    {
+                        "env_name": device.env_name,
+                        "device_id": device.device_id,
+                        "name": device.name,
+                        "alias": device.alias,
+                        "raw_type": device.raw_type,
+                        "display_type": device.display_type,
+                    }
+                    for device in tracked_devices
+                ],
+                "device_list_response": device_list_response,
+            },
+            device_aliases=device_aliases,
+            host=host,
+            net_id=args.net_id,
+        )
         write_json(out_dir / "metadata.json", metadata)
 
         await capture_http_baseline(
             session=session,
             host=host,
+            output_host=host,
+            net_id=args.net_id,
             oauth_token=oauth_token,
             tracked_devices=tracked_devices,
+            device_aliases=device_aliases,
             out_dir=out_dir,
         )
 
@@ -277,12 +376,14 @@ async def run_capture(args: argparse.Namespace) -> int:
                     record = await fetch_http_state(
                         session=session,
                         host=host,
+                        output_host=host,
+                        net_id=args.net_id,
                         oauth_token=oauth_token,
                         tracked=tracked,
+                        device_aliases=device_aliases,
                     )
                 except Exception as exc:
-                    append_jsonl(
-                        out_dir / "http_events.jsonl",
+                    error_record = sanitize_value(
                         {
                             "captured_at": iso_now(),
                             "capture_kind": "post_mqtt_error",
@@ -295,17 +396,29 @@ async def run_capture(args: argparse.Namespace) -> int:
                             "mqtt_payload": raw_payload,
                             "error": repr(exc),
                         },
+                        device_aliases=device_aliases,
+                        host=host,
+                        net_id=args.net_id,
                     )
+                    device_dir = out_dir / "devices" / tracked.alias
+                    device_dir.mkdir(parents=True, exist_ok=True)
+                    write_json(device_dir / f"http_after_mqtt_{sequence:04d}.json", error_record)
+                    append_jsonl(out_dir / "http_events.jsonl", error_record)
                     return
 
                 full_record = {
                     **record,
                     "capture_kind": "post_mqtt",
                     "sequence": sequence,
-                    "mqtt_payload": raw_payload,
+                    "mqtt_payload": sanitize_value(
+                        raw_payload,
+                        device_aliases=device_aliases,
+                        host=host,
+                        net_id=args.net_id,
+                    ),
                 }
                 append_jsonl(out_dir / "http_events.jsonl", full_record)
-                device_dir = out_dir / "devices" / tracked.device_id
+                device_dir = out_dir / "devices" / tracked.alias
                 write_json(
                     device_dir / f"http_after_mqtt_{sequence:04d}.json",
                     full_record,
@@ -355,8 +468,14 @@ async def run_capture(args: argparse.Namespace) -> int:
                 "raw_type": tracked.raw_type,
                 "mqtt_payload": payload,
             }
+            record = sanitize_value(
+                record,
+                device_aliases=device_aliases,
+                host=host,
+                net_id=args.net_id,
+            )
             append_jsonl(out_dir / "mqtt_events.jsonl", record)
-            device_dir = out_dir / "devices" / tracked.device_id
+            device_dir = out_dir / "devices" / tracked.alias
             write_json(device_dir / f"mqtt_{event_index:04d}.json", record)
             loop.call_soon_threadsafe(schedule_follow_up_http, tracked, payload, event_index)
 
@@ -372,8 +491,8 @@ async def run_capture(args: argparse.Namespace) -> int:
         print(f"Output directory: {out_dir}")
         for tracked in tracked_devices:
             print(
-                f"- {tracked.device_id} {tracked.display_type} "
-                f"({tracked.name or tracked.env_name})"
+                f"- {tracked.alias} {tracked.display_type} "
+                f"({tracked.env_name})"
             )
 
         await asyncio.sleep(args.duration)
@@ -381,19 +500,29 @@ async def run_capture(args: argparse.Namespace) -> int:
         if pending_http:
             await asyncio.gather(*pending_http, return_exceptions=True)
 
-        summary = {
-            "finished_at": iso_now(),
-            "host": host,
-            "net_id": args.net_id,
-            "duration_seconds": args.duration,
-            "output_dir": str(out_dir),
-            "event_counts": event_counts,
-            "devices_without_mqtt_events": [
-                tracked.device_id
-                for tracked in tracked_devices
-                if event_counts.get(tracked.device_id, 0) == 0
-            ],
+        aliased_event_counts = {
+            tracked_by_id[device_id].alias: count
+            for device_id, count in event_counts.items()
+            if device_id in tracked_by_id
         }
+        summary = sanitize_value(
+            {
+                "finished_at": iso_now(),
+                "host": host,
+                "net_id": args.net_id,
+                "duration_seconds": args.duration,
+                "output_dir": str(out_dir),
+                "event_counts": aliased_event_counts,
+                "devices_without_mqtt_events": [
+                    tracked.device_id
+                    for tracked in tracked_devices
+                    if event_counts.get(tracked.device_id, 0) == 0
+                ],
+            },
+            device_aliases=device_aliases,
+            host=host,
+            net_id=args.net_id,
+        )
         write_json(out_dir / "summary.json", summary)
         return 0
     finally:

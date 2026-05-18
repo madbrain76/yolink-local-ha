@@ -51,6 +51,17 @@ def _install_homeassistant_stubs() -> None:
 
     config_entries.ConfigEntry = ConfigEntry
 
+    exceptions = ModuleType("homeassistant.exceptions")
+
+    class ConfigEntryAuthFailed(Exception):
+        """Minimal auth failure stub."""
+
+    class ConfigEntryNotReady(Exception):
+        """Minimal not-ready stub."""
+
+    exceptions.ConfigEntryAuthFailed = ConfigEntryAuthFailed
+    exceptions.ConfigEntryNotReady = ConfigEntryNotReady
+
     helpers = ModuleType("homeassistant.helpers")
 
     update_coordinator = ModuleType("homeassistant.helpers.update_coordinator")
@@ -222,6 +233,7 @@ def _install_homeassistant_stubs() -> None:
 
     homeassistant.core = core
     homeassistant.config_entries = config_entries
+    homeassistant.exceptions = exceptions
     homeassistant.helpers = helpers
     homeassistant.util = util
     homeassistant.components = components
@@ -230,6 +242,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant"] = homeassistant
     sys.modules["homeassistant.core"] = core
     sys.modules["homeassistant.config_entries"] = config_entries
+    sys.modules["homeassistant.exceptions"] = exceptions
     sys.modules["homeassistant.helpers"] = helpers
     sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
     sys.modules["homeassistant.helpers.entity_platform"] = entity_platform

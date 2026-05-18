@@ -145,6 +145,7 @@ The `tests/` folder includes standalone test and diagnostics scripts that are no
   - `tests/wait_for_tilt.sh`
   - `tests/wait_for_leak.sh`
   - `tests/wait_for_lock.sh`
+  - `tests/wait_for_any.sh` (generic, device-type agnostic)
   - `tests/list_yolink_device_types.py`
   - `tests/capture_yolink_payloads.py`
 
@@ -211,6 +212,43 @@ Capture payloads for configured devices:
 python3 tests/capture_yolink_payloads.py --duration 300
 ```
 
+## Adding New Device Types
+
+To add support for a new YoLink device type, follow this procedure:
+
+### Step 1: List available device types
+
+```bash
+python3 tests/list_yolink_device_types.py
+```
+
+Identify the device type and model number of the new device.
+
+### Step 2: Capture payloads
+
+Set an environment variable with the device's serial (device ID) and run the capture script:
+
+```bash
+export YOLINK_MYNEWDEV_SERIAL=<device-id-from-step-1>
+python3 tests/capture_yolink_payloads.py --duration 300
+```
+
+This captures both HTTP state responses and MQTT events. By default, output is saved to a timestamped `captures/yolink-payloads-*` directory.
+
+### Step 3: Validate device behavior
+
+Use the generic wait script to confirm state changes are detected:
+
+```bash
+./tests/wait_for_any.sh --device-name "<device-name>" --timeout 120
+```
+
+Manually trigger the device (e.g., open/close a door, detect motion) and verify the script reports the change.
+
+### Step 4: Analyze and implement
+
+Study the captured payloads in `captures/yolink-payloads-*/` to understand the state format, field names, and MQTT event structure. Then add the device type to the appropriate platform file (`binary_sensor.py`, `sensor.py`, `switch.py`, etc.) in `custom_components/yolocal/`. Re-run the capture and wait scripts after implementation to confirm the new entity maps the same fields reported by the hub.
+
 ## Troubleshooting
 
 ### Integration doesn't appear after restart
@@ -234,8 +272,9 @@ Real-time updates require MQTT. If updates only happen on HA restart, check that
 Contributions are welcome. To add support for additional device types:
 
 1. Check the [YoLink Local API documentation](https://doc.yosmart.com/docs/protocol/local_hub/localHubMethods)
-2. Add the device type to the appropriate platform file
-3. Submit a pull request
+2. Follow the [Adding New Device Types](#adding-new-device-types) capture procedure above
+3. Add the device type to the appropriate platform file
+4. Submit a pull request
 
 ## License
 
