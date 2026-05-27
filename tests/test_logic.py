@@ -12,7 +12,14 @@ from custom_components.yolocal.api.device import Device
 from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import YoLocalCoordinator
 from custom_components.yolocal.entity import YoLocalEntity
-from custom_components.yolocal.sensor import YoLocalTHLimitSensor
+from custom_components.yolocal.sensor import (
+    YoLocalBatterySensor,
+    YoLocalLastReportedSensor,
+    YoLocalOutletPowerSensor,
+    YoLocalTHLimitSensor,
+    build_sensor_entities,
+)
+from custom_components.yolocal.switch import YoLocalSwitch
 from capture_yolink_payloads import sanitize_value
 
 
@@ -376,6 +383,170 @@ def test_state_value_prefers_nested_with_top_level_fallback() -> None:
     assert entity.state_value("version", fallback=True) == "top"
 
 
+def test_outlet_does_not_create_battery_sensor_without_battery_payload() -> None:
+    """Powered outlets should not get a synthetic battery diagnostic sensor."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", display_type="Outlet")
+    coordinator._states[device.device_id] = {
+        "state": {
+            "delay": {"ch": 1, "off": 0, "on": 0},
+            "power": 0,
+            "state": "open",
+            "version": "1404",
+            "watt": 0,
+        }
+    }
+
+    entities = build_sensor_entities(coordinator, device)
+
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
+
+
+def test_outlet_creates_power_sensor_from_deciwatt_payload() -> None:
+    """Outlet power should use the deciwatt payload field, not the zero watt field."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", display_type="Outlet")
+    coordinator._states[device.device_id] = {
+        "state": {
+            "delay": {"ch": 1, "off": 0, "on": 0},
+            "power": 57,
+            "state": "open",
+            "version": "1404",
+            "watt": 0,
+        }
+    }
+
+    entities = build_sensor_entities(coordinator, device)
+    power_sensors = [
+        entity for entity in entities if isinstance(entity, YoLocalOutletPowerSensor)
+    ]
+
+    assert len(power_sensors) == 1
+    assert power_sensors[0].native_value == 5.7
+
+
+def test_battery_sensor_is_created_only_when_payload_has_battery() -> None:
+    """Battery sensors should be discovered from payload fields, not device type."""
+    coordinator = make_coordinator()
+    door = make_device(
+        device_id=make_device_id("door-no-battery"),
+        device_type="DoorSensor",
+        display_type="DoorSensor",
+    )
+    unknown = make_device(
+        device_id=make_device_id("unknown-with-battery"),
+        device_type="UnknownDevice",
+        display_type="UnknownDevice",
+    )
+    coordinator._states[unknown.device_id] = {"state": {"battery": 4}}
+
+    door_entities = build_sensor_entities(coordinator, door)
+    unknown_entities = build_sensor_entities(coordinator, unknown)
+
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in door_entities)
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in unknown_entities)
+
+
+def test_outlet_switch_reads_nested_and_flat_state() -> None:
+    """Outlet switch state should handle HTTP-like nested and flat states."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", display_type="Outlet")
+    entity = YoLocalSwitch(coordinator, device)
+
+    coordinator._states[device.device_id] = {"state": {"state": "open"}}
+    assert entity.is_on is True
+
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+    assert entity.is_on is False
+
+    coordinator._states[device.device_id] = {"state": "open"}
+    assert entity.is_on is True
+
+
+def test_outlet_switch_tracks_physical_mqtt_state_changes() -> None:
+    """Outlet physical toggles should not collapse back to off after MQTT updates."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", display_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "delay": {"ch": 1, "off": 0, "on": 0},
+        "power": 0,
+        "state": "closed",
+        "watt": 0,
+    }
+    entity = YoLocalSwitch(coordinator, device)
+
+    open_event = coordinator._normalize_mqtt_event(
+        device,
+        {
+            "state": "open",
+            "loraInfo": {"devNetType": "A", "signal": 0, "gatewayId": "", "gateways": 1},
+            "lastReportedAt": "2026-05-27T05:55:21.874000+00:00",
+        },
+    )
+    coordinator._update_device_state(
+        device.device_id,
+        coordinator._merge_state_payload(
+            coordinator.get_state(device.device_id),
+            open_event,
+        ),
+    )
+
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+    assert entity.is_on is True
+
+    closed_event = coordinator._normalize_mqtt_event(
+        device,
+        {
+            "state": "closed",
+            "loraInfo": {"devNetType": "A", "signal": 0, "gatewayId": "", "gateways": 1},
+            "lastReportedAt": "2026-05-27T05:54:59.326000+00:00",
+        },
+    )
+    coordinator._update_device_state(
+        device.device_id,
+        coordinator._merge_state_payload(
+            coordinator.get_state(device.device_id),
+            closed_event,
+        ),
+    )
+
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "closed"
+    assert entity.is_on is False
+
+
+def test_async_send_command_refreshes_state_and_notifies_coordinator() -> None:
+    """Command refresh should publish the authoritative post-command state."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+
+    calls: list[tuple[str, object]] = []
+
+    async def set_state(_device: Device, params: dict[str, object]) -> dict[str, object]:
+        calls.append(("set_state", params))
+        return {"ok": True}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        calls.append(("get_state", None))
+        return {
+            "reportAt": "2026-05-22T12:00:00+00:00",
+            "state": {"state": "open"},
+        }
+
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+
+    result = asyncio.run(
+        coordinator.async_send_command(device.device_id, {"state": "open"})
+    )
+
+    assert result == {"ok": True}
+    assert calls == [("set_state", {"state": "open"}), ("get_state", None)]
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+    assert coordinator.data == coordinator._states
+
+
 def test_entity_availability_handles_offline_and_stale_devices() -> None:
     """Availability logic should be conservative for offline or stale devices."""
     coordinator = make_coordinator()
@@ -398,6 +569,32 @@ def test_entity_availability_handles_offline_and_stale_devices() -> None:
         "lastReportedAt": fresh.isoformat(),
     }
     assert entity.available is True
+
+
+def test_last_reported_sensor_keeps_value_during_partial_updates() -> None:
+    """Partial payloads should not make the diagnostic timestamp flicker unavailable."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", display_type="Outlet")
+    sensor = YoLocalLastReportedSensor(coordinator, device)
+
+    coordinator._states[device.device_id] = {
+        "lastReportedAt": "2026-05-27T05:55:21.874000+00:00"
+    }
+    initial_value = sensor.native_value
+
+    assert initial_value is not None
+    assert sensor.available is True
+
+    coordinator._states[device.device_id] = {"state": {"state": "open"}}
+
+    assert sensor.available is True
+    assert sensor.native_value == initial_value
+
+    coordinator._states[device.device_id] = {
+        "reportAt": "2026-05-27T05:56:00.000000+00:00"
+    }
+
+    assert sensor.native_value == datetime(2026, 5, 27, 5, 56, tzinfo=UTC)
 
 
 def test_th_limit_sensor_filters_sentinel_values() -> None:

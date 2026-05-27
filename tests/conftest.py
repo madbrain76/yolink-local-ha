@@ -196,6 +196,7 @@ def _install_homeassistant_stubs() -> None:
 
     class SensorDeviceClass:
         BATTERY = "battery"
+        POWER = "power"
         TIMESTAMP = "timestamp"
         TEMPERATURE = "temperature"
         HUMIDITY = "humidity"
@@ -223,13 +224,29 @@ def _install_homeassistant_stubs() -> None:
     binary_sensor.BinarySensorEntity = BinarySensorEntity
     binary_sensor.BinarySensorDeviceClass = BinarySensorDeviceClass
 
+    switch = ModuleType("homeassistant.components.switch")
+
+    class SwitchEntity:
+        async def async_remove(self) -> None:
+            return None
+
+    class SwitchDeviceClass:
+        OUTLET = "outlet"
+
+    switch.SwitchEntity = SwitchEntity
+    switch.SwitchDeviceClass = SwitchDeviceClass
+
     const = ModuleType("homeassistant.const")
     const.PERCENTAGE = "%"
 
     class UnitOfTemperature:
         CELSIUS = "C"
 
+    class UnitOfPower:
+        WATT = "W"
+
     const.UnitOfTemperature = UnitOfTemperature
+    const.UnitOfPower = UnitOfPower
 
     homeassistant.core = core
     homeassistant.config_entries = config_entries
@@ -254,6 +271,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components"] = components
     sys.modules["homeassistant.components.sensor"] = sensor
     sys.modules["homeassistant.components.binary_sensor"] = binary_sensor
+    sys.modules["homeassistant.components.switch"] = switch
     sys.modules["homeassistant.const"] = const
 
 

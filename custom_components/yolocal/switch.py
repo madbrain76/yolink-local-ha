@@ -70,6 +70,8 @@ class YoLocalSwitch(YoLocalEntity, SwitchEntity):
     def is_on(self) -> bool | None:
         """Return True if the switch is on."""
         state = self.device_state.get("state")
+        if isinstance(state, dict):
+            state = state.get("state")
         if state is None:
             return None
         # YoLink uses "open" for on, "closed" for off (relay terminology)

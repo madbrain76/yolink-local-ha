@@ -452,11 +452,17 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     async def async_send_command(
         self, device_id: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Send a command to a device."""
+        """Send a command to a device and refresh its authoritative state."""
         device = self._devices.get(device_id)
         if not device:
             raise ValueError(f"Unknown device: {device_id}")
-        return await self._client.set_state(device, params)
+        result = await self._client.set_state(device, params)
+        try:
+            state = await self._client.get_state(device)
+            self._update_device_state(device_id, self._normalize_http_state(state))
+        except Exception:
+            _LOGGER.warning("Failed to refresh state after command for %s", device.name)
+        return result
 
 
 async def create_coordinator(

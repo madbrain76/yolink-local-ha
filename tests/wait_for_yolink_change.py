@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+from pathlib import Path
 import time
 from typing import Any
 
@@ -377,8 +378,24 @@ async def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     """Parse command line args with env var fallbacks."""
+    prog = Path(os.getenv("YOLOCAL_WRAPPER_NAME") or "wait_for_yolink_change.py").name
     parser = argparse.ArgumentParser(
         description="Wait for YoLink MQTT state changes",
+        prog=prog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  ./wait_for_any.sh --device-name \"Kitchen plug\" --timeout 120\n"
+            "  ./wait_for_any.sh --device-id d88b4c0100012345 --timeout 120\n"
+            "  ./wait_for_motion.sh --7805 --timeout 120\n\n"
+            "Find device names and ids with:\n"
+            "  uv run python tests/list_yolink_devices.py\n"
+            "or, for type/model summary:\n"
+            "  uv run python tests/list_yolink_device_types.py\n\n"
+            "Required connection environment:\n"
+            "  YOLINK_HOST, YOLINK_CLIENT_ID, YOLINK_CLIENT_SECRET, "
+            "YOLINK_NET or YOLINK_NET_ID"
+        ),
     )
     parser.add_argument(
         "--kind",
@@ -422,10 +439,19 @@ def parse_args() -> argparse.Namespace:
     if not args.device_name:
         args.device_name = default_name or None
     if not args.device_id and not args.device_name:
+        if args.kind == "any":
+            parser.error(
+                "Generic wait needs a target device. Provide --device-id or "
+                "--device-name.\n\n"
+                "Examples:\n"
+                "  ./wait_for_any.sh --device-name \"Kitchen plug\" --timeout 120\n"
+                "  ./wait_for_any.sh --device-id d88b4c0100012345 --timeout 120\n\n"
+                "List devices with:\n"
+                "  uv run python tests/list_yolink_devices.py"
+            )
         parser.error(
-            "Provide --device-id/--device-name or set kind-specific env vars "
-            "(YOLINK_*_SERIAL). Use --kind any with --device-id/--device-name "
-            "for device types without a dedicated wrapper."
+            "Provide --device-id/--device-name or set the matching "
+            "YOLINK_*_SERIAL environment variable for this wrapper."
         )
     return args
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -10,7 +11,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTemperature
+from homeassistant.const import PERCENTAGE, UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -21,16 +22,30 @@ from .coordinator import YoLocalCoordinator
 from .entity import YoLocalEntity
 
 
+def _state_has_battery(state: dict[str, Any]) -> bool:
+    """Return True when a state payload carries a battery field."""
+    if "battery" in state:
+        return True
+    nested_state = state.get("state")
+    return isinstance(nested_state, dict) and "battery" in nested_state
+
+
+def _device_has_battery(coordinator: YoLocalCoordinator, device) -> bool:
+    """Return True when the current payload carries a battery field."""
+    return _state_has_battery(coordinator.get_state(device.device_id))
+
+
 def build_sensor_entities(
     coordinator: YoLocalCoordinator,
     device,
 ) -> list[SensorEntity]:
     """Build all sensor entities for a device."""
     entities: list[SensorEntity] = [
-        YoLocalBatterySensor(coordinator, device),
         YoLocalFirmwareSensor(coordinator, device),
         YoLocalLastReportedSensor(coordinator, device),
     ]
+    if _device_has_battery(coordinator, device):
+        entities.insert(0, YoLocalBatterySensor(coordinator, device))
 
     if device.device_type == "THSensor":
         has_threshold_sensors = device.model not in {"YS8003-UC", "YS8004-UC"}
@@ -83,6 +98,12 @@ def build_sensor_entities(
                 YoLocalDoorDelaySensor(coordinator, device),
                 YoLocalDoorOpenRemindDelaySensor(coordinator, device),
                 YoLocalDoorAlertIntervalSensor(coordinator, device),
+            ]
+        )
+    elif device.device_type == "Outlet":
+        entities.extend(
+            [
+                YoLocalOutletPowerSensor(coordinator, device),
             ]
         )
 
@@ -199,6 +220,7 @@ class YoLocalLastReportedSensor(YoLocalEntity, SensorEntity):
         """Initialize the sensor."""
         super().__init__(coordinator, device)
         self._attr_unique_id = f"{device.device_id}_last_reported"
+        self._last_native_value: datetime | None = None
 
     @property
     def available(self) -> bool:
@@ -208,10 +230,18 @@ class YoLocalLastReportedSensor(YoLocalEntity, SensorEntity):
     @property
     def native_value(self) -> datetime | None:
         """Return the last reported timestamp."""
-        report_at = self.device_state.get("lastReportedAt")
-        if report_at:
-            return dt_util.parse_datetime(report_at)
-        return None
+        for key in ("lastReportedAt", "reportAt"):
+            report_at = self.device_state.get(key)
+            if not report_at:
+                continue
+            try:
+                parsed = dt_util.parse_datetime(report_at)
+            except (TypeError, ValueError):
+                continue
+            if parsed is not None:
+                self._last_native_value = parsed
+                return parsed
+        return self._last_native_value
 
 
 class YoLocalTemperatureSensor(YoLocalEntity, SensorEntity):
@@ -405,6 +435,29 @@ class YoLocalDeviceTemperatureSensor(YoLocalEntity, SensorEntity):
     def native_value(self) -> int | None:
         """Return the device temperature."""
         return self.state_value("devTemperature")
+
+
+class YoLocalOutletPowerSensor(YoLocalEntity, SensorEntity):
+    """Active power sensor for YoLink outlets."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_suggested_display_precision = 1
+    _attr_name = "Power"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_power"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return active power in watts from the Outlet deciwatt field."""
+        power = self.state_value("power", fallback=True)
+        if power is None:
+            return None
+        return float(power) / 10
 
 
 class YoLocalMotionSensitivitySensor(YoLocalEntity, SensorEntity):

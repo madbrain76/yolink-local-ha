@@ -37,6 +37,7 @@ Matter can leave YoLink sensors stale when battery runs out, which can cause inc
 | DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
 | LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
+| Outlet | Switch, Sensor | On/off state, power | YS6614-UC
 | TempSensor | Sensor Sensor | Temperature, battery | YS8004-UC
 | THSensor | Sensor | Temperature, humidity, battery | YS8003-UC, YS8005-UC
 | TiltSensor | Binary Sensor | Temperature, battery | YS7706-UC
@@ -52,6 +53,7 @@ This project includes additional entities and diagnostics, not available in the 
 - DoorSensor: `Alert interval`, `Delay`, `Open remind delay`
 - LeakSensor: `Detector error`, `Device temperature`, `Freeze error`, `Reminder`
 - MotionSensor : `Alert interval`, `Device temperature`, `LED alarm`, `No-motion delay`, `Sensitivity`
+- Outlet: `Power`
 - TempSensor : `High humidity` (bug), `High temperature`, `Low humidity` (bug), `Low temperature`, `Reporting interval`, `Temperature correction`
 - THSensor 8003 : `High humidity`, `High temperature`, `Humidity correction`, `LCD temperature unit`, `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`
 - THSensor 8005 : `High humidity`, `High temperature`, `Humidity correction`, `Humidity max threshold`, `Humidity min threshold`, `LCD temperature unit` (bug), `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`, `Temperature max threshold`, `Temperature min threshold`
@@ -59,6 +61,8 @@ This project includes additional entities and diagnostics, not available in the 
 
 Diagnostics entities listed as "bug" are being returned from the Yolink local API in JSON responses, but not actually applicable to the specific models. This integration merely exposes them. The values are bogus, and should be ignored.
 This bug would be best fixed by Yolink in their local API implementation, rather than manually blacklisted in this project.
+
+Outlet `Power` is derived from the local API `power` field, which reports deciwatts on the tested YS6614-UC smart plug. The local API `watt` field was observed to remain at `0` and is not exposed.
 
 ## Prerequisites
 
@@ -146,6 +150,7 @@ The `tests/` folder includes standalone test and diagnostics scripts that are no
   - `tests/wait_for_leak.sh`
   - `tests/wait_for_lock.sh`
   - `tests/wait_for_any.sh` (generic, device-type agnostic)
+  - `tests/list_yolink_devices.py`
   - `tests/list_yolink_device_types.py`
   - `tests/capture_yolink_payloads.py`
 
@@ -197,7 +202,13 @@ export YOLINK_LOCK_MODEL_NUMBER_SERIAL=
 List detected type/model pairs:
 
 ```bash
-python3 tests/list_yolink_device_types.py
+uv run python tests/list_yolink_device_types.py
+```
+
+List device ids and names:
+
+```bash
+uv run python tests/list_yolink_devices.py
 ```
 
 Wait for TH unit change:
@@ -209,7 +220,7 @@ Wait for TH unit change:
 Capture payloads for configured devices:
 
 ```bash
-python3 tests/capture_yolink_payloads.py --duration 300
+uv run python tests/capture_yolink_payloads.py --duration 300
 ```
 
 ## Adding New Device Types
@@ -219,7 +230,7 @@ To add support for a new YoLink device type, follow this procedure:
 ### Step 1: List available device types
 
 ```bash
-python3 tests/list_yolink_device_types.py
+uv run python tests/list_yolink_device_types.py
 ```
 
 Identify the device type and model number of the new device.
@@ -230,7 +241,7 @@ Set an environment variable with the device's serial (device ID) and run the cap
 
 ```bash
 export YOLINK_MYNEWDEV_SERIAL=<device-id-from-step-1>
-python3 tests/capture_yolink_payloads.py --duration 300
+uv run python tests/capture_yolink_payloads.py --duration 300
 ```
 
 This captures both HTTP state responses and MQTT events. By default, output is saved to a timestamped `captures/yolink-payloads-*` directory.

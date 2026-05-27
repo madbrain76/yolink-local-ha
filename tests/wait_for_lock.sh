@@ -5,6 +5,7 @@ set -euo pipefail
 # Use placeholder env var name until model is identified:
 #   YOLINK_LOCK_MODEL_NUMBER_SERIAL=<deviceId>
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/_python.sh"
 LOCK_ID="${YOLINK_LOCK_MODEL_NUMBER_SERIAL:-}"
 
 if [[ -z "${LOCK_ID}" ]]; then
@@ -14,7 +15,7 @@ if [[ -z "${LOCK_ID}" ]]; then
   exit 0
 fi
 
-exec python3 "${SCRIPT_DIR}/wait_for_yolink_change.py" \
+exec_yolink_python "${SCRIPT_DIR}/wait_for_yolink_change.py" \
   --kind lock \
   --device-id "${LOCK_ID}" \
   "$@"
