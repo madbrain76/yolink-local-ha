@@ -109,15 +109,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._devices = {d.device_id: d for d in devices}
         self._remove_stale_registry_devices(set(self._devices))
 
-        await self._fetch_all_states()
-        try:
-            await self._connect_mqtt()
-        except Exception:
-            _LOGGER.warning(
-                "Initial MQTT connection failed; reconnecting in background",
-                exc_info=True,
-            )
-            self._on_mqtt_disconnect()
+        self._on_mqtt_disconnect()
 
         if self._discovery_task is None:
             self._discovery_task = self._create_background_task(
@@ -132,47 +124,53 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     async def _fetch_all_states(self) -> None:
         """Fetch current state for all devices via HTTP API."""
-        for device in self._devices.values():
-            try:
-                state = await self._async_get_state_with_retry(device)
-                if state is None:
-                    self._states[device.device_id] = self._mark_unreachable(
-                        self._states.get(device.device_id, {})
-                    )
-                    continue
-                self._states[device.device_id] = self._normalize_http_state(state)
-            except Exception:
-                _LOGGER.warning("Failed to get state for %s", device.name, exc_info=True)
-                self._states.setdefault(device.device_id, {})
+        self._states = await self._async_update_data()
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         """Refresh device state from the hub and merge it into the cache."""
-        refreshed_states = self._states.copy()
-
-        for device_id, device in self._devices.items():
-            try:
-                state = await self._async_get_state_with_retry(device)
-                if state is None:
-                    refreshed_states[device_id] = self._mark_unreachable(
-                        refreshed_states.get(device_id, {})
-                    )
-                    continue
-            except Exception:
-                _LOGGER.warning(
-                    "Failed to refresh state for %s",
-                    device.name,
-                    exc_info=True,
+        results = await asyncio.gather(
+            *(
+                self._async_refresh_device_state(
+                    device_id,
+                    device,
                 )
-                continue
-
-            normalized_state = self._normalize_http_state(state)
-            refreshed_states[device_id] = self._merge_state_payload(
-                refreshed_states.get(device_id, {}),
-                normalized_state,
+                for device_id, device in self._devices.items()
             )
+        )
+
+        refreshed_states = self._states.copy()
+        for device_id, incoming_state, unreachable in results:
+            current_state = refreshed_states.get(device_id, {})
+            if unreachable:
+                refreshed_states[device_id] = self._mark_unreachable(current_state)
+            elif incoming_state is not None:
+                refreshed_states[device_id] = self._merge_state_payload(
+                    current_state,
+                    incoming_state,
+                )
 
         self._states = refreshed_states
         return refreshed_states.copy()
+
+    async def _async_refresh_device_state(
+        self,
+        device_id: str,
+        device: Device,
+    ) -> tuple[str, dict[str, Any] | None, bool]:
+        """Fetch one device state and return the HTTP payload to merge."""
+        try:
+            state = await self._async_get_state_with_retry(device)
+            if state is None:
+                return device_id, None, True
+        except Exception:
+            _LOGGER.warning(
+                "Failed to refresh state for %s",
+                device.name,
+                exc_info=True,
+            )
+            return device_id, None, False
+
+        return device_id, self._normalize_http_state(state), False
 
     def _state_is_stale(self, state: dict[str, Any]) -> bool:
         """Return True when a state has not reported within the stale window."""

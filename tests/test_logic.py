@@ -885,39 +885,92 @@ def test_async_update_data_polls_when_report_is_old() -> None:
     assert refreshed[device.device_id]["state"]["battery"] == 4
 
 
+def test_async_update_data_refreshes_devices_concurrently() -> None:
+    """State polling should not serialize startup across every device."""
+    coordinator = make_coordinator()
+    first = make_device(device_id=make_device_id("first"), device_type="DoorSensor")
+    second = make_device(device_id=make_device_id("second"), device_type="DoorSensor")
+    coordinator._devices = {
+        first.device_id: first,
+        second.device_id: second,
+    }
+
+    async def run_refresh() -> dict[str, dict[str, object]]:
+        started: list[str] = []
+        both_started = asyncio.Event()
+
+        async def get_state(device: Device) -> dict[str, object]:
+            started.append(device.device_id)
+            if len(started) == 2:
+                both_started.set()
+            await both_started.wait()
+            return {"state": {"battery": 4}}
+
+        coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+        return await asyncio.wait_for(coordinator._async_update_data(), timeout=1)
+
+    refreshed = asyncio.run(run_refresh())
+
+    assert refreshed[first.device_id]["state"]["battery"] == 4
+    assert refreshed[second.device_id]["state"]["battery"] == 4
+
+
+def test_async_update_data_merges_http_results_with_current_state() -> None:
+    """HTTP refresh completion should not discard MQTT updates from the same window."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("race"), device_type="DoorSensor")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "state": {"battery": 2, "state": "closed"},
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        coordinator._states[device.device_id] = {
+            "state": {"battery": 2, "state": "open"},
+            "lastReportedAt": "2026-03-09T12:00:00+00:00",
+        }
+        return {"state": {"battery": 4}}
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert refreshed[device.device_id]["state"] == {"battery": 4, "state": "open"}
+    assert (
+        refreshed[device.device_id]["lastReportedAt"]
+        == "2026-03-09T12:00:00+00:00"
+    )
+
+
 def test_async_setup_defers_initial_data_publication() -> None:
-    """Initial setup should leave data publication to the first coordinator refresh."""
+    """Initial setup should leave state polling to the first coordinator refresh."""
     coordinator = make_coordinator()
     device = make_device(device_id=make_device_id("setup"), device_type="DoorSensor")
+    get_state_calls: list[str] = []
 
     async def get_devices() -> list[Device]:
         return [device]
 
     async def get_state(_device: Device) -> dict[str, object]:
+        get_state_calls.append("called")
         return {
             "reportAt": "2026-03-09T12:00:00+00:00",
             "state": {"battery": 4, "state": "closed"},
         }
-
-    async def connect_mqtt() -> None:
-        return None
 
     coordinator._client = SimpleNamespace(
         get_devices=get_devices,
         get_state=get_state,
         host="127.0.0.1",
     )
-    coordinator._connect_mqtt = connect_mqtt
 
     asyncio.run(coordinator._async_setup())
 
     assert coordinator.data is None
     assert coordinator._state_refresh_task is not None
-    assert coordinator.get_state(device.device_id)["state"]["battery"] == 4
-    assert (
-        coordinator.get_state(device.device_id)["lastReportedAt"]
-        == "2026-03-09T12:00:00+00:00"
-    )
+    assert coordinator._reconnect_task is not None
+    assert coordinator.get_state(device.device_id) == {}
+    assert get_state_calls == []
     for coro in coordinator.hass._scheduled_coroutines:
         coro.close()
 
