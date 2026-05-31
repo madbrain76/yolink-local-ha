@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Coroutine
+from datetime import timedelta
 from typing import Any
 
 import aiohttp
@@ -13,18 +14,26 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from .api import (
+    ApiError,
     Device,
     DeviceEvent,
     TokenManager,
     YoLinkClient,
     YoLinkMQTTClient,
 )
-from .const import DEVICE_DISCOVERY_INTERVAL, DOMAIN, UPDATE_INTERVAL
+from .const import (
+    DEVICE_DISCOVERY_INTERVAL,
+    DOMAIN,
+    UPDATE_INTERVAL,
+)
 
 _LOGGER = logging.getLogger(__name__)
 type DeviceRegistryListener = Callable[[list[Device], list[Device]], None]
+TRANSIENT_DEVICE_UNREACHABLE = "000201"
+STALE_REPORT_AGE = timedelta(hours=12)
 
 
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
@@ -50,7 +59,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             hass,
             _LOGGER,
             name="YoLink Local",
-            update_interval=UPDATE_INTERVAL,
+            update_interval=None,
         )
         self._client = client
         self._token_manager = token_manager
@@ -63,6 +72,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._states: dict[str, dict[str, Any]] = {}
         self._reconnect_task: asyncio.Task[None] | None = None
         self._discovery_task: asyncio.Task[None] | None = None
+        self._state_refresh_task: asyncio.Task[None] | None = None
         self._device_registry_listeners: list[DeviceRegistryListener] = []
         self._shutdown = False
 
@@ -114,17 +124,25 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 self._async_device_discovery_loop(),
                 "yolocal_device_discovery",
             )
-
-        self.async_set_updated_data(self._states.copy())
+        if self._state_refresh_task is None:
+            self._state_refresh_task = self._create_background_task(
+                self._async_state_refresh_loop(),
+                "yolocal_state_refresh",
+            )
 
     async def _fetch_all_states(self) -> None:
         """Fetch current state for all devices via HTTP API."""
         for device in self._devices.values():
             try:
-                state = await self._client.get_state(device)
+                state = await self._async_get_state_with_retry(device)
+                if state is None:
+                    self._states[device.device_id] = self._mark_unreachable(
+                        self._states.get(device.device_id, {})
+                    )
+                    continue
                 self._states[device.device_id] = self._normalize_http_state(state)
             except Exception:
-                _LOGGER.warning("Failed to get state for %s", device.name)
+                _LOGGER.warning("Failed to get state for %s", device.name, exc_info=True)
                 self._states.setdefault(device.device_id, {})
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
@@ -133,9 +151,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         for device_id, device in self._devices.items():
             try:
-                state = await self._client.get_state(device)
+                state = await self._async_get_state_with_retry(device)
+                if state is None:
+                    refreshed_states[device_id] = self._mark_unreachable(
+                        refreshed_states.get(device_id, {})
+                    )
+                    continue
             except Exception:
-                _LOGGER.warning("Failed to refresh state for %s", device.name)
+                _LOGGER.warning(
+                    "Failed to refresh state for %s",
+                    device.name,
+                    exc_info=True,
+                )
                 continue
 
             normalized_state = self._normalize_http_state(state)
@@ -147,12 +174,72 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._states = refreshed_states
         return refreshed_states.copy()
 
+    def _state_is_stale(self, state: dict[str, Any]) -> bool:
+        """Return True when a state has not reported within the stale window."""
+        report_at = state.get("lastReportedAt")
+        if not report_at:
+            return False
+        try:
+            last_report = dt_util.parse_datetime(report_at)
+        except (TypeError, ValueError):
+            return False
+        return last_report is not None and dt_util.utcnow() - last_report > STALE_REPORT_AGE
+
+    async def _async_get_state_with_retry(
+        self,
+        device: Device,
+        attempts: int = 3,
+    ) -> dict[str, Any] | None:
+        """Fetch device state, tolerating transient hub-to-device failures."""
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._client.get_state(device)
+            except ApiError as err:
+                if err.code != TRANSIENT_DEVICE_UNREACHABLE:
+                    raise
+                if attempt < attempts:
+                    await asyncio.sleep(1)
+                    continue
+                _LOGGER.debug(
+                    "Device state temporarily unavailable for %s: %s",
+                    device.name,
+                    err,
+                )
+                return None
+        return None
+
+    async def _async_set_state_with_retry(
+        self,
+        device: Device,
+        params: dict[str, Any],
+        attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Set device state, retrying transient hub-to-device failures."""
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._client.set_state(device, params)
+            except ApiError as err:
+                if err.code != TRANSIENT_DEVICE_UNREACHABLE:
+                    raise
+                if attempt < attempts:
+                    await asyncio.sleep(1)
+                    continue
+                self._update_device_state(
+                    device.device_id,
+                    {**self._states.get(device.device_id, {}), "online": False},
+                )
+                raise
+        raise RuntimeError("Failed to set device state")
+
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
         self._shutdown = True
         if self._discovery_task:
             self._discovery_task.cancel()
             self._discovery_task = None
+        if self._state_refresh_task:
+            self._state_refresh_task.cancel()
+            self._state_refresh_task = None
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
@@ -215,9 +302,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     def _normalize_http_state(self, state: dict[str, Any]) -> dict[str, Any]:
         """Normalize an HTTP getState payload to the coordinator's canonical shape."""
         normalized_state = self._sanitize_state_payload(state)
+        normalized_state.setdefault("online", True)
         if normalized_state.get("reportAt") and "lastReportedAt" not in normalized_state:
             normalized_state["lastReportedAt"] = normalized_state["reportAt"]
         return normalized_state
+
+    def _mark_unreachable(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Mark a device unavailable after repeated read-only getState failures."""
+        if not state:
+            return {"online": False}
+        if state.get("online") is False:
+            return state
+        return {**state, "online": False}
 
     def _normalize_mqtt_event(
         self,
@@ -271,6 +367,27 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             merged_state["state"] = merged_nested_state
         self._apply_event_availability(existing_state, incoming_state, merged_state)
         return merged_state
+
+    def _merge_device_state(
+        self,
+        device_id: str,
+        event_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge a raw device event into the cached state shape."""
+        device = self._devices[device_id]
+        normalized_event = self._normalize_mqtt_event(device, event_data)
+        return self._merge_state_payload(
+            self._states.get(device_id, {}),
+            normalized_event,
+        )
+
+    def _merge_thsensor_state(
+        self,
+        device_id: str,
+        event_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge a raw THSensor event into the cached state shape."""
+        return self._merge_device_state(device_id, event_data)
 
     def _apply_event_availability(
         self,
@@ -349,6 +466,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         while not self._shutdown:
             await asyncio.sleep(interval)
             await self._async_refresh_devices()
+
+    async def _async_state_refresh_loop(self) -> None:
+        """Periodically poll getState independent of HA coordinator scheduling."""
+        interval = UPDATE_INTERVAL.total_seconds()
+        while not self._shutdown:
+            await asyncio.sleep(interval)
+            try:
+                refreshed_states = await self._async_update_data()
+            except Exception:
+                _LOGGER.warning("Failed to refresh YoLink device states", exc_info=True)
+                continue
+            self.async_set_updated_data(refreshed_states)
 
     async def _async_refresh_devices(self) -> bool:
         """Refresh the device registry and notify listeners if membership changed."""
@@ -456,12 +585,17 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         device = self._devices.get(device_id)
         if not device:
             raise ValueError(f"Unknown device: {device_id}")
-        result = await self._client.set_state(device, params)
+        result = await self._async_set_state_with_retry(device, params)
         try:
-            state = await self._client.get_state(device)
-            self._update_device_state(device_id, self._normalize_http_state(state))
+            state = await self._async_get_state_with_retry(device)
+            if state is not None:
+                self._update_device_state(device_id, self._normalize_http_state(state))
         except Exception:
-            _LOGGER.warning("Failed to refresh state after command for %s", device.name)
+            _LOGGER.warning(
+                "Failed to refresh state after command for %s",
+                device.name,
+                exc_info=True,
+            )
         return result
 
 
@@ -475,9 +609,9 @@ async def create_coordinator(
     http_port: int = 1080,
     mqtt_port: int = 18080,
 ) -> YoLocalCoordinator:
-    """Create and initialize a coordinator.
+    """Create a coordinator.
 
-    Returns a fully-initialized, connected coordinator ready for use.
+    Home Assistant's first coordinator refresh performs setup and initial polling.
 
     Raises:
         AuthenticationError: If credentials are invalid.
@@ -490,12 +624,9 @@ async def create_coordinator(
 
         client = YoLinkClient(host, token_manager, session, http_port)
 
-        coordinator = YoLocalCoordinator(
+        return YoLocalCoordinator(
             hass, client, token_manager, session, config_entry_id, net_id, mqtt_port
         )
-        await coordinator._async_setup()
-
-        return coordinator
     except Exception:
         await session.close()
         raise

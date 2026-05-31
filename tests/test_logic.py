@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 import asyncio
+import logging
 
 from homeassistant.helpers import device_registry as dr
 
+from custom_components.yolocal.api.client import ApiError
 from custom_components.yolocal.api.device import Device
 from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import YoLocalCoordinator
@@ -57,11 +59,11 @@ def make_coordinator() -> YoLocalCoordinator:
 
     def async_create_task(coro):
         scheduled_coroutines.append(coro)
-        return SimpleNamespace(coro=coro, done=lambda: False)
+        return SimpleNamespace(coro=coro, done=lambda: False, cancel=lambda: None)
 
     def async_create_background_task(coro, _name):
         scheduled_coroutines.append(coro)
-        return SimpleNamespace(coro=coro, done=lambda: False)
+        return SimpleNamespace(coro=coro, done=lambda: False, cancel=lambda: None)
 
     hass = SimpleNamespace(
         async_create_task=async_create_task,
@@ -547,6 +549,73 @@ def test_async_send_command_refreshes_state_and_notifies_coordinator() -> None:
     assert coordinator.data == coordinator._states
 
 
+def test_async_send_command_retries_transient_failure_before_offline() -> None:
+    """Command failures should be retried before marking a device offline."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": {"power": 57, "state": "open", "watt": 0},
+    }
+    calls: list[tuple[str, object]] = []
+
+    async def set_state(_device: Device, params: dict[str, object]) -> dict[str, object]:
+        calls.append(("set_state", params))
+        if len(calls) == 1:
+            raise ApiError("000201", "Cannot connect to the device", "Outlet.setState")
+        return {"ok": True}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        calls.append(("get_state", None))
+        return {"state": {"power": 12, "state": "closed", "watt": 0}}
+
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+
+    result = asyncio.run(
+        coordinator.async_send_command(device.device_id, {"state": "closed"})
+    )
+
+    assert result == {"ok": True}
+    assert calls == [
+        ("set_state", {"state": "closed"}),
+        ("set_state", {"state": "closed"}),
+        ("get_state", None),
+    ]
+    assert coordinator.get_state(device.device_id).get("online", True) is True
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "closed"
+
+
+def test_async_send_command_marks_offline_after_repeated_transient_failures() -> None:
+    """Repeated command radio failures should mark the device offline."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": {"power": 57, "state": "open", "watt": 0},
+    }
+    calls = 0
+
+    async def set_state(_device: Device, _params: dict[str, object]) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        raise ApiError("000201", "Cannot connect to the device", "Outlet.setState")
+
+    coordinator._client = SimpleNamespace(set_state=set_state)
+
+    try:
+        asyncio.run(coordinator.async_send_command(device.device_id, {"state": "closed"}))
+    except ApiError as err:
+        assert err.code == "000201"
+    else:
+        raise AssertionError("expected ApiError")
+
+    assert calls == 3
+    assert coordinator.get_state(device.device_id)["online"] is False
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+
+
 def test_entity_availability_handles_offline_and_stale_devices() -> None:
     """Availability logic should be conservative for offline or stale devices."""
     coordinator = make_coordinator()
@@ -660,6 +729,107 @@ def test_async_update_data_keeps_old_state_when_refresh_fails() -> None:
     assert refreshed[device.device_id]["state"]["battery"] == 2
 
 
+def test_async_update_data_marks_offline_after_transient_device_unreachable(
+    caplog,
+) -> None:
+    """Repeated read-only getState failures should mark the device offline."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    fresh = datetime.now(UTC) - timedelta(minutes=5)
+    coordinator._states[device.device_id] = {
+        "lastReportedAt": fresh.isoformat(),
+        "online": True,
+        "state": {"power": 57, "state": "open", "watt": 0}
+    }
+    calls = 0
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        raise ApiError("000201", "Cannot connect to the device", "Outlet.getState")
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert calls == 3
+    assert refreshed[device.device_id] == coordinator._states[device.device_id]
+    assert refreshed[device.device_id]["online"] is False
+    assert refreshed[device.device_id]["state"]["state"] == "open"
+    assert "Failed to refresh state" not in caplog.text
+
+
+def test_async_update_data_keeps_online_when_retry_succeeds() -> None:
+    """A transient getState failure should not mark offline if a retry succeeds."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet-retry"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": {"power": 57, "state": "open", "watt": 0},
+    }
+    calls = 0
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ApiError("000201", "Cannot connect to the device", "Outlet.getState")
+        return {"state": {"power": 58, "state": "open", "watt": 0}}
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert calls == 2
+    assert refreshed[device.device_id].get("online", True) is True
+    assert refreshed[device.device_id]["state"]["power"] == 58
+
+
+def test_async_update_data_keeps_already_offline_device_offline() -> None:
+    """Repeated getState failures should not republish a changed state when already offline."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet-offline"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    cached_state = {
+        "online": False,
+        "state": {"power": 57, "state": "open", "watt": 0},
+    }
+    coordinator._states[device.device_id] = cached_state
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        raise ApiError("000201", "Cannot connect to the device", "Outlet.getState")
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert refreshed[device.device_id] is cached_state
+
+
+def test_http_success_marks_unreachable_device_online() -> None:
+    """Successful getState should restore availability even without lastReportedAt."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet-back"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": False,
+        "state": {"power": 0, "state": "open", "watt": 0},
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {"state": {"power": 58, "state": "closed", "watt": 0}}
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert refreshed[device.device_id]["online"] is True
+    assert refreshed[device.device_id]["state"]["power"] == 58
+
+
 def test_async_update_data_polls_even_for_recent_report() -> None:
     """Periodic refresh should poll even when MQTT reported recently."""
     coordinator = make_coordinator()
@@ -742,6 +912,7 @@ def test_async_setup_defers_initial_data_publication() -> None:
     asyncio.run(coordinator._async_setup())
 
     assert coordinator.data is None
+    assert coordinator._state_refresh_task is not None
     assert coordinator.get_state(device.device_id)["state"]["battery"] == 4
     assert (
         coordinator.get_state(device.device_id)["lastReportedAt"]

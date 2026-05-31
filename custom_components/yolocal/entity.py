@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
 from homeassistant.helpers import entity_registry as er
@@ -12,7 +11,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import Device
 from .const import DOMAIN
-from .coordinator import YoLocalCoordinator
+from .coordinator import STALE_REPORT_AGE, YoLocalCoordinator
 
 
 class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
@@ -92,7 +91,7 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
             try:
                 last_report = dt_util.parse_datetime(report_at)
                 if last_report is not None:
-                    if dt_util.utcnow() - last_report > timedelta(hours=12):
+                    if dt_util.utcnow() - last_report > STALE_REPORT_AGE:
                         return False
             except Exception:
                 pass

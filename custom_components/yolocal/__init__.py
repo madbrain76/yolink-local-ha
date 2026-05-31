@@ -30,6 +30,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up YoLink Local from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     host = entry.data[CONF_HUB_IP]
+    coordinator: YoLocalCoordinator | None = None
 
     try:
         coordinator = await create_coordinator(
@@ -46,12 +47,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # all entities) have valid state before platforms are set up.
         await coordinator.async_config_entry_first_refresh()
     except AuthenticationError as err:
+        if coordinator is not None:
+            await coordinator.async_shutdown()
         raise ConfigEntryAuthFailed("YoLink Local authentication failed") from err
     except (aiohttp.ClientError, OSError, TimeoutError) as err:
+        if coordinator is not None:
+            await coordinator.async_shutdown()
         raise ConfigEntryNotReady(
             f"Cannot connect to YoLink hub at {host}"
         ) from err
     except Exception:
+        if coordinator is not None:
+            await coordinator.async_shutdown()
         _LOGGER.exception("Failed to set up YoLink Local")
         return False
 

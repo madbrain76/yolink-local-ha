@@ -24,10 +24,10 @@ def _install_homeassistant_stubs() -> None:
             self.data: dict[str, dict[str, object]] = {}
 
         def async_create_task(self, coro):
-            return SimpleNamespace(coro=coro, done=lambda: False)
+            return SimpleNamespace(coro=coro, done=lambda: False, cancel=lambda: None)
 
         def async_create_background_task(self, coro, _name):
-            return SimpleNamespace(coro=coro, done=lambda: False)
+            return SimpleNamespace(coro=coro, done=lambda: False, cancel=lambda: None)
 
     def callback(func):
         return func

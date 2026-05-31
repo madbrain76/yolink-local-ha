@@ -13,6 +13,14 @@ from .device import Device
 class ApiError(Exception):
     """Raised when an API call fails."""
 
+    def __init__(self, code: str, desc: str, method: str | None = None) -> None:
+        """Initialize the API error."""
+        self.code = code
+        self.desc = desc
+        self.method = method
+        prefix = f"{method} failed" if method else "API error"
+        super().__init__(f"{prefix}: {code} {desc}".strip())
+
 
 class YoLinkClient:
     """HTTP client for YoLink Local Hub."""
@@ -78,7 +86,11 @@ class YoLinkClient:
             result = await resp.json()
 
         if result.get("code") != "000000":
-            raise ApiError(f"API error: {result}")
+            raise ApiError(
+                code=str(result.get("code", "")),
+                desc=str(result.get("desc", "")),
+                method=str(result.get("method") or payload.get("method") or ""),
+            )
 
         return result.get("data", {})
 
