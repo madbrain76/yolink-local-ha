@@ -41,6 +41,7 @@ Matter can leave YoLink sensors stale when battery runs out, which can cause inc
 | TempSensor | Sensor Sensor | Temperature, battery | YS8004-UC
 | THSensor | Sensor | Temperature, humidity, battery | YS8003-UC, YS8005-UC
 | TiltSensor | Binary Sensor | Temperature, battery | YS7706-UC
+| ValveController | Valve, Sensor | Open/closed control, battery | YS4909-UC
 
 Additional device types can be added -- contributions welcome.
 
@@ -58,6 +59,7 @@ This project includes additional entities and diagnostics, not available in the 
 - THSensor 8003 : `High humidity`, `High temperature`, `Humidity correction`, `LCD temperature unit`, `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`
 - THSensor 8005 : `High humidity`, `High temperature`, `Humidity correction`, `Humidity max threshold`, `Humidity min threshold`, `LCD temperature unit` (bug), `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`, `Temperature max threshold`, `Temperature min threshold`
 - TiltSensor: `Alert interval`, `Delay`, `Open remind delay`
+- ValveController: `Valve`
 
 Diagnostics entities listed as "bug" are being returned from the Yolink local API in JSON responses, but not actually applicable to the specific models. This integration merely exposes them. The values are bogus, and should be ignored.
 This bug would be best fixed by Yolink in their local API implementation, rather than manually blacklisted in this project.
