@@ -27,5 +27,5 @@ PLATFORMS: list[str] = [
     "lock",
     "switch",
     "siren",
-    "valve"
+    "valve",
 ]
