@@ -236,6 +236,29 @@ def _install_homeassistant_stubs() -> None:
     switch.SwitchEntity = SwitchEntity
     switch.SwitchDeviceClass = SwitchDeviceClass
 
+
+    valve = ModuleType("homeassistant.components.valve")
+
+    class ValveEntity:
+        async def async_remove(self) -> None:
+            return None
+
+    class ValveDeviceClass:
+        WATER = "water"
+        GAS = "gas"
+
+    class ValveEntityFeature:
+        OPEN = 1
+        CLOSE = 2
+        SET_POSITION = 4
+
+    def __or__(self, other: int) -> int:
+        return int(self) | int(other)
+
+    valve.ValveEntity = ValveEntity
+    valve.ValveDeviceClass = ValveDeviceClass
+    valve.ValveEntityFeature = ValveEntityFeature
+
     const = ModuleType("homeassistant.const")
     const.PERCENTAGE = "%"
 
@@ -272,6 +295,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.sensor"] = sensor
     sys.modules["homeassistant.components.binary_sensor"] = binary_sensor
     sys.modules["homeassistant.components.switch"] = switch
+    sys.modules["homeassistant.components.valve"] = valve
     sys.modules["homeassistant.const"] = const
 
 
