@@ -36,6 +36,7 @@ Matter can leave YoLink sensors stale when battery runs out, which can cause inc
 |-------------|-------------|----------|----------------------|
 | DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
 | LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
+| Manipulator | Valve, Sensor | Open/closed control, battery | YS4909-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
 | Outlet | Switch, Sensor | On/off state, power | YS6614-UC
 | TempSensor | Sensor Sensor | Temperature, battery | YS8004-UC

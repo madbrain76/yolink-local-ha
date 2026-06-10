@@ -22,6 +22,7 @@ from custom_components.yolocal.sensor import (
     build_sensor_entities,
 )
 from custom_components.yolocal.switch import YoLocalSwitch
+from custom_components.yolocal.valve import YoLocalValve
 from capture_yolink_payloads import sanitize_value
 
 
@@ -1212,3 +1213,288 @@ def test_device_from_api_preserves_door_sensor_type_for_7707() -> None:
     assert device.device_type == "DoorSensor"
     assert device.display_type == "DoorSensor"
     assert device.model == "YS7707-UC"
+
+
+def test_valve_is_closed_reads_nested_state() -> None:
+    """Valve should report closed/open correctly from HTTP-style nested state."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Manipulator", display_type="Manipulator")
+    entity = YoLocalValve(coordinator, device)
+
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+    assert entity.is_closed is True
+
+    coordinator._states[device.device_id] = {"state": {"state": "open"}}
+    assert entity.is_closed is False
+
+
+def test_valve_is_closed_reads_flat_state() -> None:
+    """Valve should fall back to reading a flat state string."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Manipulator", display_type="Manipulator")
+    entity = YoLocalValve(coordinator, device)
+
+    coordinator._states[device.device_id] = {"state": "closed"}
+    assert entity.is_closed is True
+
+    coordinator._states[device.device_id] = {"state": "open"}
+    assert entity.is_closed is False
+
+
+def test_valve_is_closed_returns_none_when_state_unknown() -> None:
+    """Valve should return None when no state information is available."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Manipulator", display_type="Manipulator")
+    entity = YoLocalValve(coordinator, device)
+
+    coordinator._states[device.device_id] = {}
+    assert entity.is_closed is None
+
+    coordinator._states[device.device_id] = {"state": {"battery": 4}}
+    assert entity.is_closed is None
+
+
+def test_valve_tracks_physical_mqtt_open_event() -> None:
+    """Physical valve open via MQTT should update is_closed to False."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Manipulator", display_type="Manipulator")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "state": "closed",
+    }
+    entity = YoLocalValve(coordinator, device)
+
+    open_event = coordinator._normalize_mqtt_event(
+        device,
+        {
+            "state": "open",
+            "lastReportedAt": "2026-05-27T06:00:00.000000+00:00",
+        },
+    )
+    coordinator._update_device_state(
+        device.device_id,
+        coordinator._merge_state_payload(
+            coordinator.get_state(device.device_id),
+            open_event,
+        ),
+    )
+
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+    assert entity.is_closed is False
+
+
+def test_valve_tracks_physical_mqtt_close_event() -> None:
+    """Physical valve close via MQTT should update is_closed to True."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Manipulator", display_type="Manipulator")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "state": "open",
+    }
+    entity = YoLocalValve(coordinator, device)
+
+    close_event = coordinator._normalize_mqtt_event(
+        device,
+        {
+            "state": "closed",
+            "lastReportedAt": "2026-05-27T06:01:00.000000+00:00",
+        },
+    )
+    coordinator._update_device_state(
+        device.device_id,
+        coordinator._merge_state_payload(
+            coordinator.get_state(device.device_id),
+            close_event,
+        ),
+    )
+
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "closed"
+    assert entity.is_closed is True
+
+
+def test_async_open_valve_sends_open_and_refreshes_state() -> None:
+    """async_open_valve should send state=open and pull fresh state from the hub."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("valve"), device_type="Manipulator")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+    entity = YoLocalValve(coordinator, device)
+
+    calls: list[tuple[str, object]] = []
+
+    async def set_state(_device, params):
+        calls.append(("set_state", params))
+        return {"ok": True}
+
+    async def get_state(_device):
+        calls.append(("get_state", None))
+        return {"state": {"state": "open"}}
+
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+
+    asyncio.run(entity.async_open_valve())
+
+    assert calls == [("set_state", {"state": "open"}), ("get_state", None)]
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+    assert entity.is_closed is False
+
+
+def test_async_close_valve_sends_close_not_closed() -> None:
+    """async_close_valve must send state='close', not state='closed'."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("valve-close"), device_type="Manipulator")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"state": "open"}}
+    entity = YoLocalValve(coordinator, device)
+
+    calls: list[tuple[str, object]] = []
+
+    async def set_state(_device, params):
+        calls.append(("set_state", params))
+        return {"ok": True}
+
+    async def get_state(_device):
+        calls.append(("get_state", None))
+        return {"state": {"state": "closed"}}
+
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+
+    asyncio.run(entity.async_close_valve())
+
+    # The YoLink API uses "close" as the command, not "closed"
+    assert calls[0] == ("set_state", {"state": "close"})
+    assert calls[1] == ("get_state", None)
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "closed"
+    assert entity.is_closed is True
+
+
+def test_valve_open_retries_transient_failure() -> None:
+    """A single radio failure on open should be retried before succeeding."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("valve-retry"), device_type="Manipulator")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": {"state": "closed"},
+    }
+    entity = YoLocalValve(coordinator, device)
+    calls: list[str] = []
+
+    async def set_state(_device, _params):
+        calls.append("set_state")
+        if len(calls) == 1:
+            raise ApiError("000201", "Cannot connect to the device", "Manipulator.setState")
+        return {"ok": True}
+
+    async def get_state(_device):
+        calls.append("get_state")
+        return {"state": {"state": "open"}}
+
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+
+    asyncio.run(entity.async_open_valve())
+
+    assert calls == ["set_state", "set_state", "get_state"]
+    assert coordinator.get_state(device.device_id).get("online", True) is True
+
+
+def test_valve_close_marks_offline_after_repeated_failures() -> None:
+    """Repeated radio failures on close should mark the valve offline."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("valve-offline"), device_type="Manipulator")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": {"state": "open"},
+    }
+    entity = YoLocalValve(coordinator, device)
+
+    async def set_state(_device, _params):
+        raise ApiError("000201", "Cannot connect to the device", "Manipulator.setState")
+
+    coordinator._client = SimpleNamespace(set_state=set_state)
+
+    try:
+        asyncio.run(entity.async_close_valve())
+    except ApiError as err:
+        assert err.code == "000201"
+    else:
+        raise AssertionError("expected ApiError")
+
+    assert coordinator.get_state(device.device_id)["online"] is False
+    # Cached state should be unchanged despite the failure
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+
+
+def test_manipulator_device_creates_valve_entity() -> None:
+    """build_entities should produce a YoLocalValve only for Manipulator devices."""
+    from custom_components.yolocal.valve import YoLocalValve as _Valve
+
+    coordinator = make_coordinator()
+
+    manipulator = make_device(
+        device_id=make_device_id("manipulator"),
+        device_type="Manipulator",
+        display_type="Manipulator",
+    )
+    door = make_device(
+        device_id=make_device_id("door-not-valve"),
+        device_type="DoorSensor",
+        display_type="DoorSensor",
+    )
+
+    def build_entities(device):
+        if device.device_type != "Manipulator":
+            return []
+        return [_Valve(coordinator, device)]
+
+    assert len(build_entities(manipulator)) == 1
+    assert isinstance(build_entities(manipulator)[0], _Valve)
+    assert build_entities(door) == []
+
+
+def test_valve_creates_battery_sensor_when_payload_has_battery() -> None:
+    """Manipulator devices that report battery should get a battery diagnostic."""
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=make_device_id("valve-battery"),
+        device_type="Manipulator",
+        display_type="Manipulator",
+    )
+    coordinator._states[device.device_id] = {"state": {"battery": 3, "state": "closed"}}
+
+    entities = build_sensor_entities(coordinator, device)
+
+    assert any(isinstance(e, YoLocalBatterySensor) for e in entities)
+
+
+def test_valve_omits_battery_sensor_without_battery_in_payload() -> None:
+    """Manipulator devices with no battery field should not get a battery sensor."""
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=make_device_id("valve-no-battery"),
+        device_type="Manipulator",
+        display_type="Manipulator",
+    )
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+
+    entities = build_sensor_entities(coordinator, device)
+
+    assert not any(isinstance(e, YoLocalBatterySensor) for e in entities)
+
+
+def test_device_from_api_recognises_manipulator_type() -> None:
+    """Device.from_api should preserve Manipulator as device_type and display_type."""
+    device = Device.from_api(
+        {
+            "deviceId": make_device_id("valve-api"),
+            "name": "Garden water valve",
+            "token": "token",
+            "type": "Manipulator",
+            "appEui": make_app_eui("4909"),
+        }
+    )
+
+    assert device.device_type == "Manipulator"
+    assert device.display_type == "Manipulator"
+    assert device.model == "YS4909-UC"
