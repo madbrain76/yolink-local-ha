@@ -7,9 +7,12 @@ from types import SimpleNamespace
 import asyncio
 import logging
 
+import aiohttp
 from homeassistant.helpers import device_registry as dr
 
+import custom_components.yolocal.api.client as client_module
 from custom_components.yolocal.api.client import ApiError
+from custom_components.yolocal.api.client import YoLinkClient
 from custom_components.yolocal.api.device import Device
 from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import YoLocalCoordinator
@@ -84,6 +87,64 @@ def make_coordinator() -> YoLocalCoordinator:
     )
 
 
+class FakeApiResponse:
+    """Minimal async response object for YoLinkClient tests."""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        """Initialize the fake response."""
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        """No-op status validation."""
+        return None
+
+    async def json(self) -> dict[str, object]:
+        """Return the configured JSON payload."""
+        return self._payload
+
+
+class FakePostContext:
+    """Minimal aiohttp request context manager."""
+
+    def __init__(self, result: object) -> None:
+        """Initialize the fake context."""
+        self._result = result
+
+    async def __aenter__(self) -> FakeApiResponse:
+        """Enter the fake request context."""
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+    async def __aexit__(self, *_args: object) -> None:
+        """Exit the fake request context."""
+        return None
+
+
+class FakeSession:
+    """Fake aiohttp session with queued POST results."""
+
+    def __init__(self, results: list[object]) -> None:
+        """Initialize the session."""
+        self.results = results
+        self.posts: list[dict[str, object]] = []
+
+    def post(self, url: str, **kwargs: object) -> FakePostContext:
+        """Return the next queued POST context."""
+        self.posts.append({"url": url, **kwargs})
+        return FakePostContext(self.results.pop(0))
+
+
+class FakeTokenManager:
+    """Fake token manager for YoLinkClient tests."""
+
+    client_id = "client"
+
+    async def get_token(self) -> str:
+        """Return a fake access token."""
+        return "token"
+
+
 def test_capture_sanitizer_redacts_tokens_and_aliases_identifiers() -> None:
     """Capture artifacts should not persist hub secrets or device identifiers."""
     sanitized = sanitize_value(
@@ -128,6 +189,59 @@ def test_capture_sanitizer_redacts_tokens_and_aliases_identifiers() -> None:
     assert device["appEui"] == "REDACTED"
     assert device["token"] == "REDACTED"
     assert sanitized["topic"] == "ylsubnet/REDACTED_NET_ID/THSensor-1/report"
+
+
+def test_get_devices_retries_transient_server_disconnect() -> None:
+    """Read-only device list calls should retry transient hub disconnects."""
+    old_delay = client_module.TRANSPORT_RETRY_DELAY
+    client_module.TRANSPORT_RETRY_DELAY = 0
+    try:
+        session = FakeSession(
+            [
+                aiohttp.ClientConnectionError(),
+                FakeApiResponse(
+                    {
+                        "code": "000000",
+                        "data": {
+                            "devices": [
+                                {
+                                    "deviceId": make_device_id("door-api"),
+                                    "name": "Door",
+                                    "token": "device-token",
+                                    "type": "DoorSensor",
+                                    "appEui": make_app_eui("7704"),
+                                }
+                            ]
+                        },
+                    }
+                ),
+            ]
+        )
+        client = YoLinkClient("hub.local", FakeTokenManager(), session)
+
+        devices = asyncio.run(client.get_devices())
+    finally:
+        client_module.TRANSPORT_RETRY_DELAY = old_delay
+
+    assert len(session.posts) == 2
+    assert len(devices) == 1
+    assert devices[0].device_id == make_device_id("door-api")
+
+
+def test_set_state_does_not_retry_transport_disconnect() -> None:
+    """State-changing commands should not be duplicated after transport errors."""
+    session = FakeSession([aiohttp.ClientConnectionError()])
+    client = YoLinkClient("hub.local", FakeTokenManager(), session)
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+
+    try:
+        asyncio.run(client.set_state(device, {"state": "closed"}))
+    except aiohttp.ClientConnectionError:
+        pass
+    else:
+        raise AssertionError("expected ServerDisconnectedError")
+
+    assert len(session.posts) == 1
 
 
 def test_merge_nested_state_covers_all_shapes() -> None:
@@ -615,6 +729,162 @@ def test_async_send_command_marks_offline_after_repeated_transient_failures() ->
     assert calls == 3
     assert coordinator.get_state(device.device_id)["online"] is False
     assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+
+
+def test_async_send_command_accepts_matching_state_after_transport_error() -> None:
+    """A transport error should be suppressed when read-back shows target state."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet-recovered"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+    calls: list[tuple[str, object]] = []
+    sleeps: list[float] = []
+
+    async def set_state(_device: Device, params: dict[str, object]) -> dict[str, object]:
+        calls.append(("set_state", params))
+        raise aiohttp.ClientConnectionError()
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        calls.append(("get_state", None))
+        return {"state": {"state": "open"}}
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    original_sleep = asyncio.sleep
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+    asyncio.sleep = fake_sleep
+    try:
+        result = asyncio.run(
+            coordinator.async_send_command(device.device_id, {"state": "open"})
+        )
+    finally:
+        asyncio.sleep = original_sleep
+
+    assert result == {}
+    assert calls == [
+        ("set_state", {"state": "open"}),
+        ("get_state", None),
+        ("get_state", None),
+    ]
+    assert sleeps == [2.0]
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+
+
+def test_async_send_command_retries_transport_error_when_readback_fails() -> None:
+    """A transport error should retry once when read-back cannot verify success."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet-readback-fail"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+    calls: list[tuple[str, object]] = []
+
+    async def set_state(_device: Device, params: dict[str, object]) -> dict[str, object]:
+        calls.append(("set_state", params))
+        if len([call for call in calls if call[0] == "set_state"]) == 1:
+            raise aiohttp.ClientConnectionError()
+        return {"ok": True}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        calls.append(("get_state", None))
+        if len([call for call in calls if call[0] == "get_state"]) == 1:
+            raise aiohttp.ClientConnectionError()
+        return {"state": {"state": "open"}}
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    original_sleep = asyncio.sleep
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+    asyncio.sleep = fake_sleep
+    try:
+        result = asyncio.run(
+            coordinator.async_send_command(device.device_id, {"state": "open"})
+        )
+    finally:
+        asyncio.sleep = original_sleep
+
+    assert result == {"ok": True}
+    assert calls == [
+        ("set_state", {"state": "open"}),
+        ("get_state", None),
+        ("set_state", {"state": "open"}),
+        ("get_state", None),
+    ]
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+
+
+def test_async_send_command_retries_transport_error_when_state_not_target() -> None:
+    """A transport error should retry once when read-back is not at target state."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet-retry-transport"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"state": "closed"}}
+    calls: list[tuple[str, object]] = []
+
+    async def set_state(_device: Device, params: dict[str, object]) -> dict[str, object]:
+        calls.append(("set_state", params))
+        if len([call for call in calls if call[0] == "set_state"]) == 1:
+            raise aiohttp.ClientConnectionError()
+        return {"ok": True}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        calls.append(("get_state", None))
+        if len([call for call in calls if call[0] == "get_state"]) == 1:
+            return {"state": {"state": "closed"}}
+        return {"state": {"state": "open"}}
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    original_sleep = asyncio.sleep
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+    asyncio.sleep = fake_sleep
+    try:
+        result = asyncio.run(
+            coordinator.async_send_command(device.device_id, {"state": "open"})
+        )
+    finally:
+        asyncio.sleep = original_sleep
+
+    assert result == {"ok": True}
+    assert calls == [
+        ("set_state", {"state": "open"}),
+        ("get_state", None),
+        ("set_state", {"state": "open"}),
+        ("get_state", None),
+    ]
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "open"
+
+
+def test_async_send_command_matches_valve_close_report_after_transport_error() -> None:
+    """Manipulator close command should match reported state=closed."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("valve-recovered"), device_type="Manipulator")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"state": "open"}}
+
+    async def set_state(_device: Device, _params: dict[str, object]) -> dict[str, object]:
+        raise aiohttp.ClientConnectionError()
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {"state": {"state": "closed"}}
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    original_sleep = asyncio.sleep
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+    asyncio.sleep = fake_sleep
+    try:
+        result = asyncio.run(
+            coordinator.async_send_command(device.device_id, {"state": "close"})
+        )
+    finally:
+        asyncio.sleep = original_sleep
+
+    assert result == {}
+    assert coordinator.get_state(device.device_id)["state"]["state"] == "closed"
 
 
 def test_entity_availability_handles_offline_and_stale_devices() -> None:

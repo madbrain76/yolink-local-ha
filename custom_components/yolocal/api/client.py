@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import aiohttp
 
 from .auth import TokenManager
 from .device import Device
+
+READ_REQUEST_RETRY_ATTEMPTS = 3
+TRANSPORT_RETRY_DELAY = 1.0
 
 
 class ApiError(Exception):
@@ -50,7 +54,10 @@ class YoLinkClient:
 
     async def get_devices(self) -> list[Device]:
         """Fetch the list of devices from the hub."""
-        result = await self._request({"method": "Home.getDeviceList"})
+        result = await self._request(
+            {"method": "Home.getDeviceList"},
+            retry_transport=True,
+        )
         return [Device.from_api(d) for d in result.get("devices", [])]
 
     async def get_state(self, device: Device) -> dict[str, Any]:
@@ -59,7 +66,7 @@ class YoLinkClient:
             "method": f"{device.device_type}.getState",
             "targetDevice": device.device_id,
             "token": device.token,
-        })
+        }, retry_transport=True)
 
     async def set_state(
         self, device: Device, params: dict[str, Any]
@@ -72,27 +79,46 @@ class YoLinkClient:
             "params": params,
         })
 
-    async def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _request(
+        self,
+        payload: dict[str, Any],
+        retry_transport: bool = False,
+    ) -> dict[str, Any]:
         """Make an authenticated API request."""
-        token = await self._token_manager.get_token()
+        attempts = READ_REQUEST_RETRY_ATTEMPTS if retry_transport else 1
         url = f"{self.base_url}/open/yolink/v2/api"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        }
 
-        async with self._session.post(url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            result = await resp.json()
+        for attempt in range(1, attempts + 1):
+            token = await self._token_manager.get_token()
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            }
 
-        if result.get("code") != "000000":
-            raise ApiError(
-                code=str(result.get("code", "")),
-                desc=str(result.get("desc", "")),
-                method=str(result.get("method") or payload.get("method") or ""),
-            )
+            try:
+                async with self._session.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                if attempt >= attempts:
+                    raise
+                await asyncio.sleep(TRANSPORT_RETRY_DELAY)
+                continue
 
-        return result.get("data", {})
+            if result.get("code") != "000000":
+                raise ApiError(
+                    code=str(result.get("code", "")),
+                    desc=str(result.get("desc", "")),
+                    method=str(result.get("method") or payload.get("method") or ""),
+                )
+
+            return result.get("data", {})
+
+        raise RuntimeError("unreachable request retry state")
 
 
 async def create_client(

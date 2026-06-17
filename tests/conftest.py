@@ -306,7 +306,11 @@ def _install_runtime_dependency_stubs() -> None:
         async def close(self) -> None:
             return None
 
+    class ClientConnectionError(Exception):
+        """Minimal aiohttp connection error stub."""
+
     aiohttp.ClientSession = ClientSession
+    aiohttp.ClientConnectionError = ClientConnectionError
     sys.modules["aiohttp"] = aiohttp
 
     paho = ModuleType("paho")

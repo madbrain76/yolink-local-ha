@@ -34,6 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 type DeviceRegistryListener = Callable[[list[Device], list[Device]], None]
 TRANSIENT_DEVICE_UNREACHABLE = "000201"
 STALE_REPORT_AGE = timedelta(hours=12)
+SET_STATE_TRANSPORT_RETRY_DELAY = 2.0
 
 
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
@@ -228,6 +229,69 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 )
                 raise
         raise RuntimeError("Failed to set device state")
+
+    async def _async_send_command_with_transport_recovery(
+        self,
+        device: Device,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Send a command, recovering one ambiguous transport failure."""
+        try:
+            return await self._async_set_state_with_retry(device, params)
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as err:
+            await asyncio.sleep(SET_STATE_TRANSPORT_RETRY_DELAY)
+            try:
+                state = await self._async_get_state_with_retry(device, attempts=1)
+                if state is not None:
+                    normalized_state = self._normalize_http_state(state)
+                    self._update_device_state(device.device_id, normalized_state)
+                    if self._state_matches_command(normalized_state, params):
+                        return {}
+            except Exception:
+                _LOGGER.debug(
+                    "Failed to verify state after transport error for %s",
+                    device.name,
+                    exc_info=True,
+                )
+
+            try:
+                return await self._async_set_state_with_retry(device, params, attempts=1)
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                raise err
+
+    def _state_matches_command(
+        self,
+        state: dict[str, Any],
+        params: dict[str, Any],
+    ) -> bool:
+        """Return True when current state already reflects the command params."""
+        for key, expected_value in params.items():
+            if not self._value_matches_command(
+                self._state_command_value(state, key),
+                expected_value,
+            ):
+                return False
+        return True
+
+    def _state_command_value(self, state: dict[str, Any], key: str) -> Any:
+        """Return a comparable state value for a command key."""
+        nested_state = state.get("state")
+        if isinstance(nested_state, dict) and key in nested_state:
+            return nested_state.get(key)
+        return state.get(key)
+
+    def _value_matches_command(self, current_value: Any, expected_value: Any) -> bool:
+        """Compare a current state value with a requested command value."""
+        if isinstance(expected_value, dict):
+            if not isinstance(current_value, dict):
+                return False
+            return all(
+                self._value_matches_command(current_value.get(key), value)
+                for key, value in expected_value.items()
+            )
+        if expected_value == "close":
+            return current_value == "closed"
+        return current_value == expected_value
 
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
@@ -583,7 +647,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         device = self._devices.get(device_id)
         if not device:
             raise ValueError(f"Unknown device: {device_id}")
-        result = await self._async_set_state_with_retry(device, params)
+        result = await self._async_send_command_with_transport_recovery(device, params)
         try:
             state = await self._async_get_state_with_retry(device)
             if state is not None:
