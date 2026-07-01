@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Any
 
 import aiohttp
@@ -35,9 +36,11 @@ class YoLinkClient:
         token_manager: TokenManager,
         session: aiohttp.ClientSession,
         port: int = 1080,
+        hosts: Sequence[str] | None = None,
     ) -> None:
         """Initialize the client."""
-        self._host = host
+        self._hosts = tuple(dict.fromkeys(hosts or [host]))
+        self._host_index = 0
         self._port = port
         self._token_manager = token_manager
         self._session = session
@@ -45,12 +48,29 @@ class YoLinkClient:
     @property
     def host(self) -> str:
         """Return the hub host."""
-        return self._host
+        if hasattr(self._token_manager, "host"):
+            return self._token_manager.host
+        return self._hosts[self._host_index]
+
+    @property
+    def hosts(self) -> tuple[str, ...]:
+        """Return all configured hub hosts."""
+        return self._hosts
 
     @property
     def base_url(self) -> str:
         """Return the base URL for the hub."""
-        return f"http://{self._host}:{self._port}"
+        return f"http://{self.host}:{self._port}"
+
+    def switch_host(self) -> bool:
+        """Switch to the next configured host."""
+        switched_token_host = False
+        if hasattr(self._token_manager, "switch_host"):
+            switched_token_host = self._token_manager.switch_host()
+        if len(self._hosts) <= 1:
+            return switched_token_host
+        self._host_index = (self._host_index + 1) % len(self._hosts)
+        return True
 
     async def get_devices(self) -> list[Device]:
         """Fetch the list of devices from the hub."""
@@ -86,10 +106,10 @@ class YoLinkClient:
     ) -> dict[str, Any]:
         """Make an authenticated API request."""
         attempts = READ_REQUEST_RETRY_ATTEMPTS if retry_transport else 1
-        url = f"{self.base_url}/open/yolink/v2/api"
 
         for attempt in range(1, attempts + 1):
             token = await self._token_manager.get_token()
+            url = f"{self.base_url}/open/yolink/v2/api"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
@@ -106,6 +126,7 @@ class YoLinkClient:
             except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
                 if attempt >= attempts:
                     raise
+                self.switch_host()
                 await asyncio.sleep(TRANSPORT_RETRY_DELAY)
                 continue
 
@@ -126,6 +147,7 @@ async def create_client(
     client_id: str,
     client_secret: str,
     port: int = 1080,
+    hosts: Sequence[str] | None = None,
 ) -> tuple["YoLinkClient", TokenManager, aiohttp.ClientSession]:
     """Create an authenticated client.
 
@@ -137,9 +159,16 @@ async def create_client(
     """
     session = aiohttp.ClientSession()
     try:
-        token_manager = TokenManager(host, client_id, client_secret, session, port)
+        token_manager = TokenManager(
+            host,
+            client_id,
+            client_secret,
+            session,
+            port,
+            hosts=hosts,
+        )
         await token_manager.get_token()  # Validates credentials
-        client = YoLinkClient(host, token_manager, session, port)
+        client = YoLinkClient(host, token_manager, session, port, hosts=hosts)
         return client, token_manager, session
     except Exception:
         await session.close()

@@ -10,10 +10,15 @@ import logging
 import aiohttp
 from homeassistant.helpers import device_registry as dr
 
+import custom_components.yolocal as yolocal_module
 import custom_components.yolocal.api.client as client_module
+import custom_components.yolocal.config_flow as config_flow_module
+from custom_components.yolocal import _configured_hosts
+from custom_components.yolocal.api.auth import TokenManager
 from custom_components.yolocal.api.client import ApiError
 from custom_components.yolocal.api.client import YoLinkClient
 from custom_components.yolocal.api.device import Device
+from custom_components.yolocal.api.mqtt import DeviceEvent
 from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import YoLocalCoordinator
 from custom_components.yolocal.entity import YoLocalEntity
@@ -27,6 +32,24 @@ from custom_components.yolocal.sensor import (
 from custom_components.yolocal.switch import YoLocalSwitch
 from custom_components.yolocal.valve import YoLocalValve
 from capture_yolink_payloads import sanitize_value
+
+
+class FakeClosableSession:
+    """Minimal aiohttp session returned by config flow tests."""
+
+    async def close(self) -> None:
+        """Close the fake session."""
+        return None
+
+
+class FakeMqttClient:
+    """Minimal MQTT client for coordinator tests."""
+
+    def __init__(self) -> None:
+        self.disconnect_calls = 0
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
 
 
 def make_device_id(label: str = "device") -> str:
@@ -145,6 +168,21 @@ class FakeTokenManager:
         return "token"
 
 
+class FakeHostTokenManager:
+    """Fake token manager that returns host-specific MQTT tokens."""
+
+    client_id = "client"
+
+    def __init__(self) -> None:
+        """Initialize token call tracking."""
+        self.hosts: list[str] = []
+
+    async def get_token_for_host(self, host: str) -> str:
+        """Return a token tied to the requested host."""
+        self.hosts.append(host)
+        return f"token-for-{host}"
+
+
 def test_capture_sanitizer_redacts_tokens_and_aliases_identifiers() -> None:
     """Capture artifacts should not persist hub secrets or device identifiers."""
     sanitized = sanitize_value(
@@ -242,6 +280,313 @@ def test_set_state_does_not_retry_transport_disconnect() -> None:
         raise AssertionError("expected ServerDisconnectedError")
 
     assert len(session.posts) == 1
+
+
+def test_read_request_fails_over_to_secondary_host() -> None:
+    """Read-only API retries should switch from primary to secondary host."""
+    old_delay = client_module.TRANSPORT_RETRY_DELAY
+    client_module.TRANSPORT_RETRY_DELAY = 0
+    try:
+        session = FakeSession(
+            [
+                FakeApiResponse({"access_token": "primary-token", "expires_in": 7200}),
+                aiohttp.ClientConnectionError(),
+                FakeApiResponse({"access_token": "secondary-token", "expires_in": 7200}),
+                FakeApiResponse({"code": "000000", "data": {"devices": []}}),
+            ]
+        )
+        token_manager = TokenManager(
+            "primary.local",
+            "client",
+            "secret",
+            session,
+            hosts=["primary.local", "secondary.local"],
+        )
+        client = YoLinkClient(
+            "primary.local",
+            token_manager,
+            session,
+            hosts=["primary.local", "secondary.local"],
+        )
+
+        devices = asyncio.run(client.get_devices())
+    finally:
+        client_module.TRANSPORT_RETRY_DELAY = old_delay
+
+    assert devices == []
+    assert session.posts[0]["url"] == "http://primary.local:1080/open/yolink/token"
+    assert session.posts[1]["url"] == "http://primary.local:1080/open/yolink/v2/api"
+    assert session.posts[2]["url"] == "http://secondary.local:1080/open/yolink/token"
+    assert session.posts[3]["url"] == "http://secondary.local:1080/open/yolink/v2/api"
+    assert client.host == "secondary.local"
+
+
+def test_token_manager_fetches_host_specific_tokens() -> None:
+    """MQTT tokens should be cached by the host that issued them."""
+    session = FakeSession(
+        [
+            FakeApiResponse({"access_token": "primary-token", "expires_in": 7200}),
+            FakeApiResponse({"access_token": "secondary-token", "expires_in": 7200}),
+        ]
+    )
+    token_manager = TokenManager(
+        "primary.local",
+        "client",
+        "secret",
+        session,
+        hosts=["primary.local", "secondary.local"],
+    )
+
+    primary_token = asyncio.run(token_manager.get_token_for_host("primary.local"))
+    secondary_token = asyncio.run(token_manager.get_token_for_host("secondary.local"))
+    secondary_token_cached = asyncio.run(
+        token_manager.get_token_for_host("secondary.local")
+    )
+
+    assert primary_token == "primary-token"
+    assert secondary_token == "secondary-token"
+    assert secondary_token_cached == "secondary-token"
+    assert [post["url"] for post in session.posts] == [
+        "http://primary.local:1080/open/yolink/token",
+        "http://secondary.local:1080/open/yolink/token",
+    ]
+
+
+def test_configured_hosts_uses_entry_data_secondary_host() -> None:
+    """Setup should use the secondary host stored in entry data."""
+    entry = SimpleNamespace(
+        data={"hub_ip": "primary.local", "secondary_hub_ip": "secondary.local"},
+    )
+
+    assert _configured_hosts(entry) == ["primary.local", "secondary.local"]
+
+
+def test_config_flow_entry_title_lists_configured_hosts(monkeypatch) -> None:
+    """Initial config entry title should include both hosts when configured."""
+
+    async def fake_create_client(**_kwargs):
+        return object(), object(), FakeClosableSession()
+
+    monkeypatch.setattr(config_flow_module, "create_client", fake_create_client)
+    flow = config_flow_module.YoLocalConfigFlow()
+
+    result = asyncio.run(
+        flow.async_step_user(
+            {
+                "hub_ip": "primary.local",
+                "secondary_hub_ip": "secondary.local",
+                "client_id": "client",
+                "client_secret": "secret",
+                "net_id": "net",
+            }
+        )
+    )
+
+    assert result["title"] == "YoLink Hub (primary.local, secondary.local)"
+
+
+def test_setup_entry_updates_stale_title_with_secondary_host(monkeypatch) -> None:
+    """Setup should normalize an existing entry title to include both hosts."""
+    entry_updates: list[dict[str, object]] = []
+
+    class FakeCoordinator:
+        async def async_config_entry_first_refresh(self) -> None:
+            return None
+
+    async def fake_create_coordinator(**_kwargs):
+        return FakeCoordinator()
+
+    async def fake_forward_entry_setups(_entry, _platforms) -> None:
+        return None
+
+    def fake_update_entry(_entry, **kwargs) -> None:
+        entry_updates.append(kwargs)
+
+    monkeypatch.setattr(yolocal_module, "create_coordinator", fake_create_coordinator)
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=fake_forward_entry_setups,
+            async_update_entry=fake_update_entry,
+        ),
+    )
+    entry = SimpleNamespace(
+        entry_id="entry",
+        title="YoLink Hub (primary.local)",
+        data={
+            "hub_ip": "primary.local",
+            "secondary_hub_ip": "secondary.local",
+            "client_id": "client",
+            "client_secret": "secret",
+            "net_id": "net",
+        },
+        options={"secondary_hub_ip": "legacy-secondary.local"},
+    )
+
+    assert asyncio.run(yolocal_module.async_setup_entry(hass, entry)) is True
+    assert entry_updates == [
+        {
+            "title": "YoLink Hub (primary.local, secondary.local)",
+            "options": {},
+        }
+    ]
+
+
+def test_reconfigure_updates_hub_hosts(monkeypatch) -> None:
+    """Reconfigure should update primary and secondary hub hosts."""
+    calls: list[dict[str, object]] = []
+
+    async def fake_create_client(**kwargs):
+        calls.append(kwargs)
+        return object(), object(), FakeClosableSession()
+
+    monkeypatch.setattr(config_flow_module, "create_client", fake_create_client)
+    flow = config_flow_module.YoLocalConfigFlow()
+    flow._reconfigure_entry = SimpleNamespace(
+        data={
+            "hub_ip": "primary.local",
+            "client_id": "client",
+            "client_secret": "secret",
+            "net_id": "net",
+        }
+    )
+
+    result = asyncio.run(
+        flow.async_step_reconfigure(
+            {
+                "hub_ip": "new-primary.local",
+                "secondary_hub_ip": "secondary.local",
+                "client_id": "new-client",
+                "client_secret": "new-secret",
+                "net_id": "new-net",
+            }
+        )
+    )
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "reconfigure_successful"
+    assert result["title"] == "YoLink Hub (new-primary.local, secondary.local)"
+    assert result["data"]["hub_ip"] == "new-primary.local"
+    assert result["data"]["secondary_hub_ip"] == "secondary.local"
+    assert result["data"]["client_id"] == "new-client"
+    assert result["data"]["client_secret"] == "new-secret"
+    assert result["data"]["net_id"] == "new-net"
+    assert [call["host"] for call in calls] == [
+        "new-primary.local",
+        "secondary.local",
+    ]
+    assert [call["hosts"] for call in calls] == [
+        ["new-primary.local"],
+        ["secondary.local"],
+    ]
+    assert calls[0]["client_id"] == "new-client"
+    assert calls[0]["client_secret"] == "new-secret"
+
+
+def test_reconfigure_removes_empty_secondary_host(monkeypatch) -> None:
+    """Reconfigure should remove a cleared secondary host."""
+    calls: list[dict[str, object]] = []
+
+    async def fake_create_client(**kwargs):
+        calls.append(kwargs)
+        return object(), object(), FakeClosableSession()
+
+    monkeypatch.setattr(config_flow_module, "create_client", fake_create_client)
+    flow = config_flow_module.YoLocalConfigFlow()
+    flow._reconfigure_entry = SimpleNamespace(
+        data={
+            "hub_ip": "primary.local",
+            "secondary_hub_ip": "old-secondary.local",
+            "client_id": "client",
+            "client_secret": "secret",
+            "net_id": "net",
+        }
+    )
+
+    result = asyncio.run(
+        flow.async_step_reconfigure(
+            {
+                "hub_ip": "primary.local",
+                "secondary_hub_ip": "  ",
+                "client_id": "client",
+                "client_secret": "secret",
+                "net_id": "net",
+            }
+        )
+    )
+
+    assert result["data"]["hub_ip"] == "primary.local"
+    assert result["title"] == "YoLink Hub (primary.local)"
+    assert result["options"] == {}
+    assert "secondary_hub_ip" not in result["data"]
+    assert [call["hosts"] for call in calls] == [["primary.local"]]
+
+
+def test_reconfigure_requires_secondary_host_connectivity(monkeypatch) -> None:
+    """Reconfigure should fail if a configured secondary host cannot be reached."""
+    calls: list[dict[str, object]] = []
+
+    async def fake_create_client(**kwargs):
+        calls.append(kwargs)
+        if kwargs["host"] == "secondary.local":
+            raise OSError("secondary unavailable")
+        return object(), object(), FakeClosableSession()
+
+    monkeypatch.setattr(config_flow_module, "create_client", fake_create_client)
+    flow = config_flow_module.YoLocalConfigFlow()
+    flow._reconfigure_entry = SimpleNamespace(
+        data={
+            "hub_ip": "primary.local",
+            "secondary_hub_ip": "old-secondary.local",
+            "client_id": "client",
+            "client_secret": "secret",
+            "net_id": "net",
+        }
+    )
+
+    result = asyncio.run(
+        flow.async_step_reconfigure(
+            {
+                "hub_ip": "primary.local",
+                "secondary_hub_ip": "secondary.local",
+                "client_id": "client",
+                "client_secret": "secret",
+                "net_id": "net",
+            }
+        )
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "cannot_connect"}
+    assert [call["hosts"] for call in calls] == [
+        ["primary.local"],
+        ["secondary.local"],
+    ]
+
+
+def test_reconfigure_form_uses_suggested_values_not_defaults() -> None:
+    """Reconfigure optional fields should be clearable in the HA UI."""
+    flow = config_flow_module.YoLocalConfigFlow()
+    flow._reconfigure_entry = SimpleNamespace(
+        data={
+            "hub_ip": "primary.local",
+            "secondary_hub_ip": "old-secondary.local",
+            "client_id": "client",
+            "client_secret": "secret",
+            "net_id": "net",
+        }
+    )
+
+    result = asyncio.run(flow.async_step_reconfigure())
+    schema = result["data_schema"].schema
+
+    assert {key.key: key.default for key in schema} == {
+        "hub_ip": None,
+        "secondary_hub_ip": None,
+        "client_id": None,
+        "client_secret": None,
+        "net_id": None,
+    }
 
 
 def test_merge_nested_state_covers_all_shapes() -> None:
@@ -632,6 +977,77 @@ def test_outlet_switch_tracks_physical_mqtt_state_changes() -> None:
     assert entity.is_on is False
 
 
+def test_duplicate_mqtt_events_are_ignored() -> None:
+    """The same MQTT report received on two interfaces should update once."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("dup"), device_type="MotionSensor")
+    coordinator._devices[device.device_id] = device
+    update_calls: list[dict[str, object]] = []
+
+    def update_device_state(device_id: str, state: dict[str, object]) -> None:
+        update_calls.append(state)
+        coordinator._states[device_id] = state
+
+    coordinator._update_device_state = update_device_state
+    event = DeviceEvent(
+        device_id=device.device_id,
+        event="report",
+        data={"state": "alert", "lastReportedAt": "2026-03-09T12:00:00+00:00"},
+        raw={
+            "deviceId": device.device_id,
+            "event": "report",
+            "time": 1773057600000,
+            "data": {"state": "alert"},
+        },
+    )
+
+    coordinator._on_device_event(event)
+    coordinator._on_device_event(event)
+
+    assert len(update_calls) == 1
+
+
+def test_distinct_mqtt_events_are_not_deduplicated() -> None:
+    """Different reports from the same device should both be processed."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("distinct"), device_type="MotionSensor")
+    coordinator._devices[device.device_id] = device
+    update_calls: list[dict[str, object]] = []
+
+    def update_device_state(device_id: str, state: dict[str, object]) -> None:
+        update_calls.append(state)
+        coordinator._states[device_id] = state
+
+    coordinator._update_device_state = update_device_state
+    first = DeviceEvent(
+        device_id=device.device_id,
+        event="report",
+        data={"state": "alert", "lastReportedAt": "2026-03-09T12:00:00+00:00"},
+        raw={
+            "deviceId": device.device_id,
+            "event": "report",
+            "time": 1773057600000,
+            "data": {"state": "alert"},
+        },
+    )
+    second = DeviceEvent(
+        device_id=device.device_id,
+        event="report",
+        data={"state": "normal", "lastReportedAt": "2026-03-09T12:00:01+00:00"},
+        raw={
+            "deviceId": device.device_id,
+            "event": "report",
+            "time": 1773057601000,
+            "data": {"state": "normal"},
+        },
+    )
+
+    coordinator._on_device_event(first)
+    coordinator._on_device_event(second)
+
+    assert len(update_calls) == 2
+
+
 def test_async_send_command_refreshes_state_and_notifies_coordinator() -> None:
     """Command refresh should publish the authoritative post-command state."""
     coordinator = make_coordinator()
@@ -908,6 +1324,22 @@ def test_entity_availability_handles_offline_and_stale_devices() -> None:
         "online": True,
         "lastReportedAt": fresh.isoformat(),
     }
+    assert entity.available is True
+
+
+def test_entity_availability_ignores_transient_coordinator_health() -> None:
+    """A hub-health blip should not make cached device entities unavailable."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", display_type="Outlet")
+    entity = YoLocalEntity(coordinator, device)
+    fresh = datetime.now(UTC) - timedelta(minutes=1)
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "lastReportedAt": fresh.isoformat(),
+    }
+    coordinator.async_set_update_error(aiohttp.ClientConnectionError("hub busy"))
+
+    assert coordinator.last_update_success is False
     assert entity.available is True
 
 
@@ -1246,6 +1678,157 @@ def test_async_setup_defers_initial_data_publication() -> None:
         coro.close()
 
 
+def test_connect_mqtt_subscribes_to_all_configured_hosts(monkeypatch) -> None:
+    """MQTT should subscribe through every configured hub interface."""
+    coordinator = make_coordinator()
+    coordinator._client = SimpleNamespace(
+        host="ethernet.local",
+        hosts=("ethernet.local", "wifi.local"),
+    )
+    coordinator._token_manager = SimpleNamespace(
+        client_id="client",
+        get_token=lambda: asyncio.sleep(0, result="token"),
+    )
+    connected_hosts: list[str] = []
+
+    async def connect_host(host: str) -> None:
+        connected_hosts.append(host)
+        coordinator._mqtt_clients[host] = FakeMqttClient()
+
+    coordinator._connect_mqtt_host = connect_host
+
+    asyncio.run(coordinator._connect_mqtt())
+
+    assert connected_hosts == ["ethernet.local", "wifi.local"]
+    assert set(coordinator._mqtt_clients) == {"ethernet.local", "wifi.local"}
+
+
+def test_connect_mqtt_keeps_secondary_when_primary_fails() -> None:
+    """Startup MQTT connection should continue when one interface is down."""
+    coordinator = make_coordinator()
+    coordinator._client = SimpleNamespace(
+        host="ethernet.local",
+        hosts=("ethernet.local", "wifi.local"),
+    )
+    connected_hosts: list[str] = []
+
+    async def connect_host(host: str) -> None:
+        if host == "ethernet.local":
+            raise ConnectionError("ethernet down")
+        connected_hosts.append(host)
+        coordinator._mqtt_clients[host] = FakeMqttClient()
+
+    coordinator._connect_mqtt_host = connect_host
+
+    asyncio.run(coordinator._connect_mqtt())
+
+    assert connected_hosts == ["wifi.local"]
+    assert set(coordinator._mqtt_clients) == {"wifi.local"}
+
+
+def test_connect_mqtt_raises_only_when_all_hosts_fail() -> None:
+    """Startup MQTT connection should fail only when no interface connects."""
+    coordinator = make_coordinator()
+    coordinator._client = SimpleNamespace(
+        host="ethernet.local",
+        hosts=("ethernet.local", "wifi.local"),
+    )
+
+    async def connect_host(host: str) -> None:
+        raise ConnectionError(f"{host} down")
+
+    coordinator._connect_mqtt_host = connect_host
+
+    try:
+        asyncio.run(coordinator._connect_mqtt())
+    except ConnectionError as err:
+        assert "wifi.local down" in str(err)
+    else:
+        raise AssertionError("expected all-host MQTT failure")
+
+
+def test_connect_mqtt_host_uses_host_specific_token(monkeypatch) -> None:
+    """Each MQTT interface should authenticate against that exact host."""
+    coordinator = make_coordinator()
+    token_manager = FakeHostTokenManager()
+    coordinator._token_manager = token_manager
+    created_clients: list[object] = []
+
+    class FakeYoLinkMQTTClient:
+        def __init__(
+            self,
+            *,
+            host: str,
+            net_id: str,
+            client_id: str,
+            access_token: str,
+            port: int,
+        ) -> None:
+            self.host = host
+            self.net_id = net_id
+            self.client_id = client_id
+            self.access_token = access_token
+            self.port = port
+            self.callbacks = []
+            self.disconnect_callbacks = []
+            created_clients.append(self)
+
+        def subscribe(self, callback):
+            self.callbacks.append(callback)
+
+        def on_disconnect(self, callback):
+            self.disconnect_callbacks.append(callback)
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.YoLinkMQTTClient",
+        FakeYoLinkMQTTClient,
+    )
+
+    asyncio.run(coordinator._connect_mqtt_host("wifi.local"))
+
+    assert token_manager.hosts == ["wifi.local"]
+    assert len(created_clients) == 1
+    assert created_clients[0].host == "wifi.local"
+    assert created_clients[0].access_token == "token-for-wifi.local"
+    assert "wifi.local" in coordinator._mqtt_clients
+
+
+def test_mqtt_disconnect_reconnects_missing_host_only() -> None:
+    """A failed interface should reconnect without dropping the other MQTT path."""
+    coordinator = make_coordinator()
+    coordinator._client = SimpleNamespace(
+        host="ethernet.local",
+        hosts=("ethernet.local", "wifi.local"),
+    )
+    ethernet_client = FakeMqttClient()
+    wifi_client = FakeMqttClient()
+    coordinator._mqtt_clients = {
+        "ethernet.local": ethernet_client,
+        "wifi.local": wifi_client,
+    }
+    reconnected_hosts: list[str] = []
+
+    async def connect_host(host: str) -> None:
+        reconnected_hosts.append(host)
+        coordinator._mqtt_clients[host] = FakeMqttClient()
+
+    coordinator._connect_mqtt_host = connect_host
+    coordinator._on_mqtt_disconnect("ethernet.local")
+    reconnect_coro = coordinator.hass._scheduled_coroutines.pop()
+
+    asyncio.run(reconnect_coro)
+
+    assert reconnected_hosts == ["ethernet.local"]
+    assert "wifi.local" in coordinator._mqtt_clients
+    assert wifi_client.disconnect_calls == 0
+
+
 def test_async_setup_removes_stale_registry_devices() -> None:
     """Startup should purge registry devices no longer present on the hub."""
     coordinator = make_coordinator()
@@ -1417,6 +2000,88 @@ def test_async_refresh_devices_removes_device_registry_entry() -> None:
 
     assert refreshed is True
     assert registry.async_get_device(identifiers={(DOMAIN, removed.device_id)}) is None
+
+
+def test_async_refresh_devices_debounces_hub_health_failure() -> None:
+    """A single device-list failure should not mark the coordinator unhealthy."""
+    coordinator = make_coordinator()
+    failure = aiohttp.ClientConnectionError("all hosts offline")
+
+    async def get_devices() -> list[Device]:
+        raise failure
+
+    coordinator._client = SimpleNamespace(
+        get_devices=get_devices,
+        get_state=None,
+        host="127.0.0.1",
+    )
+
+    first_refreshed = asyncio.run(coordinator._async_refresh_devices())
+
+    assert first_refreshed is False
+    assert coordinator.last_update_success is True
+    assert coordinator.last_exception is None
+
+    second_refreshed = asyncio.run(coordinator._async_refresh_devices())
+
+    assert second_refreshed is False
+    assert coordinator.last_update_success is False
+    assert coordinator.last_exception is failure
+
+
+def test_async_refresh_devices_clears_unhealthy_status_after_hub_recovery() -> None:
+    """A later successful device-list call should clear the coordinator error."""
+    coordinator = make_coordinator()
+    coordinator.async_set_update_error(aiohttp.ClientConnectionError("offline"))
+    device = make_device(device_id=make_device_id("recovered"), device_type="DoorSensor")
+    coordinator._devices = {device.device_id: device}
+    coordinator._states = {device.device_id: {"state": {"battery": 4}}}
+
+    async def get_devices() -> list[Device]:
+        return [device]
+
+    coordinator._client = SimpleNamespace(
+        get_devices=get_devices,
+        get_state=None,
+        host="127.0.0.1",
+    )
+
+    refreshed = asyncio.run(coordinator._async_refresh_devices())
+
+    assert refreshed is False
+    assert coordinator.last_update_success is True
+    assert coordinator.last_exception is None
+    assert coordinator.data == coordinator._states
+
+
+def test_state_refresh_failure_does_not_mark_hub_unhealthy() -> None:
+    """Per-device state refresh failures should not mark hub health bad."""
+    coordinator = make_coordinator()
+
+    async def update_data() -> dict[str, dict[str, object]]:
+        raise aiohttp.ClientConnectionError("state refresh failed")
+
+    sleep_calls = 0
+
+    async def fake_sleep(_interval: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            raise RuntimeError("stop")
+
+    original_sleep = asyncio.sleep
+    coordinator._async_update_data = update_data
+    asyncio.sleep = fake_sleep
+    try:
+        try:
+            asyncio.run(coordinator._async_state_refresh_loop())
+        except RuntimeError as exc:
+            assert str(exc) == "stop"
+    finally:
+        asyncio.sleep = original_sleep
+
+    assert coordinator.last_update_success is True
+    assert coordinator.last_exception is None
 
 
 def test_device_discovery_loop_keeps_running_after_change() -> None:

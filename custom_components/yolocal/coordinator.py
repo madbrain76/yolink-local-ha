@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable, Coroutine
 from datetime import timedelta
+from time import monotonic
 from typing import Any
 
 import aiohttp
@@ -35,6 +37,9 @@ type DeviceRegistryListener = Callable[[list[Device], list[Device]], None]
 TRANSIENT_DEVICE_UNREACHABLE = "000201"
 STALE_REPORT_AGE = timedelta(hours=12)
 SET_STATE_TRANSPORT_RETRY_DELAY = 2.0
+HUB_HEALTH_FAILURE_THRESHOLD = 2
+MQTT_DUPLICATE_WINDOW = 300.0
+MQTT_DUPLICATE_CACHE_LIMIT = 256
 
 
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
@@ -68,7 +73,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._config_entry_id = config_entry_id
         self._net_id = net_id
         self._mqtt_port = mqtt_port
-        self._mqtt_client: YoLinkMQTTClient | None = None
+        self._mqtt_clients: dict[str, YoLinkMQTTClient] = {}
         self._devices: dict[str, Device] = {}
         self._states: dict[str, dict[str, Any]] = {}
         self._reconnect_task: asyncio.Task[None] | None = None
@@ -76,6 +81,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._state_refresh_task: asyncio.Task[None] | None = None
         self._device_registry_listeners: list[DeviceRegistryListener] = []
         self._shutdown = False
+        self._hub_health_failures = 0
+        self._recent_mqtt_events: dict[str, float] = {}
 
     @property
     def devices(self) -> dict[str, Device]:
@@ -239,6 +246,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         try:
             return await self._async_set_state_with_retry(device, params)
         except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as err:
+            if hasattr(self._client, "switch_host"):
+                self._client.switch_host()
             await asyncio.sleep(SET_STATE_TRANSPORT_RETRY_DELAY)
             try:
                 state = await self._async_get_state_with_retry(device, attempts=1)
@@ -305,15 +314,49 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
-        if self._mqtt_client:
-            await self._mqtt_client.disconnect()
-            self._mqtt_client = None
+        for mqtt_client in list(self._mqtt_clients.values()):
+            await mqtt_client.disconnect()
+        self._mqtt_clients.clear()
         await self._session.close()
 
     async def _connect_mqtt(self) -> None:
-        """Connect to MQTT broker."""
-        token = await self._token_manager.get_token()
-        host = self._client.host
+        """Connect to all configured MQTT brokers."""
+        connected_hosts: list[str] = []
+        last_error: Exception | None = None
+        for host in self._mqtt_hosts:
+            try:
+                await self._connect_mqtt_host(host)
+            except Exception as err:
+                last_error = err
+                _LOGGER.warning(
+                    "Failed to connect to YoLink MQTT broker at %s",
+                    host,
+                    exc_info=True,
+                )
+            else:
+                connected_hosts.append(host)
+
+        if not connected_hosts:
+            if last_error is not None:
+                raise last_error
+            raise ConnectionError("No YoLink MQTT hosts configured")
+
+    @property
+    def _mqtt_hosts(self) -> tuple[str, ...]:
+        """Return configured MQTT hosts."""
+        hosts = getattr(self._client, "hosts", None)
+        if hosts:
+            return tuple(hosts)
+        return (self._client.host,)
+
+    async def _connect_mqtt_host(self, host: str) -> None:
+        """Connect to one MQTT broker address."""
+        if host in self._mqtt_clients:
+            return
+        if hasattr(self._token_manager, "get_token_for_host"):
+            token = await self._token_manager.get_token_for_host(host)
+        else:
+            token = await self._token_manager.get_token()
 
         mqtt_client = YoLinkMQTTClient(
             host=host,
@@ -323,12 +366,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             port=self._mqtt_port,
         )
         mqtt_client.subscribe(self._on_device_event)
-        mqtt_client.on_disconnect(self._on_mqtt_disconnect)
+        mqtt_client.on_disconnect(lambda host=host: self._on_mqtt_disconnect(host))
 
         try:
             await mqtt_client.connect()
-            self._mqtt_client = mqtt_client
-            _LOGGER.info("Connected to YoLink MQTT broker")
+            self._mqtt_clients[host] = mqtt_client
+            _LOGGER.info("Connected to YoLink MQTT broker at %s", host)
         except Exception:
             try:
                 await mqtt_client.disconnect()
@@ -337,7 +380,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     "Error while cleaning up failed MQTT client",
                     exc_info=True,
                 )
-            _LOGGER.exception("Failed to connect to MQTT broker")
             raise
 
     @callback
@@ -348,6 +390,13 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if device is None:
             _LOGGER.debug("Ignoring event for unknown device: %s", device_id)
             return
+        if self._is_duplicate_mqtt_event(event):
+            _LOGGER.debug(
+                "Ignoring duplicate MQTT event for %s: %s",
+                device_id,
+                event.event,
+            )
+            return
 
         event_data = event.data if isinstance(event.data, dict) else {}
         normalized_event = self._normalize_mqtt_event(device, event_data)
@@ -355,6 +404,33 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             device_id,
             self._merge_state_payload(self._states.get(device_id, {}), normalized_event),
         )
+
+    def _is_duplicate_mqtt_event(self, event: DeviceEvent) -> bool:
+        """Return True when the same MQTT event was recently processed."""
+        now = monotonic()
+        cutoff = now - MQTT_DUPLICATE_WINDOW
+        for key, seen_at in list(self._recent_mqtt_events.items()):
+            if seen_at < cutoff:
+                self._recent_mqtt_events.pop(key, None)
+
+        event_key = self._mqtt_event_key(event)
+        if event_key in self._recent_mqtt_events:
+            self._recent_mqtt_events[event_key] = now
+            return True
+
+        self._recent_mqtt_events[event_key] = now
+        if len(self._recent_mqtt_events) > MQTT_DUPLICATE_CACHE_LIMIT:
+            oldest_key = min(self._recent_mqtt_events, key=self._recent_mqtt_events.get)
+            self._recent_mqtt_events.pop(oldest_key, None)
+        return False
+
+    def _mqtt_event_key(self, event: DeviceEvent) -> str:
+        """Return a stable key for duplicate MQTT event detection."""
+        try:
+            raw = json.dumps(event.raw, sort_keys=True, separators=(",", ":"))
+        except TypeError:
+            raw = repr(event.raw)
+        return f"{event.device_id}|{event.event}|{raw}"
 
     def _update_device_state(self, device_id: str, state: dict[str, Any]) -> None:
         """Store updated device state and notify listeners."""
@@ -497,27 +573,38 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return event_state
 
     @callback
-    def _on_mqtt_disconnect(self) -> None:
+    def _on_mqtt_disconnect(self, host: str | None = None) -> None:
         """Reconnect MQTT when the broker disconnects."""
         if self._shutdown:
             return
+        if host is not None:
+            self._mqtt_clients.pop(host, None)
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = self.hass.async_create_task(self._async_reconnect_mqtt())
 
     async def _async_reconnect_mqtt(self) -> None:
-        """Reconnect the MQTT client with backoff."""
+        """Reconnect missing MQTT clients with backoff."""
         backoff_seconds = 5
         while not self._shutdown:
-            try:
-                if self._mqtt_client:
-                    await self._mqtt_client.disconnect()
-                    self._mqtt_client = None
-                await self._connect_mqtt()
-                if self._mqtt_client is not None:
-                    return
-            except Exception:
-                _LOGGER.exception("Failed to reconnect MQTT broker")
+            missing_hosts = [
+                host for host in self._mqtt_hosts if host not in self._mqtt_clients
+            ]
+            if not missing_hosts:
+                return
+
+            for host in missing_hosts:
+                try:
+                    await self._connect_mqtt_host(host)
+                except Exception:
+                    _LOGGER.warning(
+                        "Failed to reconnect YoLink MQTT broker at %s",
+                        host,
+                        exc_info=True,
+                    )
+
+            if all(host in self._mqtt_clients for host in self._mqtt_hosts):
+                return
 
             await asyncio.sleep(backoff_seconds)
             backoff_seconds = min(backoff_seconds * 2, 300)
@@ -545,10 +632,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Refresh the device registry and notify listeners if membership changed."""
         try:
             devices = await self._client.get_devices()
-        except Exception:
+        except Exception as err:
             _LOGGER.warning("Failed to refresh device list", exc_info=True)
+            self._mark_hub_api_failure(err)
             return False
 
+        self._mark_hub_api_available()
         new_devices = {device.device_id: device for device in devices}
         if set(new_devices) == set(self._devices):
             self._devices = new_devices
@@ -586,6 +675,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         self.async_set_updated_data(self._states.copy())
         return True
+
+    def _mark_hub_api_available(self) -> None:
+        """Clear coordinator update error after a successful hub API call."""
+        self._hub_health_failures = 0
+        if not self.last_update_success:
+            self.async_set_updated_data(self._states.copy())
+
+    def _mark_hub_api_failure(self, err: Exception) -> None:
+        """Mark coordinator unhealthy only after repeated hub API failures."""
+        self._hub_health_failures += 1
+        if self._hub_health_failures >= HUB_HEALTH_FAILURE_THRESHOLD:
+            self.async_set_update_error(err)
 
     def _remove_device_from_registry(self, device_id: str) -> None:
         """Remove a deleted device from the HA device registry."""
@@ -670,6 +771,7 @@ async def create_coordinator(
     net_id: str,
     http_port: int = 1080,
     mqtt_port: int = 18080,
+    hosts: list[str] | None = None,
 ) -> YoLocalCoordinator:
     """Create a coordinator.
 
@@ -681,10 +783,17 @@ async def create_coordinator(
     """
     session = aiohttp.ClientSession()
     try:
-        token_manager = TokenManager(host, client_id, client_secret, session, http_port)
+        token_manager = TokenManager(
+            host,
+            client_id,
+            client_secret,
+            session,
+            http_port,
+            hosts=hosts,
+        )
         await token_manager.get_token()
 
-        client = YoLinkClient(host, token_manager, session, http_port)
+        client = YoLinkClient(host, token_manager, session, http_port, hosts=hosts)
 
         return YoLocalCoordinator(
             hass, client, token_manager, session, config_entry_id, net_id, mqtt_port

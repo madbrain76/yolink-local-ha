@@ -6,6 +6,7 @@ DOMAIN = "yolocal"
 
 # Configuration keys
 CONF_HUB_IP = "hub_ip"
+CONF_SECONDARY_HUB_IP = "secondary_hub_ip"
 CONF_CLIENT_ID = "client_id"
 CONF_CLIENT_SECRET = "client_secret"
 CONF_NET_ID = "net_id"

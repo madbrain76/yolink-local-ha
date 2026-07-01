@@ -36,6 +36,7 @@ def _install_homeassistant_stubs() -> None:
     core.callback = callback
 
     config_entries = ModuleType("homeassistant.config_entries")
+    config_entries.ConfigFlowResult = dict
 
     class ConfigEntry:
         """Minimal ConfigEntry stub."""
@@ -50,6 +51,59 @@ def _install_homeassistant_stubs() -> None:
             return callback
 
     config_entries.ConfigEntry = ConfigEntry
+
+    class ConfigFlow:
+        """Minimal ConfigFlow stub."""
+
+        def __init_subclass__(cls, **_kwargs):
+            return super().__init_subclass__()
+
+        def async_create_entry(self, title="", data=None):
+            return {"type": "create_entry", "title": title, "data": data or {}}
+
+        def async_show_form(
+            self,
+            step_id=None,
+            data_schema=None,
+            errors=None,
+            description_placeholders=None,
+        ):
+            return {
+                "type": "form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": errors or {},
+                "description_placeholders": description_placeholders or {},
+            }
+
+        def _get_reconfigure_entry(self):
+            return self._reconfigure_entry
+
+        def add_suggested_values_to_schema(self, data_schema, _suggested_values):
+            return data_schema
+
+        def async_update_reload_and_abort(
+            self,
+            entry,
+            title=None,
+            data=None,
+            data_updates=None,
+            options=None,
+        ):
+            new_data = dict(entry.data)
+            if data is not None:
+                new_data = data
+            if data_updates is not None:
+                new_data.update(data_updates)
+            return {
+                "type": "abort",
+                "reason": "reconfigure_successful",
+                "title": title,
+                "data": new_data,
+                "options": options,
+            }
+
+    config_entries.ConfigFlow = ConfigFlow
 
     exceptions = ModuleType("homeassistant.exceptions")
 
@@ -78,9 +132,17 @@ def _install_homeassistant_stubs() -> None:
             self.name = name
             self.update_interval = update_interval
             self.data = None
+            self.last_update_success = True
+            self.last_exception = None
 
         def async_set_updated_data(self, data):
             self.data = data
+            self.last_update_success = True
+            self.last_exception = None
+
+        def async_set_update_error(self, err):
+            self.last_exception = err
+            self.last_update_success = False
 
     class CoordinatorEntity:
         """Minimal CoordinatorEntity stub."""
@@ -103,9 +165,13 @@ def _install_homeassistant_stubs() -> None:
 
     entity = ModuleType("homeassistant.helpers.entity")
 
+    class Entity:
+        """Minimal entity stub."""
+
     class EntityCategory:
         DIAGNOSTIC = "diagnostic"
 
+    entity.Entity = Entity
     entity.EntityCategory = EntityCategory
 
     device_registry = ModuleType("homeassistant.helpers.device_registry")
@@ -300,6 +366,32 @@ def _install_homeassistant_stubs() -> None:
 
 
 def _install_runtime_dependency_stubs() -> None:
+    voluptuous = ModuleType("voluptuous")
+
+    class _SchemaKey:
+        def __init__(self, key, default=None) -> None:
+            self.key = key
+            self.default = default
+
+        def __hash__(self) -> int:
+            return hash((self.key, self.default))
+
+        def __eq__(self, other) -> bool:
+            return (
+                isinstance(other, _SchemaKey)
+                and self.key == other.key
+                and self.default == other.default
+            )
+
+    class Schema:
+        def __init__(self, schema) -> None:
+            self.schema = schema
+
+    voluptuous.Schema = Schema
+    voluptuous.Required = _SchemaKey
+    voluptuous.Optional = _SchemaKey
+    sys.modules["voluptuous"] = voluptuous
+
     aiohttp = ModuleType("aiohttp")
 
     class ClientSession:
