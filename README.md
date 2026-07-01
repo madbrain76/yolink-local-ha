@@ -70,7 +70,7 @@ Outlet `Power` is derived from the local API `power` field, which reports deciwa
 Before installing this integration, you need:
 
 1. A **YoLink Local Hub** (model YS1606-UC)
-2. The hub connected to your network via Ethernet or Wi-Fi
+2. The hub connected to your network via Ethernet or Wi-Fi. If the hub is connected to both, you may configure both addresses for better resilience.
 3. Devices migrated from YoLink Cloud to the Local Hub
 4. HTTP and MQTT protocols enabled on the hub
 
@@ -87,6 +87,8 @@ You'll need four pieces of information from the YoLink app:
 3. Tap the **⋮** menu (top right)
 4. Find the **IP Address** under the Ethernet or Wi-fi section. Make sure you have a DHCP reservation for the hub with this IP address in your router/DHCP server.
 5. If your router has local DNS for DHCP reservations, you may also use the FQDN, which is what I do.
+
+If your hub is connected by both Ethernet and Wi-Fi, note both IP addresses or hostnames. The integration can use one as the primary address and the other as an optional secondary address. Both addresses must point to the same YoLink Local Hub.
 
 ![Hub main screen](images/IMG_2021.PNG)
 
@@ -126,16 +128,22 @@ You'll need four pieces of information from the YoLink app:
 2. Click **Add Integration**
 3. Search for **YoLink Local**
 4. Enter your credentials:
-   - **Hub IP**: Your hub's IP address or hostname
+   - **Primary hub IP/hostname**: Your hub's normal IP address or hostname, typically the Ethernet address
+   - **Secondary hub IP/hostname (optional)**: The same hub's other address, typically Wi-Fi when the primary address is Ethernet
    - **Client ID**: From the Integrations tab
    - **Client Secret**: From the Integrations tab
    - **Net ID**: From the General tab
+
+The secondary address is optional. Configure it only when the same hub is reachable on two network interfaces, such as Ethernet and Wi-Fi.
+
+To add, remove, or change the secondary address later, use **Settings -> Devices & Services -> YoLink Local -> Reconfigure**. The integration entry title lists both configured hostnames when two are set.
 
 ## How It Works
 
 - **Device Discovery**: On startup, the integration queries the hub for all connected devices
 - **Initial State**: Each device's current state is fetched via HTTP
 - **Real-time Updates**: MQTT subscription receives instant state changes (door opens, temperature changes, etc.)
+- **Dual-host resilience**: When both hub addresses are configured, the integration keeps independent MQTT subscriptions to both interfaces and deduplicates identical events. HTTP reads can fail over between configured addresses.
 - **Commands**: Lock/unlock, on/off, and other commands are sent via HTTP
 
 ## Test Scripts
@@ -162,6 +170,7 @@ Set these before running tests:
 Required connection/auth:
 
 - `YOLINK_HOST` (hub host or URL)
+- `YOLINK_HOST_SECONDARY` (optional secondary hub host or URL)
 - `YOLINK_CLIENT_ID`
 - `YOLINK_CLIENT_SECRET`
 - `YOLINK_NET` or `YOLINK_NET_ID`
@@ -224,6 +233,14 @@ Capture payloads for configured devices:
 uv run python tests/capture_yolink_payloads.py --duration 300
 ```
 
+Monitor primary and secondary MQTT paths:
+
+```bash
+uv run python tests/monitor_yolink_mqtt_hosts.py --timeout 300
+```
+
+This script keeps retrying both configured hosts for transient startup or network failures. It reports which interface receives each event and marks exact duplicate YoLink payloads received from both interfaces.
+
 ## Adding New Device Types
 
 To add support for a new YoLink device type, follow this procedure:
@@ -272,12 +289,14 @@ Check the Home Assistant logs for import errors. The integration requires `paho-
 - Verify the hub IP address is correct and reachable
 - Check that HTTP (port 1080) and MQTT (port 18080) are enabled on the hub
 - Ensure devices have been migrated to the Local Network in the YoLink app
+- If using both Ethernet and Wi-Fi, verify both configured addresses belong to the same hub and both ports are reachable on each address
 
 ### State updates are delayed
 
 Real-time updates require MQTT. If updates only happen on HA restart, check that:
 - MQTT is enabled on the hub (port 18080)
 - Your firewall allows the connection
+- If a secondary hub address is configured, verify both primary and secondary MQTT connections are reachable. The integration should continue receiving events through either interface while the other is unavailable.
 
 ## Contributing
 
