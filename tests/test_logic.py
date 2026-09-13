@@ -19,6 +19,10 @@ from custom_components.yolocal.api.client import ApiError
 from custom_components.yolocal.api.client import YoLinkClient
 from custom_components.yolocal.api.device import Device
 from custom_components.yolocal.api.mqtt import DeviceEvent
+from custom_components.yolocal.binary_sensor import (
+    YoLocalWaterFlowSensor,
+    YoLocalWaterMeterAlarmSensor,
+)
 from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import YoLocalCoordinator
 from custom_components.yolocal.entity import YoLocalEntity
@@ -27,10 +31,11 @@ from custom_components.yolocal.sensor import (
     YoLocalLastReportedSensor,
     YoLocalOutletPowerSensor,
     YoLocalTHLimitSensor,
+    YoLocalWaterMeterReadingSensor,
     build_sensor_entities,
 )
 from custom_components.yolocal.switch import YoLocalSwitch
-from custom_components.yolocal.valve import YoLocalValve
+from custom_components.yolocal.valve import YoLocalValve, build_valve_entities
 from capture_yolink_payloads import sanitize_value
 
 
@@ -2433,3 +2438,122 @@ def test_device_from_api_recognises_manipulator_type() -> None:
     assert device.device_type == "Manipulator"
     assert device.display_type == "Manipulator"
     assert device.model == "YS4909-UC"
+
+
+def test_water_meter_controller_capture_updates_entities() -> None:
+    """Full report followed by partial status changes preserves meter and flow."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = coordinator._normalize_http_state(
+        {
+            "state": {"meter": 2886895, "valve": "open", "waterFlowing": True},
+            "dailyUsage": {"amount": 2088, "times": 2},
+            "recentUsage": {"amount": 1046, "duration": 1},
+            "attributes": {"meterStepFactor": 1117, "meterUnit": 3, "screenMeterUnit": 0},
+            "alarm": {"leak": False, "valveError": False},
+            "battery": 4,
+        },
+        device,
+    )
+
+    valve = build_valve_entities(coordinator, device)[0]
+    flow = YoLocalWaterFlowSensor(coordinator, device)
+    alarm = YoLocalWaterMeterAlarmSensor(coordinator, device, "leak", "Leak alarm")
+    readings = {
+        entity._attr_unique_id: entity
+        for entity in build_sensor_entities(coordinator, device)
+        if isinstance(entity, YoLocalWaterMeterReadingSensor)
+    }
+
+    assert valve.is_closed is False
+    assert flow.is_on is True
+    assert alarm.is_on is False
+    assert round(readings[f"{device.device_id}_meter"].native_value, 2) == 32246.62
+    assert round(readings[f"{device.device_id}_dailyUsage_amount"].native_value, 2) == 23.32
+    assert readings[f"{device.device_id}_recentUsage_duration"].native_value == 1
+    assert any(isinstance(e, YoLocalBatterySensor) for e in build_sensor_entities(coordinator, device))
+
+    status = coordinator._normalize_mqtt_event(
+        device, {"state": {"valve": "close"}, "battery": 4}
+    )
+    coordinator._states[device.device_id] = coordinator._merge_state_payload(
+        coordinator.get_state(device.device_id), status
+    )
+    assert valve.is_closed is True
+    assert flow.is_on is True
+    assert round(readings[f"{device.device_id}_meter"].native_value, 2) == 32246.62
+    assert coordinator._state_matches_command(coordinator.get_state(device.device_id), {"valve": "close"})
+
+    report = coordinator._normalize_mqtt_event(
+        device,
+        {
+            "state": {"waterFlowing": False},
+            "recentUsage": {"amount": 1042, "duration": 1},
+            "alarm": {"valveError": True},
+        },
+    )
+    coordinator._states[device.device_id] = coordinator._merge_state_payload(
+        coordinator.get_state(device.device_id), report
+    )
+    assert flow.is_on is False
+    assert round(readings[f"{device.device_id}_recentUsage_amount"].native_value, 2) == 11.64
+    assert YoLocalWaterMeterAlarmSensor(
+        coordinator, device, "valveError", "Valve error"
+    ).is_on is True
+
+    refreshed = coordinator._normalize_http_state(
+        {
+            "state": {"meter": 2886900, "valve": "close", "waterFlowing": False},
+            "dailyUsage": {"amount": 2093, "times": 3},
+            "alarm": {"leak": True, "valveError": False},
+        },
+        device,
+    )
+    coordinator._states[device.device_id] = coordinator._merge_state_payload(
+        coordinator.get_state(device.device_id), refreshed
+    )
+    assert alarm.is_on is True
+    assert round(readings[f"{device.device_id}_meter"].native_value, 2) == 32246.67
+    assert round(readings[f"{device.device_id}_dailyUsage_amount"].native_value, 2) == 23.38
+
+
+def test_water_meter_controller_valve_uses_valve_parameter() -> None:
+    """WaterMeterController commands use params.valve and read back valve state."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"valve": "close"}}
+    entity = build_valve_entities(coordinator, device)[0]
+    calls = []
+
+    async def set_state(_device, params):
+        calls.append(params)
+        return {}
+
+    async def get_state(_device):
+        return {"state": {"valve": calls[-1]["valve"]}}
+
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+    asyncio.run(entity.async_open_valve())
+    assert calls == [{"valve": "open"}]
+    assert entity.is_closed is False
+    asyncio.run(entity.async_close_valve())
+    assert calls == [{"valve": "open"}, {"valve": "close"}]
+    assert entity.is_closed is True
+
+
+def test_water_meter_controller_entities_survive_initial_read_failure() -> None:
+    """A transient initial getState failure must not hide the battery entity."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._states[device.device_id] = {"online": False}
+
+    entities = build_sensor_entities(coordinator, device)
+
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
+    assert len([entity for entity in entities if isinstance(entity, YoLocalWaterMeterReadingSensor)]) == 5
+    assert next(
+        entity for entity in entities
+        if isinstance(entity, YoLocalWaterMeterReadingSensor) and entity._key == "meter"
+    ).native_value is None
