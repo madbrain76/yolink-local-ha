@@ -198,16 +198,8 @@ class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
         self._attr_unique_id = f"{device.device_id}_battery"
 
     @property
-    def available(self) -> bool:
-        """Battery sensor is always available with the last known value."""
-        return True
-
-    @property
     def native_value(self) -> int | None:
         """Return the battery level as percentage."""
-        if not super().available:
-            return 0
-
         level = self.state_value("battery", fallback=True)
 
         if level is None:

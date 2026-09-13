@@ -2557,3 +2557,60 @@ def test_water_meter_controller_entities_survive_initial_read_failure() -> None:
         entity for entity in entities
         if isinstance(entity, YoLocalWaterMeterReadingSensor) and entity._key == "meter"
     ).native_value is None
+
+
+def test_water_meter_controller_keeps_recent_state_when_poll_cannot_connect() -> None:
+    """A sleeping controller retains readings until its last report is stale."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = coordinator._normalize_http_state(
+        {
+            "state": {"meter": 2886895, "valve": "open", "waterFlowing": False},
+            "attributes": {"meterStepFactor": 1117},
+            "battery": 4,
+        },
+        device,
+    )
+    last_reported_at = coordinator.get_state(device.device_id)["lastReportedAt"]
+    assert datetime.now(UTC) - datetime.fromisoformat(last_reported_at) < timedelta(minutes=1)
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        raise ApiError(
+            "000201", "Cannot connect to the device", "WaterMeterController.getState"
+        )
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    meter = next(
+        entity
+        for entity in build_sensor_entities(coordinator, device)
+        if isinstance(entity, YoLocalWaterMeterReadingSensor) and entity._key == "meter"
+    )
+    battery = YoLocalBatterySensor(coordinator, device)
+    refreshed = asyncio.run(coordinator._async_update_data())
+    assert refreshed[device.device_id]["online"] is True
+    assert meter.available is True
+    assert round(meter.native_value, 2) == 32246.62
+    assert battery.available is True
+    assert battery.native_value == 100
+
+    coordinator._states[device.device_id]["lastReportedAt"] = (
+        datetime.now(UTC) - timedelta(hours=13)
+    ).isoformat()
+    refreshed = asyncio.run(coordinator._async_update_data())
+    assert refreshed[device.device_id]["online"] is False
+    assert meter.available is False
+    assert battery.available is False
+
+    fresh_event = coordinator._normalize_mqtt_event(
+        device,
+        {
+            "state": {"valve": "open"},
+            "lastReportedAt": datetime.now(UTC).isoformat(),
+        },
+    )
+    coordinator._states[device.device_id] = coordinator._merge_state_payload(
+        coordinator.get_state(device.device_id), fresh_event
+    )
+    assert meter.available is True
+    assert battery.available is True

@@ -150,6 +150,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device_id, incoming_state, unreachable in results:
             current_state = refreshed_states.get(device_id, {})
             if unreachable:
+                device = self._devices[device_id]
+                if (
+                    device.device_type == "WaterMeterController"
+                    and self._has_recent_report(current_state)
+                ):
+                    continue
                 refreshed_states[device_id] = self._mark_unreachable(current_state)
             elif incoming_state is not None:
                 refreshed_states[device_id] = self._merge_state_payload(
@@ -180,8 +186,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         return device_id, self._normalize_http_state(state, device), False
 
-    def _state_is_stale(self, state: dict[str, Any]) -> bool:
-        """Return True when a state has not reported within the stale window."""
+    def _has_recent_report(self, state: dict[str, Any]) -> bool:
+        """Return True when a state has reported within the stale window."""
         report_at = state.get("lastReportedAt")
         if not report_at:
             return False
@@ -189,7 +195,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             last_report = dt_util.parse_datetime(report_at)
         except (TypeError, ValueError):
             return False
-        return last_report is not None and dt_util.utcnow() - last_report > STALE_REPORT_AGE
+        return last_report is not None and dt_util.utcnow() - last_report <= STALE_REPORT_AGE
 
     async def _async_get_state_with_retry(
         self,
@@ -449,6 +455,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         normalized_state.setdefault("online", True)
         if normalized_state.get("reportAt") and "lastReportedAt" not in normalized_state:
             normalized_state["lastReportedAt"] = normalized_state["reportAt"]
+        if (
+            device is not None
+            and device.device_type == "WaterMeterController"
+            and "lastReportedAt" not in normalized_state
+        ):
+            normalized_state["lastReportedAt"] = dt_util.utcnow().isoformat()
         return normalized_state
 
     def _mark_unreachable(self, state: dict[str, Any]) -> dict[str, Any]:
