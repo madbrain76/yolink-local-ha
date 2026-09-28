@@ -82,6 +82,21 @@ async def async_setup_entry(
             )
         elif device.device_type == "MotionSensor":
             entities.append(YoLocalMotionLEDSensor(coordinator, device))
+        elif device.device_type == "WaterMeterController":
+            entities.append(YoLocalWaterFlowSensor(coordinator, device))
+            for alarm_type, alarm_name in (
+                ("leak", "Leak alarm"),
+                ("overrunAmount24H", "Daily amount alarm"),
+                ("overrunDurationOnce", "Duration alarm"),
+                ("overrunTimes24H", "Daily usage count alarm"),
+                ("reminder", "Reminder alarm"),
+                ("valveError", "Valve error"),
+            ):
+                entities.append(
+                    YoLocalWaterMeterAlarmSensor(
+                        coordinator, device, alarm_type, alarm_name
+                    )
+                )
         return entities
 
     await async_setup_device_entities(hass, entry, async_add_entities, build_entities)
@@ -126,6 +141,48 @@ class YoLocalBinarySensor(YoLocalEntity, BinarySensorEntity):
         if "version" in state:
             attrs["firmware_version"] = state.get("version")
         return attrs
+
+
+class YoLocalWaterFlowSensor(YoLocalEntity, BinarySensorEntity):
+    """Report whether water is currently flowing through a controller."""
+
+    _attr_name = "Water flowing"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_water_flowing"
+
+    @property
+    def is_on(self) -> bool | None:
+        value = self.state_value("waterFlowing")
+        return value if isinstance(value, bool) else None
+
+
+class YoLocalWaterMeterAlarmSensor(YoLocalEntity, BinarySensorEntity):
+    """Report one alarm flag from a WaterMeterController."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: YoLocalCoordinator,
+        device,
+        alarm_type: str,
+        alarm_name: str,
+    ) -> None:
+        super().__init__(coordinator, device)
+        self._alarm_type = alarm_type
+        self._attr_name = alarm_name
+        self._attr_unique_id = f"{device.device_id}_alarm_{alarm_type}"
+
+    @property
+    def is_on(self) -> bool | None:
+        alarm = self.state_value("alarm", fallback=True)
+        if not isinstance(alarm, dict):
+            return None
+        value = alarm.get(self._alarm_type)
+        return value if isinstance(value, bool) else None
 
 
 class YoLocalTHAlarmSensor(YoLocalEntity, BinarySensorEntity):

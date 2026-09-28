@@ -1,0 +1,40 @@
+{
+  "captured_at": "2026-09-13T11:59:33.672221+00:00",
+  "device_id": "WaterMeterController-1",
+  "device_name": "WaterMeterController-1",
+  "display_type": "WaterMeterController",
+  "env_name": "YOLINK_MYNEWDEV_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alarm": {
+        "leak": false,
+        "overrunAmount24H": false,
+        "overrunDurationOnce": false,
+        "overrunTimes24H": false,
+        "reminder": false,
+        "valveError": false
+      },
+      "attributes": {
+        "alertInterval": 5
+      },
+      "battery": 4,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "powerSupply": "battery",
+      "state": {
+        "valve": "open"
+      }
+    },
+    "deviceId": "WaterMeterController-1",
+    "event": "WaterMeterController.StatusChange",
+    "msgid": "1789300772037",
+    "time": 1789300772040
+  },
+  "raw_type": "WaterMeterController",
+  "sequence": 20,
+  "topic": "ylsubnet/REDACTED_NET_ID/WaterMeterController-1/report"
+}

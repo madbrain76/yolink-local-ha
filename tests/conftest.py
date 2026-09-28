@@ -266,9 +266,11 @@ def _install_homeassistant_stubs() -> None:
         TIMESTAMP = "timestamp"
         TEMPERATURE = "temperature"
         HUMIDITY = "humidity"
+        WATER = "water"
 
     class SensorStateClass:
         MEASUREMENT = "measurement"
+        TOTAL_INCREASING = "total_increasing"
 
     sensor.SensorEntity = SensorEntity
     sensor.SensorDeviceClass = SensorDeviceClass
@@ -334,8 +336,12 @@ def _install_homeassistant_stubs() -> None:
     class UnitOfPower:
         WATT = "W"
 
+    class UnitOfVolume:
+        LITERS = "L"
+
     const.UnitOfTemperature = UnitOfTemperature
     const.UnitOfPower = UnitOfPower
+    const.UnitOfVolume = UnitOfVolume
 
     homeassistant.core = core
     homeassistant.config_entries = config_entries

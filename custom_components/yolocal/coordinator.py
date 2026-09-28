@@ -150,6 +150,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device_id, incoming_state, unreachable in results:
             current_state = refreshed_states.get(device_id, {})
             if unreachable:
+                device = self._devices[device_id]
+                if (
+                    device.device_type == "WaterMeterController"
+                    and self._has_recent_report(current_state)
+                ):
+                    continue
                 refreshed_states[device_id] = self._mark_unreachable(current_state)
             elif incoming_state is not None:
                 refreshed_states[device_id] = self._merge_state_payload(
@@ -178,10 +184,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             )
             return device_id, None, False
 
-        return device_id, self._normalize_http_state(state), False
+        return device_id, self._normalize_http_state(state, device), False
 
-    def _state_is_stale(self, state: dict[str, Any]) -> bool:
-        """Return True when a state has not reported within the stale window."""
+    def _has_recent_report(self, state: dict[str, Any]) -> bool:
+        """Return True when a state has reported within the stale window."""
         report_at = state.get("lastReportedAt")
         if not report_at:
             return False
@@ -189,7 +195,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             last_report = dt_util.parse_datetime(report_at)
         except (TypeError, ValueError):
             return False
-        return last_report is not None and dt_util.utcnow() - last_report > STALE_REPORT_AGE
+        return last_report is not None and dt_util.utcnow() - last_report <= STALE_REPORT_AGE
 
     async def _async_get_state_with_retry(
         self,
@@ -252,7 +258,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             try:
                 state = await self._async_get_state_with_retry(device, attempts=1)
                 if state is not None:
-                    normalized_state = self._normalize_http_state(state)
+                    normalized_state = self._normalize_http_state(state, device)
                     self._update_device_state(device.device_id, normalized_state)
                     if self._state_matches_command(normalized_state, params):
                         return {}
@@ -299,7 +305,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 for key, value in expected_value.items()
             )
         if expected_value == "close":
-            return current_value == "closed"
+            return current_value == "close" or current_value == "closed"
         return current_value == expected_value
 
     async def async_shutdown(self) -> None:
@@ -437,12 +443,24 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._states[device_id] = state
         self.async_set_updated_data(self._states.copy())
 
-    def _normalize_http_state(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_http_state(
+        self, state: dict[str, Any], device: Device | None = None
+    ) -> dict[str, Any]:
         """Normalize an HTTP getState payload to the coordinator's canonical shape."""
-        normalized_state = self._sanitize_state_payload(state)
+        normalized_state = (
+            self._normalize_mqtt_event(device, state)
+            if device is not None and device.device_type == "WaterMeterController"
+            else self._sanitize_state_payload(state)
+        )
         normalized_state.setdefault("online", True)
         if normalized_state.get("reportAt") and "lastReportedAt" not in normalized_state:
             normalized_state["lastReportedAt"] = normalized_state["reportAt"]
+        if (
+            device is not None
+            and device.device_type == "WaterMeterController"
+            and "lastReportedAt" not in normalized_state
+        ):
+            normalized_state["lastReportedAt"] = dt_util.utcnow().isoformat()
         return normalized_state
 
     def _mark_unreachable(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -662,7 +680,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device in added_devices:
             try:
                 state = await self._client.get_state(device)
-                self._states[device.device_id] = self._normalize_http_state(state)
+                self._states[device.device_id] = self._normalize_http_state(state, device)
             except Exception:
                 _LOGGER.warning("Failed to get initial state for %s", device.name)
                 self._states[device.device_id] = {}
@@ -752,7 +770,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         try:
             state = await self._async_get_state_with_retry(device)
             if state is not None:
-                self._update_device_state(device_id, self._normalize_http_state(state))
+                self._update_device_state(device_id, self._normalize_http_state(state, device))
         except Exception:
             _LOGGER.warning(
                 "Failed to refresh state after command for %s",

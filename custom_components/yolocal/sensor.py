@@ -11,7 +11,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfPower, UnitOfTemperature
+from homeassistant.const import PERCENTAGE, UnitOfPower, UnitOfTemperature, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -19,6 +19,8 @@ from homeassistant.util import dt as dt_util
 
 from .coordinator import YoLocalCoordinator
 from .entity import async_setup_device_entities, YoLocalEntity
+
+METER_STEP_FACTOR_SCALE = 100_000
 
 
 def _state_has_battery(state: dict[str, Any]) -> bool:
@@ -43,7 +45,7 @@ def build_sensor_entities(
         YoLocalFirmwareSensor(coordinator, device),
         YoLocalLastReportedSensor(coordinator, device),
     ]
-    if _device_has_battery(coordinator, device):
+    if _device_has_battery(coordinator, device) or device.device_type == "WaterMeterController":
         entities.insert(0, YoLocalBatterySensor(coordinator, device))
 
     if device.device_type == "THSensor":
@@ -105,6 +107,17 @@ def build_sensor_entities(
                 YoLocalOutletPowerSensor(coordinator, device),
             ]
         )
+    elif device.device_type == "WaterMeterController":
+        entities.extend(
+            YoLocalWaterMeterReadingSensor(coordinator, device, key, name, parent)
+            for key, name, parent in (
+                ("meter", "Meter reading", None),
+                ("amount", "Daily usage", "dailyUsage"),
+                ("times", "Daily usage count", "dailyUsage"),
+                ("amount", "Recent usage", "recentUsage"),
+                ("duration", "Recent usage duration", "recentUsage"),
+            )
+        )
 
     return entities
 
@@ -123,6 +136,53 @@ async def async_setup_entry(
     )
 
 
+class YoLocalWaterMeterReadingSensor(YoLocalEntity, SensorEntity):
+    """Expose a meter or usage reading, converting volume counts to liters."""
+
+    def __init__(
+        self,
+        coordinator: YoLocalCoordinator,
+        device,
+        key: str,
+        name: str,
+        parent: str | None,
+    ) -> None:
+        super().__init__(coordinator, device)
+        self._key = key
+        self._parent = parent
+        self._attr_name = name
+        if key == "meter" or key == "amount":
+            self._attr_device_class = SensorDeviceClass.WATER
+            self._attr_native_unit_of_measurement = UnitOfVolume.LITERS
+            self._attr_suggested_display_precision = 2
+            if key == "meter" or parent == "dailyUsage":
+                self._attr_state_class = SensorStateClass.TOTAL_INCREASING
+        if parent == "recentUsage" and key == "duration":
+            self._attr_native_unit_of_measurement = "min"
+        suffix = f"{parent}_{key}" if parent else key
+        self._attr_unique_id = f"{device.device_id}_{suffix}"
+
+    @property
+    def native_value(self) -> int | float | None:
+        value = (
+            self.state_value(self._parent, fallback=True)
+            if self._parent
+            else self.state_value(self._key)
+        )
+        if self._parent:
+            value = value.get(self._key) if isinstance(value, dict) else None
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        if self._key not in {"meter", "amount"}:
+            return value
+
+        attributes = self.state_value("attributes", fallback=True)
+        factor = attributes.get("meterStepFactor") if isinstance(attributes, dict) else None
+        if not isinstance(factor, (int, float)) or isinstance(factor, bool) or factor <= 0:
+            return None
+        return value * factor / METER_STEP_FACTOR_SCALE
+
+
 class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
     """Battery sensor for YoLink devices."""
 
@@ -138,16 +198,8 @@ class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
         self._attr_unique_id = f"{device.device_id}_battery"
 
     @property
-    def available(self) -> bool:
-        """Battery sensor is always available with the last known value."""
-        return True
-
-    @property
     def native_value(self) -> int | None:
         """Return the battery level as percentage."""
-        if not super().available:
-            return 0
-
         level = self.state_value("battery", fallback=True)
 
         if level is None:

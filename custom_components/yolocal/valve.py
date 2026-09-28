@@ -1,4 +1,4 @@
-"""Valve platform for YoLink Local integration (Manipulator devices, e.g. YS-4909-UC)."""
+"""Valve platform for YoLink Local integration."""
 
 from __future__ import annotations
 
@@ -23,19 +23,18 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up YoLink valve entities from a config entry."""
-    def build_entities(
-        coordinator: YoLocalCoordinator,
-        device,
-    ) -> list[YoLocalValve]:
-        if device.device_type != "Manipulator":
-            return []
-        return [YoLocalValve(coordinator, device)]
+    await async_setup_device_entities(hass, entry, async_add_entities, build_valve_entities)
 
-    await async_setup_device_entities(hass, entry, async_add_entities, build_entities)
+
+def build_valve_entities(coordinator: YoLocalCoordinator, device) -> list[YoLocalValve]:
+    """Build a valve for supported YoLink controllers."""
+    if device.device_type not in {"Manipulator", "WaterMeterController"}:
+        return []
+    return [YoLocalValve(coordinator, device)]
 
 
 class YoLocalValve(YoLocalEntity, ValveEntity):
-    """Valve entity for YoLink Manipulator water-valve controller."""
+    """Valve entity for a YoLink water-valve controller."""
 
     _attr_name = None  # Use device name
     _attr_device_class = ValveDeviceClass.WATER
@@ -47,21 +46,24 @@ class YoLocalValve(YoLocalEntity, ValveEntity):
         """Return True if the valve is closed, False if open, None if unknown."""
         state = self.device_state.get("state")
         if isinstance(state, dict):
-            state = state.get("state")
-        if state is None:
-            return None
-        return state == "closed"
+            key = "valve" if self._device.device_type == "WaterMeterController" else "state"
+            state = state.get(key)
+        if state == "close" or state == "closed":
+            return True
+        if state == "open":
+            return False
+        return None
 
     async def async_open_valve(self, **kwargs: Any) -> None:
         """Open the valve."""
         await self.coordinator.async_send_command(
             self._device.device_id,
-            {"state": "open"},
+            {"valve": "open"} if self._device.device_type == "WaterMeterController" else {"state": "open"},
         )
 
     async def async_close_valve(self, **kwargs: Any) -> None:
         """Close the valve."""
         await self.coordinator.async_send_command(
             self._device.device_id,
-            {"state": "close"},
+            {"valve": "close"} if self._device.device_type == "WaterMeterController" else {"state": "close"},
         )

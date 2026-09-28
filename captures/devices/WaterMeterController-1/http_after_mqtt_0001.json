@@ -1,0 +1,111 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-09-13T11:59:19.068429+00:00",
+  "device_id": "WaterMeterController-1",
+  "device_name": "WaterMeterController-1",
+  "display_type": "WaterMeterController",
+  "env_name": "YOLINK_MYNEWDEV_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alarm": {
+        "leak": false,
+        "overrunAmount24H": false,
+        "overrunDurationOnce": false,
+        "overrunTimes24H": false,
+        "reminder": false,
+        "valveError": false
+      },
+      "attributes": {
+        "alertInterval": 5
+      },
+      "battery": 4,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "powerSupply": "battery",
+      "state": {
+        "valve": "close"
+      }
+    },
+    "deviceId": "WaterMeterController-1",
+    "event": "WaterMeterController.StatusChange",
+    "msgid": "1789300758578",
+    "time": 1789300758586
+  },
+  "raw_type": "WaterMeterController",
+  "request": {
+    "method": "WaterMeterController.getState",
+    "targetDevice": "WaterMeterController-1",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "alarm": {
+        "leak": false,
+        "overrunAmount24H": false,
+        "overrunDurationOnce": false,
+        "overrunTimes24H": false,
+        "reminder": false,
+        "valveError": false
+      },
+      "attributes": {
+        "alertInterval": 5,
+        "autoCloseValve": {
+          "leakDetection": true,
+          "overrunAmount24H": true,
+          "overrunDurationOnce": true,
+          "overrunTimes24H": true
+        },
+        "beep": true,
+        "meterStepFactor": 1117,
+        "meterUnit": 3,
+        "overrunAmount24H": 50833,
+        "overrunDurationOnce": 240,
+        "overrunTimes24H": 20,
+        "screenMeterUnit": 0
+      },
+      "battery": 4,
+      "dailyUsage": {
+        "amount": 2088,
+        "times": 2
+      },
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "location": {
+          "altitude": 0,
+          "latitude": 0,
+          "longitude": 0
+        },
+        "signal": 0
+      },
+      "powerSupply": "battery",
+      "recentUsage": {
+        "amount": 1046,
+        "duration": 1
+      },
+      "state": {
+        "meter": 2886895,
+        "valve": "close",
+        "waterFlowing": true
+      },
+      "tz": -4,
+      "valveMaintance": {
+        "day": 1,
+        "time": "6:0",
+        "type": "monthly"
+      },
+      "version": "0903"
+    },
+    "desc": "Success",
+    "method": "WaterMeterController.getState",
+    "msgid": 1789300759295,
+    "time": 1789300759295
+  },
+  "sequence": 1
+}
