@@ -22,6 +22,7 @@ from .api import (
     ApiError,
     Device,
     DeviceEvent,
+    MQTTAuthError,
     TokenManager,
     YoLinkClient,
     YoLinkMQTTClient,
@@ -395,13 +396,25 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             port=self._mqtt_port,
         )
         mqtt_client.subscribe(self._on_device_event)
-        mqtt_client.on_disconnect(lambda host=host: self._on_mqtt_disconnect(host))
+        mqtt_client.on_disconnect(
+            lambda host=host, client=mqtt_client: self._on_mqtt_disconnect(
+                host, client
+            )
+        )
 
         try:
             await mqtt_client.connect()
+            if not getattr(mqtt_client, "is_connected", True):
+                # The session dropped between CONNACK and here.
+                raise ConnectionError(f"MQTT session to {host} dropped on connect")
             self._mqtt_clients[host] = mqtt_client
             _LOGGER.info("Connected to YoLink MQTT broker at %s", host)
-        except Exception:
+        except Exception as err:
+            if isinstance(err, MQTTAuthError) and hasattr(
+                self._token_manager, "invalidate_token"
+            ):
+                # The hub no longer accepts this token; fetch a new one next try.
+                self._token_manager.invalidate_token(host)
             try:
                 await mqtt_client.disconnect()
             except Exception:
@@ -614,12 +627,23 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return event_state
 
     @callback
-    def _on_mqtt_disconnect(self, host: str | None = None) -> None:
+    def _on_mqtt_disconnect(
+        self,
+        host: str | None = None,
+        client: YoLinkMQTTClient | None = None,
+    ) -> None:
         """Reconnect MQTT when the broker disconnects."""
         if self._shutdown:
             return
         if host is not None:
-            self._mqtt_clients.pop(host, None)
+            if client is not None and self._mqtt_clients.get(host) is not client:
+                # A client we already replaced or never registered (a connect
+                # attempt still in flight). Never let it evict the live client.
+                return
+            lost = self._mqtt_clients.pop(host, None)
+            if lost is not None:
+                # Stop its network thread so it can't linger as an orphan.
+                self.hass.async_create_task(lost.disconnect())
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = self.hass.async_create_task(self._async_reconnect_mqtt())

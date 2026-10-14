@@ -18,7 +18,11 @@ from custom_components.yolocal.api.auth import TokenManager
 from custom_components.yolocal.api.client import ApiError
 from custom_components.yolocal.api.client import YoLinkClient
 from custom_components.yolocal.api.device import Device
-from custom_components.yolocal.api.mqtt import DeviceEvent
+from custom_components.yolocal.api.mqtt import (
+    DeviceEvent,
+    MQTTAuthError,
+    YoLinkMQTTClient,
+)
 from custom_components.yolocal.binary_sensor import (
     YoLocalWaterFlowSensor,
     YoLocalWaterMeterAlarmSensor,
@@ -1950,6 +1954,166 @@ def test_mqtt_disconnect_reconnects_missing_host_only() -> None:
     assert reconnected_hosts == ["ethernet.local"]
     assert "wifi.local" in coordinator._mqtt_clients
     assert wifi_client.disconnect_calls == 0
+
+    # The lost client is stopped rather than left running as an orphan.
+    stop_coro = coordinator.hass._scheduled_coroutines.pop()
+    asyncio.run(stop_coro)
+    assert ethernet_client.disconnect_calls == 1
+
+
+def test_stale_mqtt_client_disconnect_does_not_evict_live_client() -> None:
+    """A replaced client's late disconnect must not drop its replacement."""
+    coordinator = make_coordinator()
+    stale_client = FakeMqttClient()
+    live_client = FakeMqttClient()
+    coordinator._mqtt_clients = {"127.0.0.1": live_client}
+
+    coordinator._on_mqtt_disconnect("127.0.0.1", stale_client)
+
+    assert coordinator._mqtt_clients == {"127.0.0.1": live_client}
+    assert coordinator.hass._scheduled_coroutines == []
+    assert live_client.disconnect_calls == 0
+
+
+def test_mqtt_auth_refusal_invalidates_host_token(monkeypatch) -> None:
+    """A refused MQTT login should drop that host's cached token."""
+    coordinator = make_coordinator()
+    invalidated: list[str] = []
+
+    async def get_token_for_host(host: str) -> str:
+        return f"token-for-{host}"
+
+    coordinator._token_manager = SimpleNamespace(
+        client_id="client",
+        get_token_for_host=get_token_for_host,
+        invalidate_token=invalidated.append,
+    )
+
+    class RefusingClient:
+        def __init__(self, **_kwargs) -> None:
+            self.disconnected = False
+
+        def subscribe(self, _callback) -> None:
+            return None
+
+        def on_disconnect(self, _callback) -> None:
+            return None
+
+        async def connect(self) -> None:
+            raise MQTTAuthError("refused")
+
+        async def disconnect(self) -> None:
+            self.disconnected = True
+
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.YoLinkMQTTClient",
+        RefusingClient,
+    )
+
+    try:
+        asyncio.run(coordinator._connect_mqtt_host("wifi.local"))
+    except MQTTAuthError:
+        pass
+    else:
+        raise AssertionError("expected MQTTAuthError")
+
+    assert invalidated == ["wifi.local"]
+    assert "wifi.local" not in coordinator._mqtt_clients
+
+
+def test_token_manager_invalidate_token_drops_cached_token() -> None:
+    """invalidate_token should force the next request to fetch a new token."""
+    manager = TokenManager.__new__(TokenManager)
+    manager._host_tokens = {"hub.local": ("old", 1e12)}
+    manager._hosts = ("hub.local",)
+    manager._host_index = 0
+    manager._token = "old"
+    manager._expires_at = 1e12
+
+    manager.invalidate_token("hub.local")
+
+    assert manager._cached_token("hub.local") is None
+    assert manager._token is None
+
+
+def _mqtt_client_for_test() -> YoLinkMQTTClient:
+    client = YoLinkMQTTClient(
+        host="hub.local", net_id="net", client_id="client", access_token="token"
+    )
+    client._loop = None
+    return client
+
+
+_PAHO = SimpleNamespace(subscribe=lambda *_args, **_kwargs: None)
+
+
+def test_mqtt_client_notifies_one_lost_session_once() -> None:
+    """A dropped session is reported once; later paho callbacks are ignored."""
+    client = _mqtt_client_for_test()
+    notified: list[None] = []
+    client.on_disconnect(lambda: notified.append(None))
+
+    client._on_connect(_PAHO, None, None, 0)
+    client._on_disconnect(None, None, None, "Normal disconnection")
+    client._on_disconnect(None, None, None, "Unspecified error")
+
+    assert len(notified) == 1
+
+
+def test_mqtt_client_refused_connect_is_not_reported_as_disconnect() -> None:
+    """A refused login fails connect() instead of triggering a reconnect storm."""
+    client = _mqtt_client_for_test()
+    notified: list[None] = []
+    client.on_disconnect(lambda: notified.append(None))
+
+    client._on_connect(_PAHO, None, None, 5)
+    client._on_disconnect(None, None, None, "Unspecified error")
+
+    assert notified == []
+    assert isinstance(client._connect_error, MQTTAuthError)
+
+
+def test_mqtt_client_intentional_disconnect_is_not_reported() -> None:
+    """Stopping a client ourselves must not schedule a reconnect."""
+    client = _mqtt_client_for_test()
+    notified: list[None] = []
+    client.on_disconnect(lambda: notified.append(None))
+
+    client._on_connect(_PAHO, None, None, 0)
+    asyncio.run(client.disconnect())
+    client._on_disconnect(None, None, None, "Normal disconnection")
+
+    assert notified == []
+
+
+def test_mqtt_client_disables_paho_auto_reconnect(monkeypatch) -> None:
+    """paho must not retry with a stale token; the coordinator reconnects."""
+    import paho.mqtt.client as paho_client
+
+    created: list[dict] = []
+
+    class RecordingClient(paho_client.Client):
+        def __init__(self, *args, **kwargs) -> None:
+            created.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+        def loop_start(self) -> None:
+            # Simulate the hub refusing the login.
+            client._on_connect(self, None, None, 5)
+
+    monkeypatch.setattr(paho_client, "Client", RecordingClient)
+    client = YoLinkMQTTClient(
+        host="hub.local", net_id="net", client_id="client", access_token="token"
+    )
+
+    try:
+        asyncio.run(client.connect())
+    except MQTTAuthError:
+        pass
+    else:
+        raise AssertionError("expected MQTTAuthError")
+
+    assert created[0]["reconnect_on_failure"] is False
 
 
 def test_async_setup_removes_stale_registry_devices() -> None:

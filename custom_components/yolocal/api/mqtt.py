@@ -67,6 +67,14 @@ class DeviceEvent:
 EventCallback = Callable[[DeviceEvent], None]
 DisconnectCallback = Callable[[], None]
 
+# CONNACK reason codes that mean the hub rejected our credentials (MQTT 3.1.1
+# rc 4/5 and their MQTT 5 equivalents).
+_AUTH_FAILURE_CODES = {4, 5, 134, 135}
+
+
+class MQTTAuthError(ConnectionError):
+    """The hub refused the MQTT login (stale or revoked access token)."""
+
 
 class YoLinkMQTTClient:
     """MQTT client for receiving real-time device events."""
@@ -89,7 +97,19 @@ class YoLinkMQTTClient:
         self._callbacks: list[EventCallback] = []
         self._disconnect_callbacks: list[DisconnectCallback] = []
         self._connected = asyncio.Event()
+        self._connect_failed = asyncio.Event()
+        self._connect_error: ConnectionError | None = None
+        self._closing = False
+        # Set and read only on paho's network thread, so a disconnect that
+        # races the CONNACK can't be mistaken for a refused connect.
+        self._session_up = False
+        self._disconnect_notified = False
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        """Return True while the broker session is up."""
+        return self._connected.is_set()
 
     @property
     def topic(self) -> str:
@@ -109,7 +129,14 @@ class YoLinkMQTTClient:
     async def connect(self) -> None:
         """Connect to the MQTT broker."""
         self._loop = asyncio.get_running_loop()
-        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        # paho must not reconnect on its own: it would retry forever with the
+        # token it was created with, which the hub stops accepting once it
+        # rotates tokens. The coordinator owns reconnection and builds a new
+        # client with a fresh token instead.
+        self._client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            reconnect_on_failure=False,
+        )
         self._client.username_pw_set(self._client_id, self._access_token)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
@@ -118,18 +145,33 @@ class YoLinkMQTTClient:
         self._client.connect_async(self._host, self._port, keepalive=60)
         self._client.loop_start()
 
-        # Wait for connection with timeout
+        # Wait for the CONNACK (either way) with a timeout
+        connected = asyncio.ensure_future(self._connected.wait())
+        failed = asyncio.ensure_future(self._connect_failed.wait())
         try:
-            await asyncio.wait_for(self._connected.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            raise ConnectionError("Timed out connecting to MQTT broker")
+            await asyncio.wait(
+                {connected, failed},
+                timeout=10.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            connected.cancel()
+            failed.cancel()
+        if self._connected.is_set():
+            return
+        if self._connect_error is not None:
+            raise self._connect_error
+        raise ConnectionError("Timed out connecting to MQTT broker")
 
     async def disconnect(self) -> None:
         """Disconnect from the MQTT broker."""
+        self._closing = True
         if self._client:
-            self._client.loop_stop()
-            self._client.disconnect()
-            self._client = None
+            client, self._client = self._client, None
+            client.disconnect()
+            # loop_stop() joins paho's thread, which can sit in a socket
+            # connect or a 1 s reconnect sleep; keep that off the event loop.
+            await asyncio.get_running_loop().run_in_executor(None, client.loop_stop)
         self._connected.clear()
 
     def _on_connect(
@@ -143,11 +185,23 @@ class YoLinkMQTTClient:
         """Handle connection established."""
         if rc == 0 or str(rc) == "Success":
             _LOGGER.info("Connected to YoLink MQTT broker")
+            self._session_up = True
             client.subscribe(self.topic)
             if self._loop:
                 self._loop.call_soon_threadsafe(self._connected.set)
         else:
-            _LOGGER.error("MQTT connection failed: %s", rc)
+            _LOGGER.error("MQTT connection to %s failed: %s", self._host, rc)
+            value = getattr(rc, "value", rc)
+            if value in _AUTH_FAILURE_CODES:
+                self._connect_error = MQTTAuthError(
+                    f"MQTT login to {self._host} refused: {rc}"
+                )
+            else:
+                self._connect_error = ConnectionError(
+                    f"MQTT connection to {self._host} refused: {rc}"
+                )
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._connect_failed.set)
 
     def _on_disconnect(
         self,
@@ -158,8 +212,20 @@ class YoLinkMQTTClient:
         properties: Any = None,
     ) -> None:
         """Handle disconnection."""
-        _LOGGER.warning("Disconnected from MQTT broker: %s", rc)
-        self._connected.clear()
+        was_connected = self._session_up
+        self._session_up = False
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._connected.clear)
+        else:
+            self._connected.clear()
+        if self._closing or self._disconnect_notified:
+            return
+        if not was_connected:
+            # A refused or timed-out connect attempt; connect() reports it.
+            return
+        _LOGGER.warning("Disconnected from MQTT broker at %s: %s", self._host, rc)
+        # Each client reports its loss once. The coordinator replaces it.
+        self._disconnect_notified = True
         for callback in self._disconnect_callbacks:
             try:
                 if self._loop:
