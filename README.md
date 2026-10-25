@@ -28,7 +28,9 @@ The YoLink Local Hub supports both Matter and a native Local API, as well as the
 - **Faster response times** - direct HTTP/MQTT vs Matter's abstraction layer
 - **Richer entity types** - sensors, binary sensors, and diagnostic entities
 
-Matter can leave YoLink sensors stale when battery runs out, which can cause incorrect motion/status reporting and disrupt automations. YoLink devices are expected to check in periodically with the hub. This integration marks devices offline after 12 hours without reports, matching YoLink cloud integration behavior.
+Matter can leave YoLink sensors stale when battery runs out, which can cause incorrect motion/status reporting and disrupt automations. YoLink devices are expected to check in periodically with the hub. This integration marks devices offline after 12 hours without device contact, matching YoLink cloud integration behavior. A device-provided report time is preferred; where a device omits it, a new MQTT device event is used as inferred contact. Cached HTTP state responses do not extend this timer.
+
+For devices with a Battery entity, an offline device reports 0% so it appears in Home Assistant's battery dashboard. This is inferred from loss of contact, not measured by the device; radio or hub problems can also cause it.
 
 ## Tested devices
 
@@ -56,9 +58,10 @@ This project includes additional entities and diagnostics, not available in the 
 - LeakSensor: `Detector error`, `Device temperature`, `Freeze error`, `Reminder`
 - MotionSensor : `Alert interval`, `Device temperature`, `LED alarm`, `No-motion delay`, `Sensitivity`
 - Outlet: `Power`
-- TempSensor : `High humidity` (bug), `High temperature`, `Low humidity` (bug), `Low temperature`, `Reporting interval`, `Temperature correction`
-- THSensor 8003 : `High humidity`, `High temperature`, `Humidity correction`, `LCD temperature unit`, `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`
-- THSensor 8005 : `High humidity`, `High temperature`, `Humidity correction`, `Humidity max threshold`, `Humidity min threshold`, `LCD temperature unit` (bug), `Low humidity`, `Low temperature`, `Reporting interval`, `Temperature correction`, `Temperature max threshold`, `Temperature min threshold`
+- TempSensor : `Continuous alert interval`, `High humidity` (bug), `High temperature`, `Low humidity` (bug), `Low temperature`, `Temperature correction`
+- THSensor 8003 : `Continuous alert interval`, `High humidity`, `High temperature`, `Humidity correction`, `LCD temperature unit`, `Low humidity`, `Low temperature`, `Temperature correction`
+- THSensor 8005 : `Continuous alert interval`, `High humidity`, `High temperature`, `Humidity correction`, `Humidity max threshold`, `Humidity min threshold`, `LCD temperature unit` (bug), `Low humidity`, `Low temperature`, `Temperature correction`, `Temperature max threshold`, `Temperature min threshold`
+- THSensor/TempSensor models that report `recordInterval`: `Record interval`
 - TiltSensor: `Alert interval`, `Delay`, `Open remind delay`
 - WaterMeterController: `Water flowing`, `Leak alarm`, `Daily amount alarm`, `Duration alarm`, `Daily usage count alarm`, `Reminder alarm`, `Valve error`, `Meter reading`, `Daily usage`, `Daily usage count`, `Recent usage`, `Recent usage duration`
 
@@ -68,6 +71,8 @@ This bug would be best fixed by Yolink in their local API implementation, rather
 Outlet `Power` is derived from the local API `power` field, which reports deciwatts on the tested YS6614-UC smart plug. The local API `watt` field was observed to remain at `0` and is not exposed.
 
 WaterMeterController meter and usage readings are shown in liters. Recent usage duration is shown in minutes.
+
+The THSensor `Continuous alert interval` diagnostic (previously named `Reporting interval`) controls repeated alerts. The separate `Record interval` diagnostic shows the configured sampling interval, in minutes, when the device supplies it. Existing alert-interval entity IDs are preserved.
 
 ## Prerequisites
 
@@ -149,6 +154,25 @@ To add, remove, or change the secondary address later, use **Settings -> Devices
 - **Real-time Updates**: MQTT subscription receives instant state changes (door opens, temperature changes, etc.)
 - **Dual-host resilience**: When both hub addresses are configured, the integration keeps independent MQTT subscriptions to both interfaces and deduplicates identical events. HTTP reads can fail over between configured addresses.
 - **Commands**: Lock/unlock, on/off, and other commands are sent via HTTP
+
+### Temperature and humidity recordings
+
+Some THSensor models send recorded samples in `THSensor.DataRecord` MQTT batches between full state reports. The integration updates temperature and humidity from the newest valid samples, using their individual timestamps. Older batches and cached HTTP readings cannot replace newer measurements. A recent full report also takes precedence over older recorded samples delivered afterward.
+
+For devices that send a batch every 30 minutes with a 10-minute sampling interval, readings may lag by about 40 minutes rather than waiting for the next full report. The sampling and delivery schedules depend on the model and firmware.
+
+Each accepted, nonduplicate batch also fires a `yolocal_data_record` Home Assistant event containing the YoLink device serial in `device_id` and the valid `records` list. Each record contains `time`, `temperature`, and/or `humidity`. This lets automations export every sample with its original timestamp. For example:
+
+```json
+{
+  "device_id": "example-device-serial",
+  "records": [
+    {"time": "2026-10-24T21:20:57Z", "temperature": 17.1, "humidity": 49.2}
+  ]
+}
+```
+
+Home Assistant records sensor state changes at arrival time; historical samples are not backfilled into its recorder. Recorded sample times are kept separate from full-report timestamps. An old batch received now does not reset the 12-hour offline timeout to its arrival time.
 
 ## Test Scripts
 

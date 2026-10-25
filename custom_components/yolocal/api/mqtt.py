@@ -7,24 +7,11 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 import paho.mqtt.client as mqtt
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _normalize_mqtt_time(timestamp_ms: Any) -> str | None:
-    """Convert hub MQTT `time` (epoch milliseconds) to ISO-8601 UTC."""
-    if timestamp_ms is None:
-        return None
-    try:
-        return datetime.fromtimestamp(float(timestamp_ms) / 1000, UTC).isoformat()
-    except (TypeError, ValueError, OSError):
-        return None
-
-
 @dataclass
 class DeviceEvent:
     """Represents an event received from a device."""
@@ -51,8 +38,6 @@ class DeviceEvent:
         else:
             event_data = {}
 
-        if mqtt_time := _normalize_mqtt_time(payload.get("time")):
-            event_data["lastReportedAt"] = mqtt_time
         if "online" not in event_data and "online" in payload:
             event_data["online"] = payload.get("online")
 
@@ -109,7 +94,10 @@ class YoLinkMQTTClient:
     async def connect(self) -> None:
         """Connect to the MQTT broker."""
         self._loop = asyncio.get_running_loop()
-        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        self._client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            reconnect_on_failure=False,
+        )
         self._client.username_pw_set(self._client_id, self._access_token)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
@@ -123,6 +111,8 @@ class YoLinkMQTTClient:
             await asyncio.wait_for(self._connected.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             raise ConnectionError("Timed out connecting to MQTT broker")
+        if not self._connected.is_set():
+            raise ConnectionError("MQTT broker disconnected during connection")
 
     async def disconnect(self) -> None:
         """Disconnect from the MQTT broker."""
@@ -159,7 +149,10 @@ class YoLinkMQTTClient:
     ) -> None:
         """Handle disconnection."""
         _LOGGER.warning("Disconnected from MQTT broker: %s", rc)
-        self._connected.clear()
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._connected.clear)
+        else:
+            self._connected.clear()
         for callback in self._disconnect_callbacks:
             try:
                 if self._loop:

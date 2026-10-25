@@ -16,9 +16,10 @@ from homeassistant.util import dt as dt_util
 
 from .api import Device
 from .const import DOMAIN
-from .coordinator import STALE_REPORT_AGE, YoLocalCoordinator
+from .coordinator import STALE_REPORT_AGE, YoLocalCoordinator, device_contact_timestamp
 
 EntityBuilder = Callable[[YoLocalCoordinator, Device], Iterable[Entity]]
+EntityRefreshNeeded = Callable[[YoLocalCoordinator, Device, list[Entity]], bool]
 
 
 async def async_setup_device_entities(
@@ -26,6 +27,7 @@ async def async_setup_device_entities(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
     build_entities: EntityBuilder,
+    refresh_needed: EntityRefreshNeeded | None = None,
 ) -> None:
     """Set up entities that follow the YoLink dynamic device registry."""
     coordinator: YoLocalCoordinator = hass.data[DOMAIN][entry.entry_id]
@@ -34,12 +36,22 @@ async def async_setup_device_entities(
     def add_devices(devices: Iterable[Device]) -> None:
         new_entities: list[Entity] = []
         for device in devices:
-            if device.device_id in entities_by_device_id:
+            existing = entities_by_device_id.get(device.device_id)
+            if existing is not None and (
+                refresh_needed is None
+                or not refresh_needed(coordinator, device, existing)
+            ):
                 continue
             built = list(build_entities(coordinator, device))
+            if existing is not None:
+                known_ids = {entity.unique_id for entity in existing}
+                built = [entity for entity in built if entity.unique_id not in known_ids]
             if not built:
                 continue
-            entities_by_device_id[device.device_id] = built
+            if existing is None:
+                entities_by_device_id[device.device_id] = built
+            else:
+                existing.extend(built)
             new_entities.extend(built)
         if new_entities:
             async_add_entities(new_entities)
@@ -63,6 +75,12 @@ async def async_setup_device_entities(
         coordinator.register_device_registry_listener(handle_registry_change)
     )
     add_devices(coordinator.devices.values())
+    if refresh_needed is not None:
+        entry.async_on_unload(
+            coordinator.async_add_listener(
+                lambda: add_devices(coordinator.devices.values())
+            )
+        )
 
 
 class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
@@ -134,14 +152,12 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
         if not state.get("online", True):
             return False
 
-        report_at = state.get("lastReportedAt")
-        if report_at:
-            try:
-                last_report = dt_util.parse_datetime(report_at)
-                if last_report is not None:
-                    if dt_util.utcnow() - last_report > STALE_REPORT_AGE:
-                        return False
-            except Exception:
-                pass
+        # Contact is a device report timestamp or a newly received MQTT device
+        # event. A cached getState reply and its envelope timestamp cannot
+        # extend battery-device liveness.
+        last_contact = device_contact_timestamp(state)
+        if last_contact is not None:
+            if dt_util.utcnow() - last_contact > STALE_REPORT_AGE:
+                return False
 
         return True

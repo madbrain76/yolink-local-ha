@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import Callable, Coroutine
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from math import isfinite
 from time import monotonic
 from typing import Any
 
@@ -15,6 +17,7 @@ import aiohttp
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -29,6 +32,7 @@ from .api import (
 from .const import (
     DEVICE_DISCOVERY_INTERVAL,
     DOMAIN,
+    EVENT_DATA_RECORD,
     UPDATE_INTERVAL,
 )
 
@@ -36,10 +40,91 @@ _LOGGER = logging.getLogger(__name__)
 type DeviceRegistryListener = Callable[[list[Device], list[Device]], None]
 TRANSIENT_DEVICE_UNREACHABLE = "000201"
 STALE_REPORT_AGE = timedelta(hours=12)
+MQTT_EVENT_MAX_DELAY = timedelta(minutes=30)
 SET_STATE_TRANSPORT_RETRY_DELAY = 2.0
 HUB_HEALTH_FAILURE_THRESHOLD = 2
 MQTT_DUPLICATE_WINDOW = 300.0
 MQTT_DUPLICATE_CACHE_LIMIT = 256
+MQTT_CONTACT_EVENT_WINDOW = timedelta(hours=24)
+MQTT_CONTACT_EVENT_CACHE_LIMIT = 1024
+CONTACT_STORE_VERSION = 1
+TH_MEASUREMENT_FIELDS = ("temperature", "humidity")
+TH_MEASUREMENT_TIMES = "_thMeasurementTimes"
+
+
+def device_contact_timestamp(state: dict[str, Any]) -> datetime | None:
+    """Return the most recent device-originated contact time, if any.
+
+    ``lastContactAt`` is maintained by the coordinator from either a device
+    ``reportAt`` value or a new MQTT device event.  ``lastReportedAt`` remains
+    only as a migration fallback for state created by older releases.
+    """
+    candidates = (
+        _parse_timestamp(state.get("lastContactAt")),
+        _parse_timestamp(state.get("lastSeenAt")),
+        _parse_timestamp(state.get("reportAt")),
+        _parse_timestamp(state.get("lastReportedAt")),
+    )
+    return max((timestamp for timestamp in candidates if timestamp is not None), default=None)
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse a hub timestamp, accepting offset-naive UTC values."""
+    if not value:
+        return None
+    try:
+        parsed = dt_util.parse_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed is not None and parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _thsensor_measurement_timestamp(state: dict[str, Any], key: str) -> datetime | None:
+    """Read a field's sample time, falling back to the full device report."""
+    times = state.get(TH_MEASUREMENT_TIMES)
+    measured_at = _parse_timestamp(times.get(key)) if isinstance(times, dict) else None
+    return measured_at or _parse_timestamp(state.get("reportAt"))
+
+
+def state_has_battery(state: dict[str, Any]) -> bool:
+    """Recognize battery capability from the device payload."""
+    if "battery" in state:
+        return True
+    nested = state.get("state")
+    return isinstance(nested, dict) and "battery" in nested
+
+
+def _diagnostic_timestamp(value: Any) -> str:
+    """Format a timestamp without writing untrusted payload text to the log."""
+    if value is None:
+        return "<missing>"
+    if not isinstance(value, str):
+        return "<invalid>"
+    try:
+        parsed = dt_util.parse_datetime(value)
+    except (TypeError, ValueError):
+        return "<invalid>"
+    if parsed is None:
+        return "<invalid>"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.isoformat()
+
+
+def _diagnostic_online(value: Any) -> str:
+    """Format only the expected API boolean, never an arbitrary payload."""
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    return "<missing>" if value is None else "<invalid>"
+
+
+def _went_offline(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Return True only for a new explicit offline state."""
+    return bool(previous.get("online", True)) and not bool(current.get("online", True))
 
 
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
@@ -74,20 +159,219 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._net_id = net_id
         self._mqtt_port = mqtt_port
         self._mqtt_clients: dict[str, YoLinkMQTTClient] = {}
+        self._retired_mqtt_clients: list[YoLinkMQTTClient] = []
         self._devices: dict[str, Device] = {}
         self._states: dict[str, dict[str, Any]] = {}
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._mqtt_reconnect_wakeup = asyncio.Event()
         self._discovery_task: asyncio.Task[None] | None = None
         self._state_refresh_task: asyncio.Task[None] | None = None
         self._device_registry_listeners: list[DeviceRegistryListener] = []
         self._shutdown = False
         self._hub_health_failures = 0
         self._recent_mqtt_events: dict[str, float] = {}
+        self._contact_events: dict[str, str] = {}
+        self._contacts: dict[str, dict[str, str]] = {}
+        self._contact_store: Store[dict[str, Any]] = Store(
+            hass,
+            CONTACT_STORE_VERSION,
+            f"{DOMAIN}.{config_entry_id}.contacts",
+        )
+        self._contact_store_enabled = False
+        self._logged_stale_offline_reports: dict[str, str] = {}
 
     @property
     def devices(self) -> dict[str, Device]:
         """Return the device registry."""
         return self._devices
+
+    def device_has_battery(self, device_id: str, state: dict[str, Any]) -> bool:
+        """Recognize battery support from current or previously registered data."""
+        if state_has_battery(state):
+            return True
+        registry = er.async_get(self.hass)
+        return registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{device_id}_battery"
+        ) is not None
+
+    async def _async_load_contact_state(self) -> None:
+        """Restore durable device-contact and replay-detection state."""
+        try:
+            stored = await self._contact_store.async_load()
+        except Exception:  # Storage must not prevent integration startup.
+            _LOGGER.debug("Could not load YoLink device contact state", exc_info=True)
+            return
+
+        self._contact_store_enabled = True
+        if not isinstance(stored, dict):
+            return
+
+        contacts = stored.get("contacts")
+        if isinstance(contacts, dict):
+            self._contacts = {
+                device_id: {"at": record["at"], "source": record["source"]}
+                for device_id, record in contacts.items()
+                if isinstance(device_id, str)
+                and isinstance(record, dict)
+                and isinstance(record.get("at"), str)
+                and _parse_timestamp(record["at"]) is not None
+                and record.get("source") in {"reportAt", "mqtt_event"}
+            }
+
+        contact_events = stored.get("contact_events")
+        if isinstance(contact_events, dict):
+            self._contact_events = {
+                event_id: seen_at
+                for event_id, seen_at in contact_events.items()
+                if isinstance(event_id, str)
+                and isinstance(seen_at, str)
+                and _parse_timestamp(seen_at) is not None
+            }
+        self._prune_contact_events(dt_util.utcnow())
+
+    def _contact_store_data(self) -> dict[str, Any]:
+        """Return the bounded contact ledger persisted for the next restart."""
+        return {
+            "contacts": self._contacts,
+            "contact_events": self._contact_events,
+        }
+
+    def _schedule_contact_store_save(self) -> None:
+        """Persist contact evidence without blocking MQTT event processing."""
+        if self._contact_store_enabled:
+            self._contact_store.async_delay_save(self._contact_store_data, 1)
+
+    def _prune_contact_state(self, device_ids: set[str]) -> None:
+        """Discard contact records for devices no longer owned by this entry."""
+        before = len(self._contacts)
+        self._contacts = {
+            device_id: record
+            for device_id, record in self._contacts.items()
+            if device_id in device_ids
+        }
+        if len(self._contacts) != before:
+            self._schedule_contact_store_save()
+
+    def _prune_contact_events(self, now: datetime) -> None:
+        """Bound durable replay detection to the stale-contact interval."""
+        cutoff = now - MQTT_CONTACT_EVENT_WINDOW
+        self._contact_events = {
+            event_id: seen_at
+            for event_id, seen_at in self._contact_events.items()
+            if (parsed := _parse_timestamp(seen_at)) is not None and parsed >= cutoff
+        }
+        if len(self._contact_events) > MQTT_CONTACT_EVENT_CACHE_LIMIT:
+            newest = sorted(
+                self._contact_events.items(),
+                key=lambda item: _parse_timestamp(item[1]) or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )[:MQTT_CONTACT_EVENT_CACHE_LIMIT]
+            self._contact_events = dict(newest)
+
+    def _record_contact(
+        self,
+        device_id: str,
+        timestamp: datetime,
+        source: str,
+    ) -> bool:
+        """Record newer device contact and return whether it advanced."""
+        existing = self._contacts.get(device_id)
+        existing_at = _parse_timestamp(existing.get("at")) if existing else None
+        if existing_at is not None and timestamp <= existing_at:
+            return False
+        self._contacts[device_id] = {"at": timestamp.isoformat(), "source": source}
+        self._schedule_contact_store_save()
+        return True
+
+    def _apply_contact_record(
+        self,
+        device_id: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Overlay the durable contact record onto an API state payload."""
+        record = self._contacts.get(device_id)
+        if record is None:
+            return state
+        return {
+            **state,
+            "lastContactAt": record["at"],
+            "lastContactSource": record["source"],
+        }
+
+    def _record_report_contact(self, device_id: str, state: dict[str, Any]) -> bool:
+        """Use a device-provided report timestamp as authoritative contact evidence."""
+        if (reported_at := _parse_timestamp(state.get("reportAt"))) is None:
+            return False
+        return self._record_contact(device_id, reported_at, "reportAt")
+
+    def _merge_command_http_state(
+        self,
+        device_id: str,
+        incoming_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge a command follow-up read without making HTTP proof of contact."""
+        current_state = self._states.get(device_id, {})
+        if self._is_older_report(current_state, incoming_state):
+            return current_state
+        merged = self._merge_state_payload(current_state, incoming_state)
+        self._record_report_contact(device_id, merged)
+        merged = self._apply_contact_record(device_id, merged)
+        return self._battery_liveness_state(device_id, merged, current_state)
+
+    def _mqtt_contact_identity(self, event: DeviceEvent) -> str | None:
+        """Return the durable identity of an event, when the hub supplies one."""
+        msgid = event.raw.get("msgid")
+        if isinstance(msgid, (str, int)) and not isinstance(msgid, bool):
+            return f"{event.device_id}|{event.event}|{msgid}"
+        return None
+
+    def _is_replayed_contact_event(self, event: DeviceEvent) -> bool:
+        """Ignore a previously seen MQTT event before it can revive a device."""
+        event_id = self._mqtt_contact_identity(event)
+        if event_id is None:
+            return False
+        now = dt_util.utcnow()
+        self._prune_contact_events(now)
+        if event_id in self._contact_events:
+            return True
+        self._contact_events[event_id] = now.isoformat()
+        self._prune_contact_events(now)
+        self._schedule_contact_store_save()
+        return False
+
+    def _battery_liveness_state(
+        self,
+        device_id: str,
+        state: dict[str, Any],
+        previous: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Use report age, without undoing a prior offline state on a heartbeat."""
+        if not self.device_has_battery(device_id, state):
+            return state
+        last_contact = device_contact_timestamp(state)
+        if last_contact is None:
+            return state
+        age = dt_util.utcnow() - last_contact
+        if age < timedelta(0):
+            return state
+        if age > STALE_REPORT_AGE:
+            return {**state, "online": False}
+        previous_contact = device_contact_timestamp(previous)
+        previous_report = _parse_timestamp(previous.get("reportAt"))
+        current_report = _parse_timestamp(state.get("reportAt"))
+        newer_device_report = (
+            previous_report is not None
+            and current_report is not None
+            and current_report > previous_report
+        )
+        if (
+            previous.get("online") is False
+            and previous_contact is not None
+            and last_contact <= previous_contact
+            and not newer_device_report
+        ):
+            return {**state, "online": False}
+        return {**state, "online": True}
 
     def register_device_registry_listener(
         self, listener: DeviceRegistryListener
@@ -113,8 +397,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     async def _async_setup(self) -> None:
         """Set up the coordinator: fetch devices and connect MQTT."""
+        await self._async_load_contact_state()
         devices = await self._client.get_devices()
         self._devices = {d.device_id: d for d in devices}
+        self._prune_contact_state(set(self._devices))
         self._remove_stale_registry_devices(set(self._devices))
 
         self._on_mqtt_disconnect()
@@ -150,28 +436,57 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device_id, incoming_state, unreachable in results:
             current_state = refreshed_states.get(device_id, {})
             if unreachable:
-                device = self._devices[device_id]
-                if (
-                    device.device_type == "WaterMeterController"
-                    and self._has_recent_report(current_state)
-                ):
-                    continue
-                refreshed_states[device_id] = self._mark_unreachable(current_state)
+                refreshed_states[device_id] = self._mark_unreachable(
+                    device_id,
+                    current_state,
+                )
+                if _went_offline(current_state, refreshed_states[device_id]):
+                    self._log_device_unavailable(
+                        device_id, "getState", "000201", current_state
+                    )
             elif incoming_state is not None:
                 if self._is_older_report(current_state, incoming_state):
-                    # getState can lag a just-delivered MQTT report; reportAt
-                    # versions the whole snapshot, so keep the newer state.
+                    # Keep the stale-response policy, but record any rejected
+                    # offline flag because these clocks can have different origins.
                     _LOGGER.debug(
                         "Ignoring stale getState for %s (reported %s, have %s)",
                         device_id,
-                        incoming_state.get("lastReportedAt"),
-                        current_state.get("lastReportedAt"),
+                        _diagnostic_timestamp(incoming_state.get("lastReportedAt")),
+                        _diagnostic_timestamp(current_state.get("lastReportedAt")),
                     )
+                    if (
+                        incoming_state.get("online") is False
+                        and current_state.get("online", True)
+                    ):
+                        self._log_ignored_offline_snapshot(
+                            device_id, current_state, incoming_state
+                        )
                     continue
-                refreshed_states[device_id] = self._merge_state_payload(
+                merged = self._merge_state_payload(
                     current_state,
                     incoming_state,
                 )
+                self._record_report_contact(device_id, merged)
+                merged = self._apply_contact_record(device_id, merged)
+                refreshed_states[device_id] = self._battery_liveness_state(
+                    device_id, merged, current_state
+                )
+                if (
+                    incoming_state.get("online") is False
+                    and current_state.get("online", True)
+                    and refreshed_states[device_id].get("online", True)
+                ):
+                    self._log_ignored_offline_snapshot(
+                        device_id, current_state, incoming_state
+                    )
+                if _went_offline(current_state, refreshed_states[device_id]):
+                    self._log_device_unavailable(
+                        device_id,
+                        "getState",
+                        "success",
+                        current_state,
+                        incoming_state,
+                    )
 
         self._states = refreshed_states
         return refreshed_states.copy()
@@ -186,11 +501,36 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             state = await self._async_get_state_with_retry(device)
             if state is None:
                 return device_id, None, True
-        except Exception:
+        except Exception as err:
+            cached = self._states.get(device_id, {})
+            error_code = (
+                err.code
+                if isinstance(err, ApiError)
+                and isinstance(err.code, str)
+                and len(err.code) == 6
+                and err.code.isascii()
+                and err.code.isdigit()
+                else "<none>"
+            )
+            errno = getattr(err, "errno", None)
+            if not isinstance(errno, int):
+                errno = getattr(getattr(err, "os_error", None), "errno", None)
+            if not isinstance(errno, int):
+                errno = None
             _LOGGER.warning(
-                "Failed to refresh state for %s",
+                "YoLink getState request failed for %s (%s): "
+                "error_type=%s error_code=%s errno=%s "
+                "cached_online=%s cached_reportAt=%s "
+                "cached_lastReportedAt=%s lastSeenAt=%s",
                 device.name,
-                exc_info=True,
+                device.model,
+                type(err).__name__,
+                error_code,
+                errno,
+                _diagnostic_online(cached.get("online")),
+                _diagnostic_timestamp(cached.get("reportAt")),
+                _diagnostic_timestamp(cached.get("lastReportedAt")),
+                _diagnostic_timestamp(cached.get("lastSeenAt")),
             )
             return device_id, None, False
 
@@ -201,24 +541,19 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         current_state: dict[str, Any],
         incoming_state: dict[str, Any],
     ) -> bool:
-        """Return True when an incoming payload was reported before the cached one."""
-        try:
-            current = dt_util.parse_datetime(current_state.get("lastReportedAt") or "")
-            incoming = dt_util.parse_datetime(incoming_state.get("lastReportedAt") or "")
-        except (TypeError, ValueError):
-            return False
-        return current is not None and incoming is not None and incoming < current
+        """Compare device report times, falling back when one is unavailable."""
+        current_report = _parse_timestamp(current_state.get("reportAt"))
+        incoming_report = _parse_timestamp(incoming_state.get("reportAt"))
+        if current_report is not None and incoming_report is not None:
+            if incoming_report != current_report:
+                return incoming_report < current_report
+            # Equal reports cannot replace a later MQTT-delivered state.
+            current_envelope = _parse_timestamp(current_state.get("lastReportedAt"))
+            return current_envelope is not None and current_envelope > current_report
 
-    def _has_recent_report(self, state: dict[str, Any]) -> bool:
-        """Return True when a state has reported within the stale window."""
-        report_at = state.get("lastReportedAt")
-        if not report_at:
-            return False
-        try:
-            last_report = dt_util.parse_datetime(report_at)
-        except (TypeError, ValueError):
-            return False
-        return last_report is not None and dt_util.utcnow() - last_report <= STALE_REPORT_AGE
+        current = _parse_timestamp(current_state.get("lastReportedAt"))
+        incoming = _parse_timestamp(incoming_state.get("lastReportedAt"))
+        return current is not None and incoming is not None and incoming < current
 
     async def _async_get_state_with_retry(
         self,
@@ -236,9 +571,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     await asyncio.sleep(1)
                     continue
                 _LOGGER.debug(
-                    "Device state temporarily unavailable for %s: %s",
+                    "Device state temporarily unavailable for %s: code=000201",
                     device.name,
-                    err,
                 )
                 return None
         return None
@@ -282,6 +616,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 state = await self._async_get_state_with_retry(device, attempts=1)
                 if state is not None:
                     normalized_state = self._normalize_http_state(state, device)
+                    normalized_state = self._merge_command_http_state(
+                        device.device_id, normalized_state
+                    )
                     self._update_device_state(device.device_id, normalized_state)
                     if self._state_matches_command(normalized_state, params):
                         return {}
@@ -334,6 +671,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
         self._shutdown = True
+        if self._contact_store_enabled:
+            await self._contact_store.async_save(self._contact_store_data())
         if self._discovery_task:
             self._discovery_task.cancel()
             self._discovery_task = None
@@ -343,8 +682,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
-        for mqtt_client in list(self._mqtt_clients.values()):
+        for mqtt_client in [
+            *self._retired_mqtt_clients,
+            *self._mqtt_clients.values(),
+        ]:
             await mqtt_client.disconnect()
+        self._retired_mqtt_clients.clear()
         self._mqtt_clients.clear()
         await self._session.close()
 
@@ -395,7 +738,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             port=self._mqtt_port,
         )
         mqtt_client.subscribe(self._on_device_event)
-        mqtt_client.on_disconnect(lambda host=host: self._on_mqtt_disconnect(host))
+        mqtt_client.on_disconnect(
+            lambda host=host, client=mqtt_client: self._on_mqtt_disconnect(host, client)
+        )
 
         try:
             await mqtt_client.connect()
@@ -426,13 +771,158 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 event.event,
             )
             return
+        if self._mqtt_event_is_delayed(event):
+            _LOGGER.debug(
+                "Ignoring delayed MQTT event for %s: %s",
+                device_id,
+                event.event,
+            )
+            return
+        if self._is_replayed_contact_event(event):
+            _LOGGER.debug(
+                "Ignoring replayed MQTT event for %s: %s",
+                device_id,
+                event.event,
+            )
+            return
+
+        if device.device_type == "THSensor" and event.event == "THSensor.DataRecord":
+            self._on_thsensor_data_record(event)
+            return
 
         event_data = event.data if isinstance(event.data, dict) else {}
         normalized_event = self._normalize_mqtt_event(device, event_data)
-        self._update_device_state(
-            device_id,
-            self._merge_state_payload(self._states.get(device_id, {}), normalized_event),
+        if device.device_type == "THSensor":
+            measured_at = (
+                _parse_timestamp(normalized_event.get("reportAt"))
+                or self._mqtt_event_timestamp(event)
+                or dt_util.utcnow()
+            )
+            normalized_event = self._timestamp_thsensor_measurements(
+                normalized_event, measured_at
+            )
+        cached_report = _parse_timestamp(self._states.get(device_id, {}).get("reportAt"))
+        event_report = _parse_timestamp(normalized_event.get("reportAt"))
+        if (
+            cached_report is not None
+            and event_report is not None
+            and event_report < cached_report
+        ):
+            _LOGGER.debug("Ignoring older MQTT report for %s", device_id)
+            return
+        merged = self._merge_state_payload(
+            self._states.get(device_id, {}),
+            normalized_event,
         )
+        prior = self._states.get(device_id, {})
+        if self._record_report_contact(device_id, normalized_event):
+            merged["online"] = True
+        elif "reportAt" not in normalized_event and "online" not in normalized_event:
+            # The report topic is a device-event stream. For payloads without
+            # reportAt, a new non-replayed event is the best available contact
+            # evidence, but its local receipt time is kept distinct from a
+            # device-originated report timestamp.
+            if self._record_contact(device_id, dt_util.utcnow(), "mqtt_event"):
+                merged["online"] = True
+        merged = self._apply_contact_record(device_id, merged)
+        merged = self._battery_liveness_state(device_id, merged, prior)
+        if _went_offline(prior, merged):
+            self._log_device_unavailable(
+                device_id, "mqtt", "event", prior, normalized_event
+            )
+        self._update_device_state(device_id, merged)
+
+    def _on_thsensor_data_record(self, event: DeviceEvent) -> None:
+        """Apply recorded measurements without confusing sample and receipt times."""
+        records = event.data.get("records")
+        if not isinstance(records, list):
+            return
+
+        valid_records: list[dict[str, Any]] = []
+        latest: dict[str, tuple[datetime, int | float]] = {}
+        for record in records:
+            if not isinstance(record, dict) or not isinstance(record.get("time"), str):
+                continue
+            recorded_at = _parse_timestamp(record["time"])
+            if recorded_at is None:
+                continue
+            valid_record: dict[str, Any] = {"time": record["time"]}
+            for key in TH_MEASUREMENT_FIELDS:
+                value = record.get(key)
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    continue
+                try:
+                    if not isfinite(value):
+                        continue
+                except OverflowError:
+                    continue
+                valid_record[key] = value
+                if key not in latest or recorded_at > latest[key][0]:
+                    latest[key] = (recorded_at, value)
+            if len(valid_record) > 1:
+                valid_records.append(valid_record)
+
+        if not latest:
+            return
+        previous = self._states.get(event.device_id, {})
+        previous_nested = previous.get("state")
+        updates = {}
+        for key, (recorded_at, value) in latest.items():
+            current_at = _thsensor_measurement_timestamp(previous, key)
+            if (
+                isinstance(previous_nested, dict)
+                and previous_nested.get(key) is not None
+                and current_at is not None
+                and recorded_at <= current_at
+            ):
+                continue
+            updates[key] = (recorded_at, value)
+        incoming = {
+            "state": {key: value for key, (_, value) in updates.items()},
+            TH_MEASUREMENT_TIMES: {
+                key: recorded_at.isoformat() for key, (recorded_at, _) in updates.items()
+            },
+        }
+        merged = self._merge_state_payload(previous, incoming)
+        merged["state"].pop("records", None)
+        # A historical sample proves contact no earlier than its sample time.
+        # Receiving an old batch now must not reset the twelve-hour timeout.
+        contact_at = max(recorded_at for recorded_at, _ in latest.values())
+        source = "mqtt_event"
+        reported_at = _parse_timestamp(event.data.get("reportAt"))
+        if reported_at is not None and reported_at >= contact_at:
+            contact_at = reported_at
+            source = "reportAt"
+        if self._record_contact(event.device_id, contact_at, source):
+            merged["online"] = True
+        merged = self._apply_contact_record(event.device_id, merged)
+        merged = self._battery_liveness_state(event.device_id, merged, previous)
+        if _went_offline(previous, merged):
+            self._log_device_unavailable(event.device_id, "mqtt", "event", previous)
+        self._update_device_state(event.device_id, merged)
+        self.hass.bus.async_fire(
+            EVENT_DATA_RECORD,
+            {"device_id": event.device_id, "records": valid_records},
+        )
+
+    def _mqtt_event_timestamp(self, event: DeviceEvent) -> datetime | None:
+        """Read the transport clock for ordering, independently of radio contact."""
+        try:
+            return datetime.fromtimestamp(float(event.raw.get("time")) / 1000, UTC)
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    def _mqtt_event_is_delayed(self, event: DeviceEvent) -> bool:
+        """Reject an old transport packet without treating its time as contact."""
+        # A device report time is stronger than the hub transport clock. Hub/HA
+        # clock skew must not discard that authoritative contact evidence.
+        if _parse_timestamp(event.data.get("reportAt")) is not None:
+            return False
+        event_time = self._mqtt_event_timestamp(event)
+        if event_time is None:
+            return False
+        age = dt_util.utcnow() - event_time
+        return age > MQTT_EVENT_MAX_DELAY
 
     def _is_duplicate_mqtt_event(self, event: DeviceEvent) -> bool:
         """Return True when the same MQTT event was recently processed."""
@@ -454,17 +944,82 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return False
 
     def _mqtt_event_key(self, event: DeviceEvent) -> str:
-        """Return a stable key for duplicate MQTT event detection."""
+        """Return a transport-independent key for duplicate MQTT events."""
+        event_data = dict(event.data)
+        event_data.pop("lastReportedAt", None)
         try:
-            raw = json.dumps(event.raw, sort_keys=True, separators=(",", ":"))
+            raw = json.dumps(
+                {
+                    "device_id": event.device_id,
+                    "event": event.event,
+                    "data": event_data,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         except TypeError:
-            raw = repr(event.raw)
-        return f"{event.device_id}|{event.event}|{raw}"
+            raw = repr((event.device_id, event.event, event_data))
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def _update_device_state(self, device_id: str, state: dict[str, Any]) -> None:
         """Store updated device state and notify listeners."""
         self._states[device_id] = state
         self.async_set_updated_data(self._states.copy())
+
+    def _log_device_unavailable(
+        self,
+        device_id: str,
+        source: str,
+        result: str,
+        cached: dict[str, Any],
+        incoming: dict[str, Any] | None = None,
+    ) -> None:
+        """Log only status fields needed to distinguish read and event failures."""
+        device = self._devices[device_id]
+        incoming = incoming or {}
+        report_at = incoming.get("reportAt") or incoming.get("lastReportedAt")
+        _LOGGER.warning(
+            "YoLink device unavailable: %s (%s); source=%s result=%s "
+            "online=%s reportAt=%s cached_online=%s cached_reportAt=%s "
+            "cached_lastReportedAt=%s lastSeenAt=%s",
+            device.name,
+            device.model,
+            source,
+            result,
+            _diagnostic_online(incoming.get("online")),
+            _diagnostic_timestamp(report_at),
+            _diagnostic_online(cached.get("online")),
+            _diagnostic_timestamp(cached.get("reportAt")),
+            _diagnostic_timestamp(cached.get("lastReportedAt")),
+            _diagnostic_timestamp(cached.get("lastSeenAt")),
+        )
+
+    def _log_ignored_offline_snapshot(
+        self,
+        device_id: str,
+        cached: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> None:
+        """Record a discarded offline flag once per distinct HTTP report."""
+        report_at = _diagnostic_timestamp(
+            incoming.get("reportAt") or incoming.get("lastReportedAt")
+        )
+        if self._logged_stale_offline_reports.get(device_id) == report_at:
+            return
+        self._logged_stale_offline_reports[device_id] = report_at
+        device = self._devices[device_id]
+        _LOGGER.warning(
+            "YoLink ignored getState online=False for %s (%s): "
+            "reportAt=%s cached_online=%s cached_reportAt=%s "
+            "cached_lastReportedAt=%s lastSeenAt=%s",
+            device.name,
+            device.model,
+            report_at,
+            _diagnostic_online(cached.get("online")),
+            _diagnostic_timestamp(cached.get("reportAt")),
+            _diagnostic_timestamp(cached.get("lastReportedAt")),
+            _diagnostic_timestamp(cached.get("lastSeenAt")),
+        )
 
     def _normalize_http_state(
         self, state: dict[str, Any], device: Device | None = None
@@ -478,20 +1033,21 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         normalized_state.setdefault("online", True)
         if normalized_state.get("reportAt") and "lastReportedAt" not in normalized_state:
             normalized_state["lastReportedAt"] = normalized_state["reportAt"]
-        if (
-            device is not None
-            and device.device_type == "WaterMeterController"
-            and "lastReportedAt" not in normalized_state
-        ):
-            normalized_state["lastReportedAt"] = dt_util.utcnow().isoformat()
+        if device is not None and device.device_type == "THSensor":
+            normalized_state = self._timestamp_thsensor_measurements(
+                normalized_state, _parse_timestamp(normalized_state.get("reportAt"))
+            )
         return normalized_state
 
-    def _mark_unreachable(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Mark a device unavailable after repeated read-only getState failures."""
-        if not state:
-            return {"online": False}
+    def _mark_unreachable(
+        self,
+        device_id: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Mark a device offline after three explicit getState 000201 errors."""
         if state.get("online") is False:
             return state
+        _LOGGER.debug("Marking %s offline after repeated getState 000201", device_id)
         return {**state, "online": False}
 
     def _normalize_mqtt_event(
@@ -529,6 +1085,55 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         return self._sanitize_state_payload(normalized)
 
+    def _timestamp_thsensor_measurements(
+        self,
+        state: dict[str, Any],
+        measured_at: datetime | None,
+    ) -> dict[str, Any]:
+        """Version TH readings without changing the device's report/contact time."""
+        nested = state.get("state")
+        if measured_at is None or not isinstance(nested, dict):
+            return state
+        times = {
+            key: measured_at.isoformat()
+            for key in TH_MEASUREMENT_FIELDS
+            if nested.get(key) is not None
+        }
+        return {**state, TH_MEASUREMENT_TIMES: times} if times else state
+
+    def _merge_thsensor_measurements(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+        merged: dict[str, Any],
+    ) -> None:
+        """Keep each TH reading's newest timestamp across MQTT and HTTP merges."""
+        existing_times = existing.get(TH_MEASUREMENT_TIMES, {})
+        incoming_times = incoming.get(TH_MEASUREMENT_TIMES, {})
+        if not existing_times and not incoming_times:
+            return
+        existing_nested = existing.get("state")
+        incoming_nested = incoming.get("state")
+        if not isinstance(incoming_nested, dict):
+            return
+        if not isinstance(existing_nested, dict):
+            existing_nested = {}
+        times = dict(existing_times)
+        for key in TH_MEASUREMENT_FIELDS:
+            if key not in incoming_nested:
+                continue
+            current_at = _thsensor_measurement_timestamp(existing, key)
+            incoming_at = _parse_timestamp(incoming_times.get(key))
+            if (
+                key in existing_nested
+                and current_at is not None
+                and (incoming_at is None or incoming_at < current_at)
+            ):
+                merged["state"][key] = existing_nested[key]
+            elif incoming_at is not None:
+                times[key] = incoming_at.isoformat()
+        merged[TH_MEASUREMENT_TIMES] = times
+
     def _merge_state_payload(
         self,
         existing_state: dict[str, Any],
@@ -544,6 +1149,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             merged_state["state"] = self._sanitize_nested_state(merged_nested_state)
         elif merged_nested_state is not None:
             merged_state["state"] = merged_nested_state
+        self._merge_thsensor_measurements(existing_state, incoming_state, merged_state)
         self._apply_event_availability(existing_state, incoming_state, merged_state)
         return merged_state
 
@@ -614,13 +1220,24 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return event_state
 
     @callback
-    def _on_mqtt_disconnect(self, host: str | None = None) -> None:
+    def _on_mqtt_disconnect(
+        self,
+        host: str | None = None,
+        client: YoLinkMQTTClient | None = None,
+    ) -> None:
         """Reconnect MQTT when the broker disconnects."""
         if self._shutdown:
             return
         if host is not None:
-            self._mqtt_clients.pop(host, None)
+            current_client = self._mqtt_clients.get(host)
+            if current_client is None or (
+                client is not None and current_client is not client
+            ):
+                return
+            self._mqtt_clients.pop(host)
+            self._retired_mqtt_clients.append(current_client)
         if self._reconnect_task and not self._reconnect_task.done():
+            self._mqtt_reconnect_wakeup.set()
             return
         self._reconnect_task = self.hass.async_create_task(self._async_reconnect_mqtt())
 
@@ -628,6 +1245,17 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Reconnect missing MQTT clients with backoff."""
         backoff_seconds = 5
         while not self._shutdown:
+            while self._retired_mqtt_clients:
+                client = self._retired_mqtt_clients[0]
+                try:
+                    await client.disconnect()
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Failed to close disconnected MQTT client: %s",
+                        type(err).__name__,
+                    )
+                self._retired_mqtt_clients.pop(0)
+
             missing_hosts = [
                 host for host in self._mqtt_hosts if host not in self._mqtt_clients
             ]
@@ -644,11 +1272,22 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                         exc_info=True,
                     )
 
-            if all(host in self._mqtt_clients for host in self._mqtt_hosts):
+            if (
+                all(host in self._mqtt_clients for host in self._mqtt_hosts)
+                and not self._retired_mqtt_clients
+            ):
                 return
 
-            await asyncio.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 2, 300)
+            try:
+                await asyncio.wait_for(
+                    self._mqtt_reconnect_wakeup.wait(), timeout=backoff_seconds
+                )
+            except TimeoutError:
+                backoff_seconds = min(backoff_seconds * 2, 300)
+            else:
+                backoff_seconds = 5
+            finally:
+                self._mqtt_reconnect_wakeup.clear()
 
     async def _async_device_discovery_loop(self) -> None:
         """Periodically check for device additions/removals."""
@@ -698,6 +1337,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         for device_id in removed_ids:
             self._states.pop(device_id, None)
+            self._logged_stale_offline_reports.pop(device_id, None)
             self._remove_device_from_registry(device_id)
 
         for device in added_devices:
@@ -793,7 +1433,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         try:
             state = await self._async_get_state_with_retry(device)
             if state is not None:
-                self._update_device_state(device_id, self._normalize_http_state(state, device))
+                normalized_state = self._normalize_http_state(state, device)
+                self._update_device_state(
+                    device_id,
+                    self._merge_command_http_state(device_id, normalized_state),
+                )
         except Exception:
             _LOGGER.warning(
                 "Failed to refresh state after command for %s",

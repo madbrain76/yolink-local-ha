@@ -134,11 +134,22 @@ def _install_homeassistant_stubs() -> None:
             self.data = None
             self.last_update_success = True
             self.last_exception = None
+            self._listeners = []
+
+        def async_add_listener(self, listener):
+            self._listeners.append(listener)
+
+            def remove_listener():
+                self._listeners.remove(listener)
+
+            return remove_listener
 
         def async_set_updated_data(self, data):
             self.data = data
             self.last_update_success = True
             self.last_exception = None
+            for listener in list(self._listeners):
+                listener()
 
         def async_set_update_error(self, err):
             self.last_exception = err
@@ -152,6 +163,10 @@ def _install_homeassistant_stubs() -> None:
 
         def __init__(self, coordinator) -> None:
             self.coordinator = coordinator
+
+        @property
+        def unique_id(self):
+            return getattr(self, "_attr_unique_id", None)
 
         @property
         def available(self) -> bool:
@@ -221,6 +236,16 @@ def _install_homeassistant_stubs() -> None:
         def async_get(self, entity_id):
             return self.entities.get(entity_id)
 
+        def async_get_entity_id(self, domain, platform, unique_id):
+            for entity_id, entry in self.entities.items():
+                if (
+                    entity_id.startswith(f"{domain}.")
+                    and getattr(entry, "platform", None) == platform
+                    and getattr(entry, "unique_id", None) == unique_id
+                ):
+                    return entity_id
+            return None
+
         def async_remove(self, entity_id):
             self.entities.pop(entity_id, None)
 
@@ -238,6 +263,28 @@ def _install_homeassistant_stubs() -> None:
 
     entity_registry.async_get = async_get_entity_registry
     entity_registry.async_entries_for_config_entry = async_entries_for_config_entry
+
+    storage = ModuleType("homeassistant.helpers.storage")
+
+    class Store:
+        """In-memory subset of Home Assistant's persistent Store helper."""
+
+        def __init__(self, _hass, _version, _key) -> None:
+            self.data = None
+
+        def __class_getitem__(cls, _item):
+            return cls
+
+        async def async_load(self):
+            return self.data
+
+        async def async_save(self, data) -> None:
+            self.data = data
+
+        def async_delay_save(self, data_func, _delay) -> None:
+            self.data = data_func()
+
+    storage.Store = Store
 
     util = ModuleType("homeassistant.util")
     dt = ModuleType("homeassistant.util.dt")
@@ -361,6 +408,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.helpers.entity"] = entity
     sys.modules["homeassistant.helpers.device_registry"] = device_registry
     sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
+    sys.modules["homeassistant.helpers.storage"] = storage
     sys.modules["homeassistant.util"] = util
     sys.modules["homeassistant.util.dt"] = dt
     sys.modules["homeassistant.components"] = components

@@ -8,7 +8,9 @@ import asyncio
 import logging
 
 import aiohttp
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 
 import custom_components.yolocal as yolocal_module
 import custom_components.yolocal.api.client as client_module
@@ -18,13 +20,16 @@ from custom_components.yolocal.api.auth import TokenManager
 from custom_components.yolocal.api.client import ApiError
 from custom_components.yolocal.api.client import YoLinkClient
 from custom_components.yolocal.api.device import Device
-from custom_components.yolocal.api.mqtt import DeviceEvent
+from custom_components.yolocal.api.mqtt import DeviceEvent, YoLinkMQTTClient
 from custom_components.yolocal.binary_sensor import (
     YoLocalWaterFlowSensor,
     YoLocalWaterMeterAlarmSensor,
 )
 from custom_components.yolocal.const import DOMAIN
-from custom_components.yolocal.coordinator import YoLocalCoordinator
+from custom_components.yolocal.coordinator import (
+    YoLocalCoordinator,
+    device_contact_timestamp,
+)
 from custom_components.yolocal.entity import YoLocalEntity
 from custom_components.yolocal.sensor import (
     YoLocalBatterySensor,
@@ -32,6 +37,7 @@ from custom_components.yolocal.sensor import (
     YoLocalOutletPowerSensor,
     YoLocalTHLimitSensor,
     YoLocalWaterMeterReadingSensor,
+    async_setup_entry as async_setup_sensor_entry,
     build_sensor_entities,
 )
 from custom_components.yolocal.switch import YoLocalSwitch
@@ -914,6 +920,38 @@ def test_battery_sensor_is_created_only_when_payload_has_battery() -> None:
     assert any(isinstance(entity, YoLocalBatterySensor) for entity in unknown_entities)
 
 
+def test_battery_sensor_reports_zero_while_device_is_offline() -> None:
+    """Keep a battery device at 0% in HA's battery dashboard while offline."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="MotionSensor", display_type="MotionSensor")
+    battery = YoLocalBatterySensor(coordinator, device)
+    motion = YoLocalEntity(coordinator, device)
+
+    coordinator._states[device.device_id] = {
+        "online": False,
+        "state": {"battery": 1},
+    }
+    assert motion.available is False
+    assert battery.available is True
+    assert battery.native_value == 0
+
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "lastReportedAt": (datetime.now(UTC) - timedelta(hours=13)).isoformat(),
+        "state": {"battery": 1},
+    }
+    assert battery.available is True
+    assert battery.native_value == 0
+
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "lastReportedAt": datetime.now(UTC).isoformat(),
+        "state": {"battery": 4},
+    }
+    assert battery.available is True
+    assert battery.native_value == 100
+
+
 def test_outlet_switch_reads_nested_and_flat_state() -> None:
     """Outlet switch state should handle HTTP-like nested and flat states."""
     coordinator = make_coordinator()
@@ -1001,7 +1039,7 @@ def test_duplicate_mqtt_events_are_ignored() -> None:
         raw={
             "deviceId": device.device_id,
             "event": "report",
-            "time": 1773057600000,
+            "time": int(datetime.now(UTC).timestamp() * 1000),
             "data": {"state": "alert"},
         },
     )
@@ -1031,7 +1069,7 @@ def test_distinct_mqtt_events_are_not_deduplicated() -> None:
         raw={
             "deviceId": device.device_id,
             "event": "report",
-            "time": 1773057600000,
+            "time": int(datetime.now(UTC).timestamp() * 1000),
             "data": {"state": "alert"},
         },
     )
@@ -1042,7 +1080,7 @@ def test_distinct_mqtt_events_are_not_deduplicated() -> None:
         raw={
             "deviceId": device.device_id,
             "event": "report",
-            "time": 1773057601000,
+            "time": int(datetime.now(UTC).timestamp() * 1000) + 1,
             "data": {"state": "normal"},
         },
     )
@@ -1374,6 +1412,20 @@ def test_last_reported_sensor_keeps_value_during_partial_updates() -> None:
     assert sensor.native_value == datetime(2026, 5, 27, 5, 56, tzinfo=UTC)
 
 
+def test_last_reported_sensor_prefers_device_report_over_mqtt_envelope() -> None:
+    """A hub heartbeat must not make Last reported look like a radio report."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor")
+    coordinator._states[device.device_id] = {
+        "reportAt": "2026-10-18T21:30:58Z",
+        "lastReportedAt": "2026-10-19T00:30:59Z",
+    }
+
+    assert YoLocalLastReportedSensor(coordinator, device).native_value == datetime(
+        2026, 10, 18, 21, 30, 58, tzinfo=UTC
+    )
+
+
 def test_th_limit_sensor_filters_sentinel_values() -> None:
     """Threshold sensor should reject unrealistic sentinel values."""
     coordinator = make_coordinator()
@@ -1437,16 +1489,16 @@ def test_async_update_data_keeps_old_state_when_refresh_fails() -> None:
     assert refreshed[device.device_id]["state"]["battery"] == 2
 
 
-def test_async_update_data_marks_offline_after_transient_device_unreachable(
+def test_async_update_data_marks_silent_device_offline_after_transient_device_unreachable(
     caplog,
 ) -> None:
-    """Repeated read-only getState failures should mark the device offline."""
+    """A device we have not heard from recently goes offline on read failures."""
     coordinator = make_coordinator()
     device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
     coordinator._devices[device.device_id] = device
-    fresh = datetime.now(UTC) - timedelta(minutes=5)
+    stale = datetime.now(UTC) - timedelta(minutes=45)
     coordinator._states[device.device_id] = {
-        "lastReportedAt": fresh.isoformat(),
+        "lastReportedAt": stale.isoformat(),
         "online": True,
         "state": {"power": 57, "state": "open", "watt": 0}
     }
@@ -1463,10 +1515,384 @@ def test_async_update_data_marks_offline_after_transient_device_unreachable(
     refreshed = asyncio.run(coordinator._async_update_data())
 
     assert calls == 3
+    assert refreshed[device.device_id]["online"] is False
+    assert refreshed[device.device_id]["state"]["state"] == "open"
+    assert YoLocalEntity(coordinator, device).available is False
+    assert "Failed to refresh state" not in caplog.text
+
+
+def test_getstate_unreachable_logs_unavailability_once_without_secrets(caplog) -> None:
+    """A 000201 outage identifies the cached report without exposing payloads."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    device.token = "private-device-token"
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "lastReportedAt": "2026-10-12T01:31:02Z",
+        "state": {"client_secret": "private-payload-secret"},
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        raise ApiError("000201", "private-error-detail", "THSensor.getState")
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+
+    asyncio.run(coordinator._async_update_data())
+    asyncio.run(coordinator._async_update_data())
+
+    assert caplog.text.count("YoLink device unavailable:") == 1
+    assert "source=getState" in caplog.text
+    assert "result=000201" in caplog.text
+    assert "online=<missing>" in caplog.text
+    assert "cached_lastReportedAt=2026-10-12T01:31:02+00:00" in caplog.text
+    assert "private-" not in caplog.text
+
+
+def test_getstate_online_false_logs_response_fields_without_payload(caplog) -> None:
+    """A successful offline response is distinguishable from a read failure."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": False,
+            "reportAt": "2026-10-23T12:34:56Z",
+            "state": {"access_token": "private-payload-secret"},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert "source=getState result=success" in caplog.text
+    assert "online=False" in caplog.text
+    assert "reportAt=2026-10-23T12:34:56+00:00" in caplog.text
+    assert "private-payload-secret" not in caplog.text
+
+
+def test_getstate_diagnostic_rejects_malformed_report_time(caplog) -> None:
+    """Only parsed timestamps, not arbitrary response text, reach the log."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {"online": False, "reportAt": "private-timestamp-secret"}
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert "reportAt=<invalid>" in caplog.text
+    assert "private-timestamp-secret" not in caplog.text
+
+
+def test_mqtt_online_false_logs_event_fields_without_payload(caplog) -> None:
+    """An explicit MQTT offline event has a distinct diagnostic source."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True}
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+    payload = {
+        "deviceId": device.device_id,
+        "event": "report",
+        "time": int(datetime.now(UTC).timestamp() * 1000),
+        "online": False,
+        "data": {"state": {"client_secret": "private-payload-secret"}},
+    }
+
+    coordinator._on_device_event(DeviceEvent.from_payload(payload))
+
+    assert "source=mqtt result=event" in caplog.text
+    assert "online=False" in caplog.text
+    assert "reportAt=<missing>" in caplog.text
+    assert "private-payload-secret" not in caplog.text
+
+
+def test_getstate_transport_failure_logs_safe_error_and_cached_state(caplog) -> None:
+    """Transport failures log the category and cached context, not exception text."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "lastReportedAt": "2026-10-23T12:34:56Z",
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        raise RuntimeError("private-transport-secret")
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert "getState request failed" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert "cached_online=True" in caplog.text
+    assert "cached_lastReportedAt=2026-10-23T12:34:56+00:00" in caplog.text
+    assert "private-transport-secret" not in caplog.text
+
+
+def test_async_update_data_000201_marks_recent_outlet_offline(caplog) -> None:
+    """Three explicit 000201 responses override a recent MQTT report."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    deliver_mqtt_report(coordinator, device)
+    assert YoLocalEntity(coordinator, device).available is True
+    assert coordinator.get_state(device.device_id)["lastContactAt"]
+    calls = 0
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        raise ApiError("000201", "Cannot connect to the device", "Outlet.getState")
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert calls == 3
     assert refreshed[device.device_id] == coordinator._states[device.device_id]
     assert refreshed[device.device_id]["online"] is False
     assert refreshed[device.device_id]["state"]["state"] == "open"
+    assert YoLocalEntity(coordinator, device).available is False
     assert "Failed to refresh state" not in caplog.text
+    assert caplog.text.count("YoLink device unavailable:") == 1
+
+
+def deliver_mqtt_report(
+    coordinator: YoLocalCoordinator,
+    device: Device,
+    *,
+    online: bool | None = None,
+    reported_at: datetime | None = None,
+    power: int = 57,
+) -> None:
+    """Deliver a wire-format MQTT report through the real payload parser."""
+    reported_at = reported_at or datetime.now(UTC)
+    raw: dict[str, object] = {
+        "deviceId": device.device_id,
+        "event": "report",
+        "time": int(reported_at.timestamp() * 1000),
+        "data": {"state": {"power": power, "state": "open", "watt": 0}},
+    }
+    if online is not None:
+        raw["online"] = online
+    coordinator._on_device_event(DeviceEvent.from_payload(raw))
+
+
+def test_delayed_mqtt_report_does_not_make_stale_outlet_available() -> None:
+    """A buffered report cannot count as fresh contact after reconnecting."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "lastReportedAt": (datetime.now(UTC) - timedelta(hours=13)).isoformat(),
+        "state": {"power": 57, "state": "open", "watt": 0},
+    }
+    entity = YoLocalEntity(coordinator, device)
+    assert entity.available is False
+
+    deliver_mqtt_report(
+        coordinator,
+        device,
+        reported_at=datetime.now(UTC) - timedelta(hours=14),
+    )
+
+    assert "lastSeenAt" not in coordinator.get_state(device.device_id)
+    assert entity.available is False
+
+
+def test_delayed_mqtt_report_does_not_prevent_explicit_unreachable() -> None:
+    """A buffered report cannot overrule a later explicit 000201."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    deliver_mqtt_report(
+        coordinator,
+        device,
+        reported_at=datetime.now(UTC) - timedelta(minutes=45),
+    )
+
+    state = coordinator.get_state(device.device_id)
+    assert "lastSeenAt" not in state
+    assert coordinator._mark_unreachable(device.device_id, state)["online"] is False
+
+
+def test_device_contact_timestamp_normalizes_naive_and_aware_values() -> None:
+    """A mixed timestamp pair must be comparable in either order."""
+    now = datetime.now(UTC)
+    older = now - timedelta(minutes=20)
+    newer = now - timedelta(minutes=1)
+
+    assert device_contact_timestamp(
+        {
+            "lastSeenAt": older.replace(tzinfo=None).isoformat(),
+            "lastReportedAt": newer.isoformat(),
+        }
+    ) == newer
+    assert device_contact_timestamp(
+        {
+            "lastSeenAt": older.isoformat(),
+            "lastReportedAt": newer.replace(tzinfo=None).isoformat(),
+        }
+    ) == newer
+
+
+def test_entity_availability_accepts_naive_report_time() -> None:
+    """An offset-free report time must not crash availability checks."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet")
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "lastReportedAt": (
+            datetime.now(UTC) - timedelta(minutes=5)
+        ).replace(tzinfo=None).isoformat(),
+    }
+    entity = YoLocalEntity(coordinator, device)
+
+    assert entity.available is True
+
+    coordinator._states[device.device_id]["lastReportedAt"] = (
+        datetime.now(UTC) - timedelta(hours=13)
+    ).replace(tzinfo=None).isoformat()
+    assert entity.available is False
+
+
+def test_naive_report_time_does_not_abort_multi_device_refresh() -> None:
+    """One unreachable device with a naive timestamp must not lose other polls."""
+    coordinator = make_coordinator()
+    unreachable = make_device(device_id=make_device_id("unreachable"), device_type="Outlet")
+    reachable = make_device(device_id=make_device_id("reachable"), device_type="Outlet")
+    coordinator._devices = {
+        unreachable.device_id: unreachable,
+        reachable.device_id: reachable,
+    }
+    coordinator._states[unreachable.device_id] = {
+        "online": True,
+        "lastReportedAt": (
+            datetime.now(UTC) - timedelta(minutes=45)
+        ).replace(tzinfo=None).isoformat(),
+    }
+
+    async def get_state(device: Device) -> dict[str, object]:
+        if device.device_id == unreachable.device_id:
+            raise ApiError("000201", "Cannot connect to the device", "Outlet.getState")
+        return {"reportAt": datetime.now(UTC).isoformat(), "state": {"power": 57}}
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert refreshed[unreachable.device_id]["online"] is False
+    assert refreshed[reachable.device_id]["state"]["power"] == 57
+
+
+def test_async_update_data_stale_getstate_cannot_revive_offline_device() -> None:
+    """An older getState snapshot never restores availability, contact or not.
+
+    The hub serves cached getState results, so an ``online`` flag in a snapshot
+    that predates the cached report is as stale as the rest of the payload.
+    """
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": False,
+        "lastSeenAt": datetime.now(UTC).isoformat(),
+        "lastReportedAt": "2026-10-13T13:58:46+00:00",
+        "state": {"power": 57, "state": "open", "watt": 0},
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": True,
+            "reportAt": "2026-10-13T12:41:32Z",
+            "state": {"power": 99, "state": "closed", "watt": 0},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    refreshed = asyncio.run(coordinator._async_update_data())
+
+    assert refreshed[device.device_id]["online"] is False
+    assert refreshed[device.device_id]["state"]["power"] == 57
+    assert YoLocalEntity(coordinator, device).available is False
+
+
+def test_async_update_data_old_snapshot_is_not_device_contact() -> None:
+    """A hub-cached getState reply must not pass itself off as a live report.
+
+    Polling stamps nothing: only a device-originated MQTT delivery counts as
+    ``lastSeenAt``. Otherwise a device that died days ago would look recently
+    seen and dodge both the contact grace and the 12-hour stale-report rule.
+    """
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    old = (datetime.now(UTC) - timedelta(hours=13)).isoformat()
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": True,
+            "reportAt": old,
+            "state": {"power": 57, "state": "open", "watt": 0},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    asyncio.run(coordinator._async_update_data())
+
+    state = coordinator.get_state(device.device_id)
+    assert "lastSeenAt" not in state
+    assert state["lastReportedAt"] == old
+    assert state["online"] is True
+    assert YoLocalEntity(coordinator, device).available is False
+
+
+def test_async_send_command_marks_offline_despite_recent_contact() -> None:
+    """A device that ignores three commands is failing, however recently it spoke.
+
+    The read-path contact grace must not leak onto commands: a setState that
+    cannot reach the device is direct evidence, and the automation needs both
+    the raise and an offline device.
+    """
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    deliver_mqtt_report(coordinator, device)
+    assert YoLocalEntity(coordinator, device).available is True
+    calls = 0
+
+    async def set_state(_device: Device, _params: dict[str, object]) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        raise ApiError("000201", "Cannot connect to the device", "Outlet.setState")
+
+    coordinator._client = SimpleNamespace(set_state=set_state, host="127.0.0.1")
+
+    try:
+        asyncio.run(coordinator.async_send_command(device.device_id, {"state": "closed"}))
+    except ApiError as err:
+        assert err.code == "000201"
+    else:
+        raise AssertionError("expected ApiError")
+
+    assert calls == 3
+    assert coordinator.get_state(device.device_id)["online"] is False
+    assert YoLocalEntity(coordinator, device).available is False
 
 
 def test_async_update_data_keeps_online_when_retry_succeeds() -> None:
@@ -1722,6 +2148,269 @@ def test_async_update_data_stale_getstate_online_false_leaves_cache() -> None:
     assert refreshed == cached
 
 
+def test_ignored_offline_getstate_logs_clocks_once_without_payload(caplog) -> None:
+    """Passive diagnostics distinguish device reportAt from MQTT envelope time."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    report_at = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "report",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"reportAt": report_at, "state": {"battery": 3}},
+            }
+        )
+    )
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": False,
+            "reportAt": report_at,
+                "state": {"battery": 3, "client_secret": "private-payload-secret"},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+    caplog.set_level(logging.WARNING, logger="custom_components.yolocal.coordinator")
+
+    asyncio.run(coordinator._async_update_data())
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.get_state(device.device_id)["online"] is True
+    assert caplog.text.count("YoLink ignored getState online=False") == 1
+    assert f"reportAt={datetime.fromisoformat(report_at).isoformat()}" in caplog.text
+    assert f"cached_reportAt={datetime.fromisoformat(report_at).isoformat()}" in caplog.text
+    assert "cached_lastReportedAt=<missing>" in caplog.text
+    assert "private-payload-secret" not in caplog.text
+
+
+def test_thsensor_cached_offline_snapshot_waits_for_twelve_hour_report_age() -> None:
+    """A successful cached read must not declare a sleeping sensor dead."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    report_at = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "reportAt": report_at,
+        "lastReportedAt": report_at,
+        "state": {"battery": 3, "temperature": 21},
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": False,
+            "reportAt": report_at,
+            "state": {"battery": 3, "temperature": 21},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.get_state(device.device_id)["online"] is True
+    assert YoLocalEntity(coordinator, device).available is True
+    assert YoLocalBatterySensor(coordinator, device).native_value == 75
+
+
+def test_thsensor_startup_uses_recent_cached_report_despite_offline_flag() -> None:
+    """A cold start may use a recent device report from a cached HTTP payload."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    report_at = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": False,
+            "reportAt": report_at,
+            "state": {"battery": 3, "temperature": 21},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.get_state(device.device_id)["online"] is True
+    assert YoLocalEntity(coordinator, device).available is True
+    assert YoLocalBatterySensor(coordinator, device).native_value == 75
+
+
+def test_thsensor_000201_forces_offline_even_with_recent_report() -> None:
+    """An explicit 000201 remains an offline signal for a battery device."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    report_at = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+    state = {
+        "online": True,
+        "reportAt": report_at,
+        "lastReportedAt": report_at,
+        "state": {"battery": 3, "temperature": 21},
+    }
+
+    assert coordinator._mark_unreachable(device.device_id, state)["online"] is False
+
+
+def test_thsensor_000201_stays_offline_until_new_radio_report() -> None:
+    """A later hub heartbeat cannot undo an explicit unreachable result."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    report_at = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+    coordinator._states[device.device_id] = coordinator._mark_unreachable(
+        device.device_id,
+        {
+            "online": True,
+            "reportAt": report_at,
+            "lastReportedAt": report_at,
+            "state": {"battery": 3, "temperature": 21},
+        },
+    )
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "THSensor.Report",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"reportAt": report_at},
+            }
+        )
+    )
+    assert coordinator.get_state(device.device_id)["online"] is False
+    assert YoLocalBatterySensor(coordinator, device).native_value == 0
+
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "THSensor.Report",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"reportAt": datetime.now(UTC).isoformat()},
+            }
+        )
+    )
+    assert coordinator.get_state(device.device_id)["online"] is True
+    assert YoLocalBatterySensor(coordinator, device).native_value == 75
+
+
+def test_thsensor_mqtt_envelope_does_not_extend_radio_contact() -> None:
+    """A half-hourly hub packet cannot hide a thirteen-hour-old report."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    report_at = (datetime.now(UTC) - timedelta(hours=13)).isoformat()
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "reportAt": report_at,
+        "lastReportedAt": report_at,
+        "state": {"battery": 3, "temperature": 21},
+    }
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "THSensor.Report",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"reportAt": report_at},
+            }
+        )
+    )
+
+    assert YoLocalEntity(coordinator, device).available is False
+    assert YoLocalBatterySensor(coordinator, device).native_value == 0
+
+
+def test_older_mqtt_report_cannot_roll_back_radio_contact() -> None:
+    """A buffered packet with an older reportAt cannot replace live state."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    current = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    old = (datetime.now(UTC) - timedelta(hours=13)).isoformat()
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "reportAt": current,
+        "lastReportedAt": current,
+        "state": {"battery": 3, "temperature": 22},
+    }
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "THSensor.Report",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"reportAt": old, "temperature": 21},
+            }
+        )
+    )
+
+    assert coordinator.get_state(device.device_id)["reportAt"] == current
+    assert coordinator.get_state(device.device_id)["state"]["temperature"] == 22
+    assert YoLocalEntity(coordinator, device).available is True
+
+
+def test_thsensor_newer_http_report_recovers_from_missed_mqtt_report() -> None:
+    """Compare the device report clock, not the newer MQTT envelope clock."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    old_report = datetime.now(UTC) - timedelta(hours=4)
+    new_report = datetime.now(UTC) - timedelta(hours=1)
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "reportAt": old_report.isoformat(),
+        "lastReportedAt": datetime.now(UTC).isoformat(),
+        "state": {"battery": 3, "temperature": 21},
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": True,
+            "reportAt": new_report.isoformat(),
+            "state": {"battery": 3, "temperature": 22},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.get_state(device.device_id)["state"]["temperature"] == 22
+
+
+def test_thsensor_newer_http_report_clears_000201_despite_later_mqtt_envelope() -> None:
+    """The device report clock wins over an unrelated MQTT receipt clock."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    old_report = datetime.now(UTC) - timedelta(hours=4)
+    new_report = datetime.now(UTC) - timedelta(hours=1)
+    receipt = datetime.now(UTC) - timedelta(minutes=1)
+    coordinator._states[device.device_id] = {
+        "online": False,
+        "reportAt": old_report.isoformat(),
+        "lastReportedAt": receipt.isoformat(),
+        "lastSeenAt": receipt.isoformat(),
+        "state": {"battery": 3, "temperature": 21},
+    }
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": True,
+            "reportAt": new_report.isoformat(),
+            "state": {"battery": 3, "temperature": 22},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.get_state(device.device_id)["online"] is True
+    assert coordinator.get_state(device.device_id)["state"]["temperature"] == 22
+
+
 def test_async_update_data_equal_report_getstate_restores_online() -> None:
     """A getState with the same reportAt as the cache is current and merges."""
     coordinator = make_coordinator()
@@ -1938,11 +2627,12 @@ def test_mqtt_disconnect_reconnects_missing_host_only() -> None:
     reconnected_hosts: list[str] = []
 
     async def connect_host(host: str) -> None:
+        assert ethernet_client.disconnect_calls == 1
         reconnected_hosts.append(host)
         coordinator._mqtt_clients[host] = FakeMqttClient()
 
     coordinator._connect_mqtt_host = connect_host
-    coordinator._on_mqtt_disconnect("ethernet.local")
+    coordinator._on_mqtt_disconnect("ethernet.local", ethernet_client)
     reconnect_coro = coordinator.hass._scheduled_coroutines.pop()
 
     asyncio.run(reconnect_coro)
@@ -1950,6 +2640,152 @@ def test_mqtt_disconnect_reconnects_missing_host_only() -> None:
     assert reconnected_hosts == ["ethernet.local"]
     assert "wifi.local" in coordinator._mqtt_clients
     assert wifi_client.disconnect_calls == 0
+
+    replacement = coordinator._mqtt_clients["ethernet.local"]
+    coordinator._on_mqtt_disconnect("ethernet.local", ethernet_client)
+    assert coordinator._mqtt_clients["ethernet.local"] is replacement
+    assert coordinator.hass._scheduled_coroutines == []
+
+
+def test_new_mqtt_disconnect_wakes_existing_reconnect_backoff() -> None:
+    """A second interface failure must interrupt backoff for the first."""
+    coordinator = make_coordinator()
+    coordinator._client = SimpleNamespace(
+        host="ethernet.local",
+        hosts=("ethernet.local", "wifi.local"),
+    )
+    ethernet_client = FakeMqttClient()
+    coordinator._mqtt_clients = {"ethernet.local": ethernet_client}
+
+    async def scenario() -> None:
+        wifi_attempted = asyncio.Event()
+        ethernet_reconnected = asyncio.Event()
+
+        async def connect_host(host: str) -> None:
+            if host == "wifi.local":
+                wifi_attempted.set()
+                raise ConnectionError("wifi down")
+            assert ethernet_client.disconnect_calls == 1
+            coordinator._mqtt_clients[host] = FakeMqttClient()
+            ethernet_reconnected.set()
+
+        coordinator._connect_mqtt_host = connect_host
+        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator._on_mqtt_disconnect()
+        try:
+            await asyncio.wait_for(wifi_attempted.wait(), timeout=1)
+            await asyncio.sleep(0)
+            coordinator._on_mqtt_disconnect("ethernet.local", ethernet_client)
+            await asyncio.wait_for(ethernet_reconnected.wait(), timeout=1)
+        finally:
+            coordinator._shutdown = True
+            task = coordinator._reconnect_task
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    asyncio.run(scenario())
+
+
+def test_mqtt_client_disables_paho_auto_reconnect(monkeypatch) -> None:
+    """Coordinator-controlled reconnects must not race Paho's own reconnects."""
+    created_kwargs: list[dict] = []
+
+    class FakePahoClient:
+        def __init__(self, _version, **kwargs) -> None:
+            created_kwargs.append(kwargs)
+
+        def username_pw_set(self, *_args) -> None:
+            pass
+
+        def connect_async(self, *_args, **_kwargs) -> None:
+            pass
+
+        def loop_start(self) -> None:
+            self.on_connect(self, None, None, 0)
+
+        def subscribe(self, _topic) -> None:
+            pass
+
+        def loop_stop(self) -> None:
+            pass
+
+        def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr("custom_components.yolocal.api.mqtt.mqtt.Client", FakePahoClient)
+    client = YoLinkMQTTClient("hub.local", "net", "client", "token")
+
+    async def connect_and_close() -> None:
+        await client.connect()
+        await client.disconnect()
+
+    asyncio.run(connect_and_close())
+    assert created_kwargs == [{"reconnect_on_failure": False}]
+
+
+def test_mqtt_connect_rejects_immediate_disconnect(monkeypatch) -> None:
+    """A dropped connection must not be registered as a live MQTT client."""
+
+    class FakePahoClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def username_pw_set(self, *_args) -> None:
+            pass
+
+        def connect_async(self, *_args, **_kwargs) -> None:
+            pass
+
+        def loop_start(self) -> None:
+            self.on_connect(self, None, None, 0)
+            self.on_disconnect(self, None, None, "Connection lost")
+
+        def subscribe(self, _topic) -> None:
+            pass
+
+        def loop_stop(self) -> None:
+            pass
+
+        def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr("custom_components.yolocal.api.mqtt.mqtt.Client", FakePahoClient)
+    client = YoLinkMQTTClient("hub.local", "net", "client", "token")
+
+    async def connect_and_close() -> None:
+        try:
+            await client.connect()
+        except ConnectionError:
+            pass
+        else:
+            raise AssertionError("a disconnected client was accepted")
+        finally:
+            await client.disconnect()
+
+    asyncio.run(connect_and_close())
+
+
+def test_shutdown_closes_retired_mqtt_client() -> None:
+    """A client awaiting reconnect must still be closed on HA shutdown."""
+    coordinator = make_coordinator()
+    retired = FakeMqttClient()
+    active = FakeMqttClient()
+    coordinator._mqtt_clients = {
+        "ethernet.local": retired,
+        "wifi.local": active,
+    }
+    coordinator._session = SimpleNamespace(close=lambda: asyncio.sleep(0))
+
+    coordinator._on_mqtt_disconnect("ethernet.local", retired)
+    coordinator.hass._scheduled_coroutines.pop().close()
+    asyncio.run(coordinator.async_shutdown())
+
+    assert retired.disconnect_calls == 1
+    assert active.disconnect_calls == 1
 
 
 def test_async_setup_removes_stale_registry_devices() -> None:
@@ -2662,12 +3498,23 @@ def test_water_meter_controller_valve_uses_valve_parameter() -> None:
 
 
 def test_water_meter_controller_entities_survive_initial_read_failure() -> None:
-    """A transient initial getState failure must not hide the battery entity."""
+    """A known battery entity survives an initial getState failure."""
     coordinator = make_coordinator()
     device = make_device(device_type="WaterMeterController", model="YS5009-UC")
     coordinator._states[device.device_id] = {"online": False}
+    registry = er.async_get(coordinator.hass)
+    entity_id = "sensor.test_water_meter_battery"
+    registry.entities[entity_id] = SimpleNamespace(
+        entity_id=entity_id,
+        unique_id=f"{device.device_id}_battery",
+        platform=DOMAIN,
+        config_entry_id="entry",
+    )
 
-    entities = build_sensor_entities(coordinator, device)
+    try:
+        entities = build_sensor_entities(coordinator, device)
+    finally:
+        registry.async_remove(entity_id)
 
     assert any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
     assert len([entity for entity in entities if isinstance(entity, YoLocalWaterMeterReadingSensor)]) == 5
@@ -2677,8 +3524,58 @@ def test_water_meter_controller_entities_survive_initial_read_failure() -> None:
     ).native_value is None
 
 
-def test_water_meter_controller_keeps_recent_state_when_poll_cannot_connect() -> None:
-    """A sleeping controller retains readings until its last report is stale."""
+def test_water_meter_controller_without_battery_evidence_has_no_battery_entity() -> None:
+    """Battery discovery does not treat the controller type as battery evidence."""
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=make_device_id("water-without-battery"),
+        device_type="WaterMeterController",
+        model="YS5009-UC",
+    )
+    coordinator._states[device.device_id] = {"online": False}
+
+    entities = build_sensor_entities(coordinator, device)
+
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
+
+
+def test_battery_entity_added_when_first_payload_arrives_after_setup() -> None:
+    """A new offline controller gains a battery entity without a reload."""
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=make_device_id("late-battery"),
+        device_type="WaterMeterController",
+        model="YS5009-UC",
+    )
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": False}
+    coordinator.hass.data = {DOMAIN: {"entry": coordinator}}
+    entry = ConfigEntry()
+    added = []
+
+    asyncio.run(
+        async_setup_sensor_entry(
+            coordinator.hass,
+            entry,
+            lambda entities: added.extend(entities),
+        )
+    )
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in added)
+
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": {"battery": 3},
+    }
+    coordinator.async_set_updated_data(coordinator._states.copy())
+    coordinator.async_set_updated_data(coordinator._states.copy())
+
+    batteries = [entity for entity in added if isinstance(entity, YoLocalBatterySensor)]
+    assert len(batteries) == 1
+    assert batteries[0].native_value == 75
+
+
+def test_water_meter_controller_000201_forces_offline_until_new_report() -> None:
+    """A controller handles an explicit 000201 like other battery devices."""
     coordinator = make_coordinator()
     device = make_device(device_type="WaterMeterController", model="YS5009-UC")
     coordinator._devices[device.device_id] = device
@@ -2690,8 +3587,7 @@ def test_water_meter_controller_keeps_recent_state_when_poll_cannot_connect() ->
         },
         device,
     )
-    last_reported_at = coordinator.get_state(device.device_id)["lastReportedAt"]
-    assert datetime.now(UTC) - datetime.fromisoformat(last_reported_at) < timedelta(minutes=1)
+    assert "lastContactAt" not in coordinator.get_state(device.device_id)
 
     async def get_state(_device: Device) -> dict[str, object]:
         raise ApiError(
@@ -2706,29 +3602,179 @@ def test_water_meter_controller_keeps_recent_state_when_poll_cannot_connect() ->
     )
     battery = YoLocalBatterySensor(coordinator, device)
     refreshed = asyncio.run(coordinator._async_update_data())
-    assert refreshed[device.device_id]["online"] is True
-    assert meter.available is True
-    assert round(meter.native_value, 2) == 32246.62
-    assert battery.available is True
-    assert battery.native_value == 100
-
-    coordinator._states[device.device_id]["lastReportedAt"] = (
-        datetime.now(UTC) - timedelta(hours=13)
-    ).isoformat()
-    refreshed = asyncio.run(coordinator._async_update_data())
     assert refreshed[device.device_id]["online"] is False
     assert meter.available is False
-    assert battery.available is False
+    assert round(meter.native_value, 2) == 32246.62
+    assert battery.available is True
+    assert battery.native_value == 0
 
-    fresh_event = coordinator._normalize_mqtt_event(
-        device,
-        {
-            "state": {"valve": "open"},
-            "lastReportedAt": datetime.now(UTC).isoformat(),
-        },
-    )
-    coordinator._states[device.device_id] = coordinator._merge_state_payload(
-        coordinator.get_state(device.device_id), fresh_event
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "WaterMeterController.StatusChange",
+                "msgid": "fresh-controller-event",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"state": {"valve": "open"}, "battery": 4},
+            }
+        )
     )
     assert meter.available is True
     assert battery.available is True
+
+
+def test_water_meter_http_snapshot_does_not_extend_inferred_contact() -> None:
+    """A cached WaterMeterController getState reply cannot hide an outage."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    old_contact = (datetime.now(UTC) - timedelta(hours=13)).isoformat()
+    coordinator._contacts[device.device_id] = {
+        "at": old_contact,
+        "source": "mqtt_event",
+    }
+    coordinator._states[device.device_id] = coordinator._apply_contact_record(
+        device.device_id,
+        {
+            "online": True,
+            "state": {"battery": 4, "meter": 2886895},
+        },
+    )
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {
+            "online": True,
+            "battery": 4,
+            "state": {"meter": 2886895},
+        }
+
+    coordinator._client = SimpleNamespace(get_state=get_state, host="127.0.0.1")
+
+    asyncio.run(coordinator._async_update_data())
+
+    state = coordinator.get_state(device.device_id)
+    assert state["lastContactAt"] == old_contact
+    assert state["online"] is False
+    assert YoLocalBatterySensor(coordinator, device).native_value == 0
+
+
+def test_water_meter_command_refresh_does_not_revive_stale_contact() -> None:
+    """A post-command cached getState response cannot reverse inferred offline."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._contacts[device.device_id] = {
+        "at": (datetime.now(UTC) - timedelta(hours=13)).isoformat(),
+        "source": "mqtt_event",
+    }
+    coordinator._states[device.device_id] = coordinator._apply_contact_record(
+        device.device_id,
+        {"online": False, "state": {"battery": 4, "valve": "close"}},
+    )
+
+    async def set_state(_device: Device, _params: dict[str, object]) -> dict[str, object]:
+        return {}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "battery": 4, "state": {"valve": "open"}}
+
+    coordinator._client = SimpleNamespace(set_state=set_state, get_state=get_state)
+
+    asyncio.run(coordinator.async_send_command(device.device_id, {"valve": "open"}))
+
+    assert coordinator.get_state(device.device_id)["online"] is False
+    assert YoLocalBatterySensor(coordinator, device).native_value == 0
+
+
+def test_water_meter_new_mqtt_event_recovers_inferred_contact() -> None:
+    """A new WaterMeterController event recovers an inferred offline state."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._contacts[device.device_id] = {
+        "at": (datetime.now(UTC) - timedelta(hours=13)).isoformat(),
+        "source": "mqtt_event",
+    }
+    coordinator._states[device.device_id] = coordinator._apply_contact_record(
+        device.device_id,
+        {"online": False, "state": {"battery": 4, "valve": "close"}},
+    )
+
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "WaterMeterController.StatusChange",
+                "msgid": "new-water-meter-event",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"state": {"valve": "open"}, "battery": 4},
+            }
+        )
+    )
+
+    state = coordinator.get_state(device.device_id)
+    assert state["online"] is True
+    assert state["lastContactSource"] == "mqtt_event"
+    assert _parse_timestamp_for_test(state["lastContactAt"]) > datetime.now(UTC) - timedelta(
+        minutes=1
+    )
+    assert YoLocalBatterySensor(coordinator, device).native_value == 100
+
+
+def test_replayed_mqtt_event_cannot_revive_battery_device() -> None:
+    """A replay with the same msgid stays ignored beyond fast de-duplication."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    payload = {
+        "deviceId": device.device_id,
+        "event": "WaterMeterController.StatusChange",
+        "msgid": "replayed-water-meter-event",
+        "time": int(datetime.now(UTC).timestamp() * 1000),
+        "data": {"state": {"valve": "open"}, "battery": 4},
+    }
+    coordinator._on_device_event(DeviceEvent.from_payload(payload))
+    first_contact = coordinator.get_state(device.device_id)["lastContactAt"]
+    coordinator._states[device.device_id]["online"] = False
+    coordinator._recent_mqtt_events.clear()
+    payload["time"] = int(datetime.now(UTC).timestamp() * 1000) + 1
+
+    coordinator._on_device_event(DeviceEvent.from_payload(payload))
+
+    state = coordinator.get_state(device.device_id)
+    assert state["online"] is False
+    assert state["lastContactAt"] == first_contact
+
+
+def test_contact_ledger_survives_restart_and_rejects_replayed_event() -> None:
+    """The durable ledger prevents a replay from reviving a reloaded entry."""
+    coordinator = make_coordinator()
+    coordinator._contact_store_enabled = True
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    payload = {
+        "deviceId": device.device_id,
+        "event": "WaterMeterController.StatusChange",
+        "msgid": "restart-water-meter-event",
+        "time": int(datetime.now(UTC).timestamp() * 1000),
+        "data": {"state": {"valve": "open"}, "battery": 4},
+    }
+    coordinator._on_device_event(DeviceEvent.from_payload(payload))
+    saved = coordinator._contact_store_data()
+
+    restored = make_coordinator()
+    restored._devices[device.device_id] = device
+    restored._contact_store.data = saved
+    asyncio.run(restored._async_load_contact_state())
+    restored._states[device.device_id] = restored._apply_contact_record(
+        device.device_id,
+        {"online": False, "state": {"battery": 4, "valve": "close"}},
+    )
+    restored._on_device_event(DeviceEvent.from_payload(payload))
+
+    assert restored.get_state(device.device_id)["online"] is False
+
+
+def _parse_timestamp_for_test(value: str) -> datetime:
+    """Parse the coordinator's serialized UTC timestamp in test assertions."""
+    return datetime.fromisoformat(value)
