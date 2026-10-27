@@ -321,7 +321,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     def _mqtt_contact_identity(self, event: DeviceEvent) -> str | None:
         """Return the durable identity of an event, when the hub supplies one."""
         msgid = event.raw.get("msgid")
-        if isinstance(msgid, (str, int)) and not isinstance(msgid, bool):
+        if isinstance(msgid, (str, int)) and not isinstance(msgid, bool) and msgid != "":
             return f"{event.device_id}|{event.event}|{msgid}"
         return None
 
@@ -933,6 +933,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 self._recent_mqtt_events.pop(key, None)
 
         event_key = self._mqtt_event_key(event)
+        if event_key is None:
+            return False
         if event_key in self._recent_mqtt_events:
             self._recent_mqtt_events[event_key] = now
             return True
@@ -943,8 +945,17 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._recent_mqtt_events.pop(oldest_key, None)
         return False
 
-    def _mqtt_event_key(self, event: DeviceEvent) -> str:
-        """Return a transport-independent key for duplicate MQTT events."""
+    def _mqtt_event_key(self, event: DeviceEvent) -> str | None:
+        """Identify copies of one report, not separate reports of the same state."""
+        identity = self._mqtt_contact_identity(event)
+        if identity is None:
+            # The envelope clock identifies a packet here, never radio contact.
+            timestamp = self._mqtt_event_timestamp(event) or _parse_timestamp(
+                event.data.get("reportAt")
+            )
+            if timestamp is None:
+                return None
+            identity = timestamp.isoformat()
         event_data = dict(event.data)
         event_data.pop("lastReportedAt", None)
         try:
@@ -952,13 +963,14 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 {
                     "device_id": event.device_id,
                     "event": event.event,
+                    "identity": identity,
                     "data": event_data,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
         except TypeError:
-            raw = repr((event.device_id, event.event, event_data))
+            raw = repr((event.device_id, event.event, identity, event_data))
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def _update_device_state(self, device_id: str, state: dict[str, Any]) -> None:

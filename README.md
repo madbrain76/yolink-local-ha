@@ -41,9 +41,9 @@ For devices with a Battery entity, an offline device reports 0% so it appears in
 | Manipulator | Valve, Sensor | Open/closed control, battery | YS4909-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
 | Outlet | Switch, Sensor | On/off state, power | YS6614-UC
-| TempSensor | Sensor Sensor | Temperature, battery | YS8004-UC
+| TempSensor | Sensor | Temperature, battery | YS8004-UC
 | THSensor | Sensor | Temperature, humidity, battery | YS8003-UC, YS8005-UC, YS8007-UC
-| TiltSensor | Binary Sensor | Temperature, battery | YS7706-UC
+| TiltSensor | Binary Sensor | Open/closed state, battery | YS7706-UC
 | WaterMeterController | Valve, Binary Sensor, Sensor | Valve control, water flow, alarms, meter and usage readings, battery | YS5009-UC
 
 Additional device types can be added -- contributions welcome.
@@ -152,7 +152,7 @@ To add, remove, or change the secondary address later, use **Settings -> Devices
 - **Device Discovery**: On startup, the integration queries the hub for all connected devices
 - **Initial State**: Each device's current state is fetched via HTTP
 - **Real-time Updates**: MQTT subscription receives instant state changes (door opens, temperature changes, etc.)
-- **Dual-host resilience**: When both hub addresses are configured, the integration keeps independent MQTT subscriptions to both interfaces and deduplicates identical events. HTTP reads can fail over between configured addresses.
+- **Dual-host resilience**: When both hub addresses are configured, the integration keeps independent MQTT subscriptions to both interfaces and deduplicates copies of the same event for five minutes. Separate reports with identical sensor values are still processed, using the message ID (or packet timestamp when no ID is supplied) to distinguish them. HTTP reads can fail over between configured addresses.
 - **Commands**: Lock/unlock, on/off, and other commands are sent via HTTP
 
 ### Temperature and humidity recordings

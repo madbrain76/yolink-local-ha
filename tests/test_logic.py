@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 import asyncio
+import json
 import logging
 
 import aiohttp
+import pytest
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -22,6 +25,7 @@ from custom_components.yolocal.api.client import YoLinkClient
 from custom_components.yolocal.api.device import Device
 from custom_components.yolocal.api.mqtt import DeviceEvent, YoLinkMQTTClient
 from custom_components.yolocal.binary_sensor import (
+    YoLocalBinarySensor,
     YoLocalWaterFlowSensor,
     YoLocalWaterMeterAlarmSensor,
 )
@@ -1089,6 +1093,127 @@ def test_distinct_mqtt_events_are_not_deduplicated() -> None:
     coordinator._on_device_event(second)
 
     assert len(update_calls) == 2
+
+
+@pytest.mark.parametrize("identity_field", ["msgid", "time"])
+def test_repeated_motion_transitions_with_distinct_event_identities(
+    monkeypatch, identity_field
+) -> None:
+    """Fresh motion reports must not disappear within the duplicate window."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="MotionSensor")
+    coordinator._devices[device.device_id] = device
+    sensor = YoLocalBinarySensor(coordinator, device)
+    observed: list[bool | None] = []
+    now = datetime(2026, 10, 26, tzinfo=UTC)
+    elapsed = 0
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.dt_util.utcnow",
+        lambda: now + timedelta(seconds=elapsed),
+    )
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.monotonic", lambda: elapsed
+    )
+
+    def update_device_state(device_id, state):
+        coordinator._states[device_id] = state
+        observed.append(sensor.is_on)
+
+    coordinator._update_device_state = update_device_state
+    for index, state in enumerate(("alert", "normal", "alert", "normal", "alert")):
+        elapsed = index * 60
+        payload = {
+            "deviceId": device.device_id,
+            "event": (
+                "MotionSensor.Alert" if state == "alert" else "MotionSensor.StatusChange"
+            ),
+            "time": int((now + timedelta(seconds=elapsed)).timestamp() * 1000),
+            "data": {"state": state, "battery": 4},
+        }
+        if identity_field == "msgid":
+            payload["msgid"] = f"motion-{index}"
+        event = DeviceEvent.from_payload(payload)
+        coordinator._on_device_event(event)
+        coordinator._on_device_event(event)
+
+    assert observed == [True, False, True, False, True]
+
+
+def test_mqtt_event_identity_survives_transport_time_changes(monkeypatch) -> None:
+    """One identified event received over both interfaces is still a duplicate."""
+    coordinator = make_coordinator()
+    elapsed = 0
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.monotonic", lambda: elapsed
+    )
+    payload = {
+        "deviceId": make_device_id(),
+        "event": "MotionSensor.Alert",
+        "msgid": "same-motion-event",
+        "time": 1792972800000,
+        "data": {"state": "alert"},
+    }
+    assert coordinator._is_duplicate_mqtt_event(DeviceEvent.from_payload(payload)) is False
+    elapsed = 299
+    payload["time"] += 1000
+    assert coordinator._is_duplicate_mqtt_event(DeviceEvent.from_payload(payload)) is True
+    payload["msgid"] = "new-motion-event"
+    assert coordinator._is_duplicate_mqtt_event(DeviceEvent.from_payload(payload)) is False
+    elapsed = 600
+    payload["msgid"] = "same-motion-event"
+    assert coordinator._is_duplicate_mqtt_event(DeviceEvent.from_payload(payload)) is False
+
+
+def test_saved_motion_alerts_with_matching_data_are_distinct(monkeypatch) -> None:
+    """Replay real captures whose repeated alert data is identical."""
+    capture_dir = Path(__file__).resolve().parents[1] / "captures/devices/MotionSensor-1"
+    payloads = [
+        json.loads((capture_dir / filename).read_text())["mqtt_payload"]
+        for filename in ("mqtt_0002.json", "mqtt_0009.json", "mqtt_0015.json")
+    ]
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=payloads[0]["deviceId"], device_type="MotionSensor"
+    )
+    coordinator._devices[device.device_id] = device
+    updates = []
+
+    def update_device_state(device_id, state):
+        coordinator._states[device_id] = state
+        updates.append(state)
+
+    coordinator._update_device_state = update_device_state
+    for payload in payloads:
+        now = datetime.fromtimestamp(payload["time"] / 1000, UTC)
+        monkeypatch.setattr(
+            "custom_components.yolocal.coordinator.dt_util.utcnow", lambda: now
+        )
+        monkeypatch.setattr(
+            "custom_components.yolocal.coordinator.monotonic", lambda: now.timestamp()
+        )
+        event = DeviceEvent.from_payload(payload)
+        coordinator._on_device_event(event)
+        coordinator._on_device_event(event)
+
+    assert len(updates) == 3
+    assert all(state["state"]["state"] == "alert" for state in updates)
+    assert len({state["lastContactAt"] for state in updates}) == 3
+
+
+@pytest.mark.parametrize("msgid", [None, "", True])
+def test_unidentified_mqtt_events_are_not_content_deduplicated(msgid) -> None:
+    """Matching state data alone cannot distinguish fresh reports from copies."""
+    coordinator = make_coordinator()
+    for state in ("alert", "normal", "alert"):
+        event = DeviceEvent.from_payload(
+            {
+                "deviceId": make_device_id(),
+                "event": "MotionSensor.Report",
+                "msgid": msgid,
+                "data": {"state": state},
+            }
+        )
+        assert coordinator._is_duplicate_mqtt_event(event) is False
 
 
 def test_async_send_command_refreshes_state_and_notifies_coordinator() -> None:
