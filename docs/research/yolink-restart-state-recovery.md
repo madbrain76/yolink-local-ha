@@ -4,7 +4,7 @@ Initially assessed 2026-10-12; integration behavior updated 2026-10-25. Scope: a
 
 ## Conclusion
 
-**No YoSmart-documented Local Hub mechanism other than `THSensor.getState` is guaranteed to return a complete last-known THSensor state after restart.** Home Assistant state restoration could preserve the last value Home Assistant already had, but that is local restoration, not a new value from the hub or device. The integration persists device-contact and replay-detection records, but does not restore measurement values or a complete device-state snapshot.
+**No YoSmart-documented Local Hub mechanism other than `THSensor.getState` is guaranteed to return a complete last-known THSensor state after restart.** Home Assistant state restoration could preserve the last value Home Assistant already had, but that is local restoration, not a new value from the hub or device. The integration persists device-contact and replay-detection records and each THSensor temperature and humidity reading with its sample time, but not a complete device-state snapshot.
 
 ## Verified findings
 
@@ -32,7 +32,7 @@ The documentation does **not** support treating `online` from an older successfu
 
 ## Current integration behavior
 
-- Startup restores the contact ledger, performs Home Assistant's first refresh, and the generic client issues `<device type>.getState`; there is no alternate THSensor query. Measurement values initially come from the HTTP response, not the ledger. [setup](../../custom_components/yolocal/__init__.py), [coordinator](../../custom_components/yolocal/coordinator.py), [client](../../custom_components/yolocal/api/client.py)
+- Startup restores the contact ledger, performs Home Assistant's first refresh, and the generic client issues `<device type>.getState`; there is no alternate THSensor query. Measurement values come from the HTTP response unless the store holds a newer sample for that field: `getState` carries only the last full report, never `DataRecord` samples ([issue #13](https://github.com/madbrain76/yolink-local-ha/issues/13), [captures](../../captures/devices/THSensor-2)). [setup](../../custom_components/yolocal/__init__.py), [coordinator](../../custom_components/yolocal/coordinator.py), [client](../../custom_components/yolocal/api/client.py)
 - MQTT subscribes to the report topic after connecting. The implementation does not explicitly configure a durable MQTT session, QoS, or a request for historical message replay. Persisted event identities detect duplicates received after reconnect or restart. [MQTT client](../../custom_components/yolocal/api/mqtt.py), [coordinator](../../custom_components/yolocal/coordinator.py)
 - Entities read measurement values from the coordinator's in-memory state. No integration entity subclasses a Home Assistant restore class or calls a restore API. [base entity](../../custom_components/yolocal/entity.py), [TH sensors](../../custom_components/yolocal/sensor.py)
 - `THSensor.DataRecord` batches can restore temperature and humidity from timestamped samples after subscribing, but do not contain a complete device state. This observed local behavior is described in [issue #12](https://github.com/madbrain76/yolink-local-ha/issues/12); it is not documented by the THSensor API page. Newer samples update readings without replacing newer full reports or changing full-report timestamps.

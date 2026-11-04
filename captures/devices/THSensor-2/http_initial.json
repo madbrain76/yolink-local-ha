@@ -1,0 +1,54 @@
+{
+  "captured_at": "2026-10-24T21:29:00+00:00",
+  "device_id": "THSensor-2",
+  "device_name": "THSensor-2",
+  "display_type": "THSensor",
+  "env_name": "YOLINK_TH_8015_SERIAL",
+  "raw_type": "THSensor",
+  "request": {
+    "method": "THSensor.getState",
+    "targetDevice": "THSensor-2"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": false,
+      "reportAt": "2026-10-24T17:30:56.287Z",
+      "state": {
+        "alarm": {
+          "code": 0,
+          "highHumidity": false,
+          "highTemp": false,
+          "lowBattery": false,
+          "lowHumidity": false,
+          "lowTemp": false,
+          "period": false
+        },
+        "battery": 4,
+        "batteryType": "Li",
+        "humidity": 61.6,
+        "humidityCorrection": 0,
+        "humidityLimit": {
+          "max": 100,
+          "min": 0
+        },
+        "interval": 0,
+        "mode": "f",
+        "recordInterval": 10,
+        "screenDuration": 1,
+        "state": "normal",
+        "tempCorrection": 0,
+        "tempLimit": {
+          "max": 1000,
+          "min": -1000
+        },
+        "temperature": 12.7,
+        "version": "1506"
+      }
+    },
+    "desc": "Success",
+    "method": "THSensor.getState",
+    "msgid": 1792877340639,
+    "time": 1792877340639
+  }
+}
