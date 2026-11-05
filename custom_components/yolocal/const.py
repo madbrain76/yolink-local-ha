@@ -3,6 +3,7 @@
 from datetime import timedelta
 
 DOMAIN = "yolocal"
+EVENT_DATA_RECORD = f"{DOMAIN}_data_record"
 
 # Configuration keys
 CONF_HUB_IP = "hub_ip"

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -17,23 +16,39 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .coordinator import YoLocalCoordinator
+from .coordinator import YoLocalCoordinator, state_has_battery
 from .entity import async_setup_device_entities, YoLocalEntity
 
 METER_STEP_FACTOR_SCALE = 100_000
 
 
-def _state_has_battery(state: dict[str, Any]) -> bool:
-    """Return True when a state payload carries a battery field."""
-    if "battery" in state:
-        return True
-    nested_state = state.get("state")
-    return isinstance(nested_state, dict) and "battery" in nested_state
-
-
 def _device_has_battery(coordinator: YoLocalCoordinator, device) -> bool:
-    """Return True when the current payload carries a battery field."""
-    return _state_has_battery(coordinator.get_state(device.device_id))
+    """Recognize battery support from the payload or a prior HA entity."""
+    return coordinator.device_has_battery(
+        device.device_id, coordinator.get_state(device.device_id)
+    )
+
+
+def _device_has_record_interval(coordinator: YoLocalCoordinator, device) -> bool:
+    """Discover sampling support from the THSensor payload."""
+    if device.device_type != "THSensor":
+        return False
+    state = coordinator.get_state(device.device_id)
+    nested = state.get("state")
+    return state.get("recordInterval") is not None or (
+        isinstance(nested, dict) and nested.get("recordInterval") is not None
+    )
+
+
+def _sensor_discovery_needed(coordinator, device, existing) -> bool:
+    """Discover optional diagnostics when their first payload arrives."""
+    return (
+        state_has_battery(coordinator.get_state(device.device_id))
+        and not any(isinstance(entity, YoLocalBatterySensor) for entity in existing)
+    ) or (
+        _device_has_record_interval(coordinator, device)
+        and not any(isinstance(entity, YoLocalTHRecordIntervalSensor) for entity in existing)
+    )
 
 
 def build_sensor_entities(
@@ -45,7 +60,7 @@ def build_sensor_entities(
         YoLocalFirmwareSensor(coordinator, device),
         YoLocalLastReportedSensor(coordinator, device),
     ]
-    if _device_has_battery(coordinator, device) or device.device_type == "WaterMeterController":
+    if _device_has_battery(coordinator, device):
         entities.insert(0, YoLocalBatterySensor(coordinator, device))
 
     if device.device_type == "THSensor":
@@ -54,6 +69,8 @@ def build_sensor_entities(
         if device.display_type == "THSensor":
             entities.append(YoLocalTHModeSensor(coordinator, device))
         entities.append(YoLocalTHIntervalSensor(coordinator, device))
+        if _device_has_record_interval(coordinator, device):
+            entities.append(YoLocalTHRecordIntervalSensor(coordinator, device))
         entities.append(
             YoLocalTHCorrectionSensor(coordinator, device, "temperature")
         )
@@ -133,6 +150,7 @@ async def async_setup_entry(
         entry,
         async_add_entities,
         build_sensor_entities,
+        refresh_needed=_sensor_discovery_needed,
     )
 
 
@@ -198,8 +216,16 @@ class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
         self._attr_unique_id = f"{device.device_id}_battery"
 
     @property
+    def available(self) -> bool:
+        """Keep the inferred empty battery visible when the device is offline."""
+        return True
+
+    @property
     def native_value(self) -> int | None:
         """Return the battery level as percentage."""
+        if not super().available:
+            return 0
+
         level = self.state_value("battery", fallback=True)
 
         if level is None:
@@ -245,7 +271,7 @@ class YoLocalLastReportedSensor(YoLocalEntity, SensorEntity):
     @property
     def native_value(self) -> datetime | None:
         """Return the last reported timestamp."""
-        for key in ("lastReportedAt", "reportAt"):
+        for key in ("reportAt", "lastContactAt", "lastReportedAt"):
             report_at = self.device_state.get(key)
             if not report_at:
                 continue
@@ -329,11 +355,11 @@ class YoLocalTHModeSensor(YoLocalEntity, SensorEntity):
 
 
 class YoLocalTHIntervalSensor(YoLocalEntity, SensorEntity):
-    """Reporting interval sensor for YoLink THSensor."""
+    """Continuous alert interval sensor for YoLink THSensor."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_native_unit_of_measurement = "min"
-    _attr_name = "Reporting interval"
+    _attr_name = "Continuous alert interval"
 
     def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
         """Initialize the sensor."""
@@ -342,8 +368,26 @@ class YoLocalTHIntervalSensor(YoLocalEntity, SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        """Return the reporting interval."""
+        """Return the interval between repeated alerts."""
         return self.state_value("interval", fallback=True)
+
+
+class YoLocalTHRecordIntervalSensor(YoLocalEntity, SensorEntity):
+    """Recording interval sensor for THSensor models that report it."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "min"
+    _attr_name = "Record interval"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_record_interval"
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the configured sample interval."""
+        return self.state_value("recordInterval", fallback=True)
 
 
 class YoLocalTHCorrectionSensor(YoLocalEntity, SensorEntity):

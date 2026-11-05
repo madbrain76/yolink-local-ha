@@ -7,24 +7,11 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 import paho.mqtt.client as mqtt
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _normalize_mqtt_time(timestamp_ms: Any) -> str | None:
-    """Convert hub MQTT `time` (epoch milliseconds) to ISO-8601 UTC."""
-    if timestamp_ms is None:
-        return None
-    try:
-        return datetime.fromtimestamp(float(timestamp_ms) / 1000, UTC).isoformat()
-    except (TypeError, ValueError, OSError):
-        return None
-
-
 @dataclass
 class DeviceEvent:
     """Represents an event received from a device."""
@@ -51,8 +38,6 @@ class DeviceEvent:
         else:
             event_data = {}
 
-        if mqtt_time := _normalize_mqtt_time(payload.get("time")):
-            event_data["lastReportedAt"] = mqtt_time
         if "online" not in event_data and "online" in payload:
             event_data["online"] = payload.get("online")
 
@@ -161,6 +146,8 @@ class YoLinkMQTTClient:
             return
         if self._connect_error is not None:
             raise self._connect_error
+        if connected.done() and not connected.cancelled():
+            raise ConnectionError("MQTT broker disconnected during connection")
         raise ConnectionError("Timed out connecting to MQTT broker")
 
     async def disconnect(self) -> None:
