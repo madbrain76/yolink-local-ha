@@ -30,6 +30,6 @@
     "time": 1792902657022
   },
   "raw_type": "THSensor",
-  "sequence": 3,
+  "sequence": 23,
   "topic": "ylsubnet/REDACTED_NET_ID/THSensor-2/report"
 }

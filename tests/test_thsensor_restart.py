@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -102,7 +102,7 @@ def run_first_session(monkeypatch) -> dict:
         load("http_initial.json")["response"]["data"],
     )
     assert readings(coordinator) == (12.7, 61.6)
-    for name in ("mqtt_0001.json", "mqtt_0002.json", "mqtt_0003.json"):
+    for name in ("mqtt_0021.json", "mqtt_0022.json", "mqtt_0023.json"):
         replay(coordinator, monkeypatch, name)
     assert readings(coordinator) == (14.3, 57.9)
     return coordinator._contact_store.data
@@ -112,13 +112,13 @@ def test_restart_keeps_recorded_samples_newer_than_get_state(monkeypatch) -> Non
     stored = run_first_session(monkeypatch)
 
     restarted = make_coordinator(stored)
-    poll(restarted, monkeypatch, "2026-10-25T04:45:00+00:00", get_state_after("mqtt_0001.json"))
+    poll(restarted, monkeypatch, "2026-10-25T04:45:00+00:00", get_state_after("mqtt_0021.json"))
 
     # Without the stored samples this would replay the 21:30Z report (17.2, 49.7).
     assert readings(restarted) == (14.3, 57.9)
-    assert restarted.get_state(DEVICE.device_id)["reportAt"] == load("mqtt_0001.json")["captured_at"]
+    assert restarted.get_state(DEVICE.device_id)["reportAt"] == load("mqtt_0021.json")["captured_at"]
 
-    replay(restarted, monkeypatch, "mqtt_0004.json")
+    replay(restarted, monkeypatch, "mqtt_0024.json")
     assert readings(restarted) == (14, 61.7)
 
 
@@ -126,9 +126,9 @@ def test_newer_full_report_beats_stored_samples_after_restart(monkeypatch) -> No
     stored = run_first_session(monkeypatch)
 
     restarted = make_coordinator(stored)
-    poll(restarted, monkeypatch, "2026-10-25T05:31:30+00:00", get_state_after("mqtt_0005.json"))
+    poll(restarted, monkeypatch, "2026-10-25T05:31:30+00:00", get_state_after("mqtt_0025.json"))
 
-    report = load("mqtt_0005.json")["mqtt_payload"]["data"]
+    report = load("mqtt_0025.json")["mqtt_payload"]["data"]
     assert readings(restarted) == (report["temperature"], report["humidity"])
 
 
@@ -150,6 +150,7 @@ def test_samples_are_stored_with_their_sample_time(monkeypatch) -> None:
         "bad",
         {"temperature": ["14.3", "2026-10-25T04:20:56+00:00"]},
         {"temperature": [True, "2026-10-25T04:20:56+00:00"]},
+        {"temperature": [float("nan"), "2026-10-25T04:20:56+00:00"]},
         {"temperature": [14.3, "not a time"]},
         {"temperature": [14.3]},
         {"pressure": [1013, "2026-10-25T04:20:56+00:00"]},
@@ -157,6 +158,51 @@ def test_samples_are_stored_with_their_sample_time(monkeypatch) -> None:
 )
 def test_malformed_stored_samples_are_ignored(monkeypatch, entry) -> None:
     restarted = make_coordinator({"th_measurements": {DEVICE.device_id: entry}})
-    poll(restarted, monkeypatch, "2026-10-25T04:45:00+00:00", get_state_after("mqtt_0001.json"))
+    poll(restarted, monkeypatch, "2026-10-25T04:45:00+00:00", get_state_after("mqtt_0021.json"))
 
     assert readings(restarted) == (17.2, 49.7)
+
+
+def test_event_without_readings_before_first_poll(monkeypatch) -> None:
+    """MQTT connects alongside the first refresh, so an event can beat it."""
+    stored = run_first_session(monkeypatch)
+    restarted = make_coordinator(stored)
+
+    # No reportAt, no measurements, fresh msgid: never filtered as a replay.
+    set_now(monkeypatch, "2026-10-25T04:44:00+00:00")
+    restarted._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "data": {"battery": 3},
+                "deviceId": DEVICE.device_id,
+                "event": "THSensor.Report",
+                "msgid": "9999999002",
+                "time": 1792903440000,  # 2026-10-25T04:44:00Z
+            }
+        )
+    )
+    poll(restarted, monkeypatch, "2026-10-25T04:45:00+00:00", get_state_after("mqtt_0021.json"))
+
+    assert readings(restarted) == (14.3, 57.9)
+
+
+def test_newer_report_before_first_poll_beats_stored_samples(monkeypatch) -> None:
+    stored = run_first_session(monkeypatch)
+    restarted = make_coordinator(stored)
+
+    replay(restarted, monkeypatch, "mqtt_0025.json")
+    poll(restarted, monkeypatch, "2026-10-25T05:31:30+00:00", get_state_after("mqtt_0025.json"))
+
+    report = load("mqtt_0025.json")["mqtt_payload"]["data"]
+    assert readings(restarted) == (report["temperature"], report["humidity"])
+
+
+def test_non_finite_readings_are_not_stored(monkeypatch) -> None:
+    coordinator = make_coordinator()
+    get_state = copy.deepcopy(load("http_initial.json")["response"]["data"])
+    get_state["state"]["temperature"] = float("nan")
+    poll(coordinator, monkeypatch, "2026-10-24T21:29:00+00:00", get_state)
+
+    assert coordinator._th_measurements == {
+        DEVICE.device_id: {"humidity": [61.6, "2026-10-24T17:30:56.287000+00:00"]}
+    }
