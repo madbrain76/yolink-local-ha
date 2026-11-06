@@ -157,7 +157,7 @@ To add, remove, or change the secondary address later, use **Settings -> Devices
 
 ### Temperature and humidity recordings
 
-Some THSensor models send recorded samples in `THSensor.DataRecord` MQTT batches between full state reports. The integration updates temperature and humidity from the newest valid samples, using their individual timestamps. Older batches and cached HTTP readings cannot replace newer measurements. A recent full report also takes precedence over older recorded samples delivered afterward.
+Some THSensor models send recorded samples in `THSensor.DataRecord` MQTT batches between full state reports. The integration updates temperature and humidity from the newest valid samples, using their individual timestamps. Older batches and cached HTTP readings cannot replace newer measurements. A recent full report also takes precedence over older recorded samples delivered afterward. Each reading is stored with its sample time, so after a restart a `getState` older than the newest recorded sample does not replace it.
 
 For devices that send a batch every 30 minutes with a 10-minute sampling interval, readings may lag by about 40 minutes rather than waiting for the next full report. The sampling and delivery schedules depend on the model and firmware.
 

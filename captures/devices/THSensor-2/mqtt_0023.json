@@ -1,0 +1,35 @@
+{
+  "captured_at": "2026-10-25T04:30:57.037485+00:00",
+  "device_id": "THSensor-2",
+  "device_name": "THSensor-2",
+  "display_type": "THSensor",
+  "env_name": "YOLINK_TH_8015_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "records": [
+        {
+          "humidity": 59.4,
+          "temperature": 14.5,
+          "time": "2026-10-25T04:00:56.000Z"
+        },
+        {
+          "humidity": 59,
+          "temperature": 14.5,
+          "time": "2026-10-25T04:10:56.000Z"
+        },
+        {
+          "humidity": 57.9,
+          "temperature": 14.3,
+          "time": "2026-10-25T04:20:56.000Z"
+        }
+      ]
+    },
+    "deviceId": "THSensor-2",
+    "event": "THSensor.DataRecord",
+    "msgid": "1792902657021",
+    "time": 1792902657022
+  },
+  "raw_type": "THSensor",
+  "sequence": 23,
+  "topic": "ylsubnet/REDACTED_NET_ID/THSensor-2/report"
+}

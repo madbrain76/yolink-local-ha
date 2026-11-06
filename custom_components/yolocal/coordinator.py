@@ -88,6 +88,16 @@ def _thsensor_measurement_timestamp(state: dict[str, Any], key: str) -> datetime
     return measured_at or _parse_timestamp(state.get("reportAt"))
 
 
+def _is_measurement(value: Any) -> bool:
+    """Accept a finite numeric TH reading, rejecting booleans and NaN."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return isfinite(value)
+    except OverflowError:
+        return False
+
+
 def state_has_battery(state: dict[str, Any]) -> bool:
     """Recognize battery capability from the device payload."""
     if "battery" in state:
@@ -172,6 +182,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._recent_mqtt_events: dict[str, float] = {}
         self._contact_events: dict[str, str] = {}
         self._contacts: dict[str, dict[str, str]] = {}
+        self._th_measurements: dict[str, dict[str, list[Any]]] = {}
         self._contact_store: Store[dict[str, Any]] = Store(
             hass,
             CONTACT_STORE_VERSION,
@@ -229,12 +240,90 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             }
         self._prune_contact_events(dt_util.utcnow())
 
+        th_measurements = stored.get("th_measurements")
+        if isinstance(th_measurements, dict):
+            for device_id, fields in th_measurements.items():
+                if not isinstance(device_id, str) or not isinstance(fields, dict):
+                    continue
+                valid = {
+                    key: [entry[0], entry[1]]
+                    for key, entry in fields.items()
+                    if key in TH_MEASUREMENT_FIELDS
+                    and isinstance(entry, list)
+                    and len(entry) == 2
+                    and _is_measurement(entry[0])
+                    and isinstance(entry[1], str)
+                    and _parse_timestamp(entry[1]) is not None
+                }
+                if valid:
+                    self._th_measurements[device_id] = valid
+
     def _contact_store_data(self) -> dict[str, Any]:
         """Return the bounded contact ledger persisted for the next restart."""
         return {
             "contacts": self._contacts,
             "contact_events": self._contact_events,
+            "th_measurements": self._th_measurements,
         }
+
+    def _record_th_measurements(self, device_id: str, state: dict[str, Any]) -> None:
+        """Persist each TH reading with its sample time when it advances.
+
+        ``getState`` carries only the last full report, so after a restart it
+        would otherwise replace newer ``DataRecord`` samples for up to 4 hours.
+        """
+        device = self._devices.get(device_id)
+        nested = state.get("state")
+        if device is None or device.device_type != "THSensor" or not isinstance(nested, dict):
+            return
+        stored = self._th_measurements.setdefault(device_id, {})
+        changed = False
+        for key in TH_MEASUREMENT_FIELDS:
+            value = nested.get(key)
+            measured_at = _thsensor_measurement_timestamp(state, key)
+            if not _is_measurement(value) or measured_at is None:
+                continue
+            previous = stored.get(key)
+            previous_at = _parse_timestamp(previous[1]) if previous else None
+            if previous_at is not None and measured_at <= previous_at:
+                continue
+            stored[key] = [value, measured_at.isoformat()]
+            changed = True
+        if not stored:
+            self._th_measurements.pop(device_id, None)
+        if changed:
+            self._schedule_contact_store_save()
+
+    def _with_stored_th_measurements(
+        self, device_id: str, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fold in each persisted TH reading newer than the cached one.
+
+        Applied by sample time rather than only to an empty cache: an MQTT
+        event without readings can arrive before the first poll after a restart.
+        """
+        stored = self._th_measurements.get(device_id)
+        if not stored:
+            return state
+        nested = state.get("state")
+        nested = dict(nested) if isinstance(nested, dict) else {}
+        times = state.get(TH_MEASUREMENT_TIMES)
+        times = dict(times) if isinstance(times, dict) else {}
+        changed = False
+        for key, (value, stored_at) in stored.items():
+            current_at = _thsensor_measurement_timestamp(state, key)
+            if (
+                nested.get(key) is not None
+                and current_at is not None
+                and _parse_timestamp(stored_at) <= current_at
+            ):
+                continue
+            nested[key] = value
+            times[key] = stored_at
+            changed = True
+        if not changed:
+            return state
+        return {**state, "state": nested, TH_MEASUREMENT_TIMES: times}
 
     def _schedule_contact_store_save(self) -> None:
         """Persist contact evidence without blocking MQTT event processing."""
@@ -243,13 +332,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     def _prune_contact_state(self, device_ids: set[str]) -> None:
         """Discard contact records for devices no longer owned by this entry."""
-        before = len(self._contacts)
+        before = len(self._contacts) + len(self._th_measurements)
         self._contacts = {
             device_id: record
             for device_id, record in self._contacts.items()
             if device_id in device_ids
         }
-        if len(self._contacts) != before:
+        self._th_measurements = {
+            device_id: fields
+            for device_id, fields in self._th_measurements.items()
+            if device_id in device_ids
+        }
+        if len(self._contacts) + len(self._th_measurements) != before:
             self._schedule_contact_store_save()
 
     def _prune_contact_events(self, now: datetime) -> None:
@@ -463,9 +557,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                         )
                     continue
                 merged = self._merge_state_payload(
-                    current_state,
+                    self._with_stored_th_measurements(device_id, current_state),
                     incoming_state,
                 )
+                self._record_th_measurements(device_id, merged)
                 self._record_report_contact(device_id, merged)
                 merged = self._apply_contact_record(device_id, merged)
                 refreshed_states[device_id] = self._battery_liveness_state(
@@ -849,12 +944,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             valid_record: dict[str, Any] = {"time": record["time"]}
             for key in TH_MEASUREMENT_FIELDS:
                 value = record.get(key)
-                if not isinstance(value, (int, float)) or isinstance(value, bool):
-                    continue
-                try:
-                    if not isfinite(value):
-                        continue
-                except OverflowError:
+                if not _is_measurement(value):
                     continue
                 valid_record[key] = value
                 if key not in latest or recorded_at > latest[key][0]:
@@ -976,6 +1066,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     def _update_device_state(self, device_id: str, state: dict[str, Any]) -> None:
         """Store updated device state and notify listeners."""
         self._states[device_id] = state
+        self._record_th_measurements(device_id, state)
         self.async_set_updated_data(self._states.copy())
 
     def _log_device_unavailable(
