@@ -48,6 +48,11 @@ MQTT_DUPLICATE_WINDOW = 300.0
 MQTT_DUPLICATE_CACHE_LIMIT = 256
 MQTT_CONTACT_EVENT_WINDOW = timedelta(hours=24)
 MQTT_CONTACT_EVENT_CACHE_LIMIT = 1024
+# HA's Store refuses to load a file whose version differs when no migration is
+# supplied, which would leave the store disabled and contacts unpersisted. The
+# loader below validates each key permissively, so adding a payload key stays
+# backward and forward compatible; raise this only together with a migrate
+# function, and expect the contact ledger to be rebuilt from live traffic.
 CONTACT_STORE_VERSION = 1
 TH_MEASUREMENT_FIELDS = ("temperature", "humidity")
 TH_MEASUREMENT_TIMES = "_thMeasurementTimes"
@@ -211,7 +216,13 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         try:
             stored = await self._contact_store.async_load()
         except Exception:  # Storage must not prevent integration startup.
-            _LOGGER.debug("Could not load YoLink device contact state", exc_info=True)
+            # Availability inference depends on this ledger, so losing it is
+            # worth a line the user can find without debug logging enabled.
+            _LOGGER.warning(
+                "Could not load YoLink device contact state; offline detection"
+                " and duplicate filtering start empty for this session",
+                exc_info=True,
+            )
             return
 
         self._contact_store_enabled = True
@@ -840,9 +851,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         try:
             await mqtt_client.connect()
-            if not getattr(mqtt_client, "is_connected", True):
-                # The session dropped between CONNACK and here.
-                raise ConnectionError(f"MQTT session to {host} dropped on connect")
             self._mqtt_clients[host] = mqtt_client
             _LOGGER.info("Connected to YoLink MQTT broker at %s", host)
         except Exception as err:
@@ -963,7 +971,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         if not latest:
             return
-        previous = self._states.get(event.device_id, {})
+        previous = self._with_stored_th_measurements(
+            event.device_id,
+            self._states.get(event.device_id, {}),
+        )
         previous_nested = previous.get("state")
         updates = {}
         for key, (recorded_at, value) in latest.items():

@@ -25,33 +25,42 @@ from custom_components.yolocal.sensor import (
 )
 
 
-@pytest.fixture
-def thsensor(monkeypatch):
-    now = datetime(2026, 10, 24, 21, 30, 56, tzinfo=UTC)
-    monkeypatch.setattr(dt_util, "utcnow", lambda: now)
-    hass = SimpleNamespace(bus=SimpleNamespace(async_fire=Mock()))
-    coordinator = YoLocalCoordinator(
-        hass=hass,
+def _new_coordinator() -> YoLocalCoordinator:
+    """Build a coordinator the way a fresh integration setup would."""
+    return YoLocalCoordinator(
+        hass=SimpleNamespace(bus=SimpleNamespace(async_fire=Mock())),
         client=SimpleNamespace(host="127.0.0.1"),
         token_manager=SimpleNamespace(client_id="test"),
         session=SimpleNamespace(),
         config_entry_id="entry",
         net_id="test",
     )
+
+
+def full_report(now: datetime) -> dict:
+    """Return the hub's cached full-report payload for the fixture device."""
+    return {
+        "online": True,
+        "reportAt": (now - timedelta(hours=4)).isoformat(),
+        "state": {
+            "temperature": 15.0,
+            "humidity": 45.0,
+            "battery": 4,
+            "interval": 0,
+            "recordInterval": 10,
+        },
+    }
+
+
+@pytest.fixture
+def thsensor(monkeypatch):
+    now = datetime(2026, 10, 24, 21, 30, 56, tzinfo=UTC)
+    monkeypatch.setattr(dt_util, "utcnow", lambda: now)
+    coordinator = _new_coordinator()
     device = Device("test-th", "Test TH", "unused", "THSensor", "THSensor", "YS8015-UC")
     coordinator._devices[device.device_id] = device
     coordinator._states[device.device_id] = coordinator._normalize_http_state(
-        {
-            "online": True,
-            "reportAt": (now - timedelta(hours=4)).isoformat(),
-            "state": {
-                "temperature": 15.0,
-                "humidity": 45.0,
-                "battery": 4,
-                "interval": 0,
-                "recordInterval": 10,
-            },
-        },
+        full_report(now),
         device,
     )
     return coordinator, device, now
@@ -386,3 +395,59 @@ def test_record_interval_is_discovered_when_report_arrives_after_setup(thsensor)
     ]
     assert len(record_entities) == 1
     assert record_entities[0].native_value == 10
+
+
+def test_reload_keeps_newest_recorded_sample_over_older_full_report(thsensor):
+    """Keep recorded samples across a reload instead of replaying an older report.
+
+    Regression for https://github.com/madbrain76/yolink-local-ha/issues/13.
+    """
+    coordinator, device, now = thsensor
+    coordinator._contact_store_enabled = True
+
+    coordinator._on_device_event(data_record(device, now, [sample(now)]))
+    assert readings(coordinator, device) == (17.1, 49.2)
+
+    saved = coordinator._contact_store_data()
+
+    restored = _new_coordinator()
+    restored._devices[device.device_id] = device
+    restored._contact_store.data = saved
+    asyncio.run(restored._async_load_contact_state())
+    restored._client = SimpleNamespace(
+        host="127.0.0.1",
+        get_state=lambda _device: asyncio.sleep(0, result=full_report(now)),
+    )
+    asyncio.run(restored._fetch_all_states())
+
+    state = restored.get_state(device.device_id)
+    assert readings(restored, device) == (17.1, 49.2)
+    assert state["reportAt"] == (now - timedelta(hours=4)).isoformat()
+
+
+def test_record_batch_fills_fields_it_did_not_carry(thsensor):
+    """Apply stored samples for fields a batch omits, matching the poll path.
+
+    Both merge bases must consult the persisted samples by sample time, so the
+    result cannot depend on which of a poll and a batch arrived first.
+    """
+    coordinator, device, now = thsensor
+    coordinator._contact_store_enabled = True
+    coordinator._on_device_event(data_record(device, now, [sample(now)]))
+    saved = coordinator._contact_store_data()
+
+    restored = _new_coordinator()
+    restored._devices[device.device_id] = device
+    restored._contact_store.data = saved
+    asyncio.run(restored._async_load_contact_state())
+
+    restored._on_device_event(
+        data_record(
+            device,
+            now,
+            [{"temperature": 99.9, "time": now.isoformat()}],
+            msgid="temperature-only-batch",
+        )
+    )
+
+    assert readings(restored, device) == (99.9, 49.2)

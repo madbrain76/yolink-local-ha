@@ -12,6 +12,12 @@ from typing import Any
 import paho.mqtt.client as mqtt
 
 _LOGGER = logging.getLogger(__name__)
+
+# paho's thread can be stuck in a socket connect or its 1 s reconnect sleep, so
+# a bounded join keeps one wedged broker from stalling HA shutdown.
+_LOOP_STOP_TIMEOUT_SECONDS = 5.0
+
+
 @dataclass
 class DeviceEvent:
     """Represents an event received from a device."""
@@ -92,11 +98,6 @@ class YoLinkMQTTClient:
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
-    def is_connected(self) -> bool:
-        """Return True while the broker session is up."""
-        return self._connected.is_set()
-
-    @property
     def topic(self) -> str:
         """Return the subscription topic."""
         return f"ylsubnet/{self._net_id}/+/report"
@@ -157,8 +158,21 @@ class YoLinkMQTTClient:
             client, self._client = self._client, None
             client.disconnect()
             # loop_stop() joins paho's thread, which can sit in a socket
-            # connect or a 1 s reconnect sleep; keep that off the event loop.
-            await asyncio.get_running_loop().run_in_executor(None, client.loop_stop)
+            # connect or a 1 s reconnect sleep; keep that off the event loop and
+            # stop waiting if the thread never wakes up. The thread leaks in that
+            # case, but waiting on it forever would stall shutdown and block
+            # reconnecting every other hub interface behind it.
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(None, client.loop_stop),
+                    timeout=_LOOP_STOP_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                _LOGGER.warning(
+                    "MQTT network loop at %s did not stop within %s s",
+                    self._host,
+                    _LOOP_STOP_TIMEOUT_SECONDS,
+                )
         self._connected.clear()
 
     def _on_connect(

@@ -1,6 +1,6 @@
 [project]
 name = "yolink-local-ha"
-version = "0.5.8"
+version = "0.5.9"
 description = "Home Assistant integration for YoLink Local Hub devices (MQTT + HTTP)"
 readme = "README.md"
 requires-python = ">=3.12"

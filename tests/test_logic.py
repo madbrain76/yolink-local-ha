@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import asyncio
 import json
 import logging
+import threading
 
 import aiohttp
 import pytest
@@ -2896,6 +2897,52 @@ def test_mqtt_connect_rejects_immediate_disconnect(monkeypatch) -> None:
             await client.disconnect()
 
     asyncio.run(connect_and_close())
+
+
+def test_mqtt_disconnect_bounds_blocking_loop_stop(monkeypatch, caplog) -> None:
+    """A wedged paho thread must not hold MQTT disconnect open forever."""
+    release = threading.Event()
+
+    class BlockingPahoClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def username_pw_set(self, *_args) -> None:
+            pass
+
+        def connect_async(self, *_args, **_kwargs) -> None:
+            pass
+
+        def loop_start(self) -> None:
+            self.on_connect(self, None, None, 0)
+
+        def subscribe(self, _topic) -> None:
+            pass
+
+        def loop_stop(self) -> None:
+            release.wait(timeout=2)
+
+        def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "custom_components.yolocal.api.mqtt.mqtt.Client", BlockingPahoClient
+    )
+    monkeypatch.setattr(
+        "custom_components.yolocal.api.mqtt._LOOP_STOP_TIMEOUT_SECONDS", 0.05
+    )
+    client = YoLinkMQTTClient("hub.local", "net", "client", "token")
+
+    async def connect_and_close() -> None:
+        await client.connect()
+        await client.disconnect()
+        release.set()
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.yolocal.api.mqtt"):
+        asyncio.run(connect_and_close())
+
+    release.set()
+    assert "did not stop" in caplog.text
 
 
 def test_shutdown_closes_retired_mqtt_client() -> None:

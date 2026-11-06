@@ -115,7 +115,12 @@ class TokenManager:
             self._expires_at = expires_at
 
     def invalidate_token(self, host: str) -> None:
-        """Drop a cached token the hub has rejected so the next use fetches a new one."""
+        """Drop a cached token the hub has rejected so the next use fetches a new one.
+
+        The hub issues a single token per host that both the HTTP API and the
+        MQTT broker accept, so rejecting either protocol evicts the shared
+        credential and the next request of either kind re-authenticates.
+        """
         self._host_tokens.pop(host, None)
         if host == self.host:
             self._token = None
