@@ -114,6 +114,13 @@ class TokenManager:
             self._token = token
             self._expires_at = expires_at
 
+    def invalidate_token(self, host: str) -> None:
+        """Drop a cached token the hub has rejected so the next use fetches a new one."""
+        self._host_tokens.pop(host, None)
+        if host == self.host:
+            self._token = None
+            self._expires_at = 0
+
     def switch_host(self) -> bool:
         """Switch to the next configured host and invalidate the cached token."""
         if len(self._hosts) <= 1:

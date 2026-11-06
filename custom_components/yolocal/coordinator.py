@@ -25,6 +25,7 @@ from .api import (
     ApiError,
     Device,
     DeviceEvent,
+    MQTTAuthError,
     TokenManager,
     YoLinkClient,
     YoLinkMQTTClient,
@@ -839,9 +840,17 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         try:
             await mqtt_client.connect()
+            if not getattr(mqtt_client, "is_connected", True):
+                # The session dropped between CONNACK and here.
+                raise ConnectionError(f"MQTT session to {host} dropped on connect")
             self._mqtt_clients[host] = mqtt_client
             _LOGGER.info("Connected to YoLink MQTT broker at %s", host)
-        except Exception:
+        except Exception as err:
+            if isinstance(err, MQTTAuthError) and hasattr(
+                self._token_manager, "invalidate_token"
+            ):
+                # The hub no longer accepts this token; fetch a new one next try.
+                self._token_manager.invalidate_token(host)
             try:
                 await mqtt_client.disconnect()
             except Exception:

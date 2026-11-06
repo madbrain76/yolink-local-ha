@@ -7,13 +7,14 @@ Local Hub. It has no Home Assistant dependencies.
 from .auth import AuthenticationError, TokenManager
 from .client import ApiError, YoLinkClient, create_client
 from .device import Device
-from .mqtt import DeviceEvent, YoLinkMQTTClient
+from .mqtt import DeviceEvent, MQTTAuthError, YoLinkMQTTClient
 
 __all__ = [
     "ApiError",
     "AuthenticationError",
     "Device",
     "DeviceEvent",
+    "MQTTAuthError",
     "TokenManager",
     "YoLinkClient",
     "YoLinkMQTTClient",
