@@ -16,8 +16,8 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .coordinator import YoLocalCoordinator, state_has_battery
-from .entity import async_setup_device_entities, YoLocalEntity
+from .coordinator import YoLocalCoordinator
+from .entity import YoLocalEntity, async_setup_device_entities
 
 METER_STEP_FACTOR_SCALE = 100_000
 
@@ -41,14 +41,20 @@ def _device_has_record_interval(coordinator: YoLocalCoordinator, device) -> bool
 
 
 def _sensor_discovery_needed(coordinator, device, existing) -> bool:
-    """Discover optional diagnostics when their first payload arrives."""
-    return (
-        state_has_battery(coordinator.get_state(device.device_id))
-        and not any(isinstance(entity, YoLocalBatterySensor) for entity in existing)
-    ) or (
-        _device_has_record_interval(coordinator, device)
-        and not any(isinstance(entity, YoLocalTHRecordIntervalSensor) for entity in existing)
+    """Rebuild entities when an optional diagnostic should appear or retire.
+
+    Comparing both directions is what lets a battery sensor for a device the hub
+    never reports a level for be removed instead of lingering forever.
+    """
+    battery_wanted = _device_has_battery(coordinator, device)
+    battery_present = any(
+        isinstance(entity, YoLocalBatterySensor) for entity in existing
     )
+    record_wanted = _device_has_record_interval(coordinator, device)
+    record_present = any(
+        isinstance(entity, YoLocalTHRecordIntervalSensor) for entity in existing
+    )
+    return battery_wanted != battery_present or record_wanted != record_present
 
 
 def build_sensor_entities(
@@ -151,6 +157,7 @@ async def async_setup_entry(
         async_add_entities,
         build_sensor_entities,
         refresh_needed=_sensor_discovery_needed,
+        retirable_suffixes=("_battery",),
     )
 
 

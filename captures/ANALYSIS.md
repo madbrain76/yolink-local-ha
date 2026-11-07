@@ -250,3 +250,44 @@ Safer options:
 
 - keep the current nested merge behavior
 - or normalize MQTT payloads into HTTP-like nested shape before storing them
+
+## Addendum: Outlet capture, 2026-11-07
+
+The original scope above covers a 300-second window over seven devices and does
+not include an Outlet. A separate 150-second capture was taken while the device
+was switched at its physical button, giving four `Outlet.StatusChange` frames,
+sixty-nine periodic reports, and matching `getState` calls. Six representative
+frames are kept under [devices/Outlet-1](devices/Outlet-1).
+
+Device: `Outlet-1` (`Outlet`)
+
+HTTP `getState` response `data`:
+
+```json
+{"delay":{"ch":1,"off":0,"on":0},"loraInfo":{"devNetType":"A","gatewayId":"","gateways":1,"location":{"altitude":0,"latitude":0,"longitude":0},"signal":0},"power":754,"state":"open","time":{},"tz":-8,"version":"1404","watt":14040}
+```
+
+MQTT `Outlet.StatusChange` payload `data`:
+
+```json
+{"loraInfo":{"devNetType":"A","gatewayId":"","gateways":1,"signal":0},"state":"closed"}
+```
+
+Observed differences:
+
+- Outlet is the first captured family whose HTTP fields sit directly on
+  `response.data` rather than nested under `response.data.state`, so `data.state`
+  is the open/closed string itself and the nested-state lookup finds nothing
+- `Outlet.StatusChange` carries only `state` and `loraInfo`, so a state change
+  alone refreshes nothing else and periodic reports carry the metering fields
+- `power` and `watt` advance between reports and are not derived from each other
+
+Functional implication:
+
+- No `battery` or `batteryType` key appeared in any of the 146 captured
+  payloads, in HTTP or MQTT, periodic or on state change. The hub does not
+  report a battery level for this Outlet, so a Battery diagnostic entity for it
+  has no payload support at all. The coordinator therefore derives battery
+  capability from payloads only and persists the device ids that ever actually
+  reported a level, rather than trusting a battery entity left in the Home
+  Assistant entity registry.

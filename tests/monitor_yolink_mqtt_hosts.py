@@ -15,7 +15,6 @@ from typing import Any
 
 import aiohttp
 import paho.mqtt.client as mqtt
-
 from yolink_tooling_common import HUB_HTTP_PORT, HUB_MQTT_PORT, normalize_host
 
 
@@ -188,7 +187,7 @@ async def run(args: argparse.Namespace) -> int:
         print("Hosts:", ", ".join(monitors))
         try:
             await asyncio.wait_for(done.wait(), timeout=args.timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print(f"Timed out after {args.timeout}s")
         finally:
             done.set()

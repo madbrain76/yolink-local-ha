@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.util import dt as dt_util
 

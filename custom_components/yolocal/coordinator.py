@@ -13,7 +13,6 @@ from time import monotonic
 from typing import Any
 
 import aiohttp
-
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -189,6 +188,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._contact_events: dict[str, str] = {}
         self._contacts: dict[str, dict[str, str]] = {}
         self._th_measurements: dict[str, dict[str, list[Any]]] = {}
+        self._battery_device_ids: set[str] = set()
         self._contact_store: Store[dict[str, Any]] = Store(
             hass,
             CONTACT_STORE_VERSION,
@@ -203,13 +203,36 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return self._devices
 
     def device_has_battery(self, device_id: str, state: dict[str, Any]) -> bool:
-        """Recognize battery support from current or previously registered data."""
-        if state_has_battery(state):
-            return True
-        registry = er.async_get(self.hass)
-        return registry.async_get_entity_id(
-            "sensor", DOMAIN, f"{device_id}_battery"
-        ) is not None
+        """Recognize battery support from durable payload evidence only.
+
+        The cache is deliberately not consulted: merging keeps earlier keys, so a
+        stray battery field once stored would keep the entity alive forever. Only
+        a raw payload that actually carried a level adds a device to the set.
+        """
+        return device_id in self._battery_device_ids
+
+    def _remember_battery_capability(self, device_id: str) -> None:
+        """Record durable evidence that a device reports a battery level.
+
+        Callers must pass a freshly received payload. Merged cache state always
+        keeps its earlier keys, so testing that instead would promote one stray
+        field into permanent capability.
+        """
+        if device_id in self._battery_device_ids:
+            return
+        self._battery_device_ids.add(device_id)
+        self._schedule_contact_store_save()
+
+    def _forget_battery_capability(self, device_id: str) -> None:
+        """Drop capability when an authoritative read reports no battery.
+
+        Only a successful, non-empty ``getState`` qualifies, so a partial command
+        read-back can never strip a real battery device.
+        """
+        if device_id not in self._battery_device_ids:
+            return
+        self._battery_device_ids.discard(device_id)
+        self._schedule_contact_store_save()
 
     async def _async_load_contact_state(self) -> None:
         """Restore durable device-contact and replay-detection state."""
@@ -270,12 +293,19 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 if valid:
                     self._th_measurements[device_id] = valid
 
+        battery_devices = stored.get("battery_devices")
+        if isinstance(battery_devices, list):
+            self._battery_device_ids = {
+                device_id for device_id in battery_devices if isinstance(device_id, str)
+            }
+
     def _contact_store_data(self) -> dict[str, Any]:
         """Return the bounded contact ledger persisted for the next restart."""
         return {
             "contacts": self._contacts,
             "contact_events": self._contact_events,
             "th_measurements": self._th_measurements,
+            "battery_devices": sorted(self._battery_device_ids),
         }
 
     def _record_th_measurements(self, device_id: str, state: dict[str, Any]) -> None:
@@ -344,7 +374,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     def _prune_contact_state(self, device_ids: set[str]) -> None:
         """Discard contact records for devices no longer owned by this entry."""
-        before = len(self._contacts) + len(self._th_measurements)
+        before = (
+            len(self._contacts)
+            + len(self._th_measurements)
+            + len(self._battery_device_ids)
+        )
         self._contacts = {
             device_id: record
             for device_id, record in self._contacts.items()
@@ -355,7 +389,16 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             for device_id, fields in self._th_measurements.items()
             if device_id in device_ids
         }
-        if len(self._contacts) + len(self._th_measurements) != before:
+        self._battery_device_ids = {
+            device_id
+            for device_id in self._battery_device_ids
+            if device_id in device_ids
+        }
+        if (
+            len(self._contacts)
+            + len(self._th_measurements)
+            + len(self._battery_device_ids)
+        ) != before:
             self._schedule_contact_store_save()
 
     def _prune_contact_events(self, now: datetime) -> None:
@@ -431,8 +474,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return f"{event.device_id}|{event.event}|{msgid}"
         return None
 
-    def _is_replayed_contact_event(self, event: DeviceEvent) -> bool:
-        """Ignore a previously seen MQTT event before it can revive a device."""
+    def _claim_contact_event(self, event: DeviceEvent) -> bool:
+        """Claim an event identity, or report that it was already claimed.
+
+        Registers the identity and schedules a save, so this is not a pure test.
+        """
         event_id = self._mqtt_contact_identity(event)
         if event_id is None:
             return False
@@ -568,6 +614,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                             device_id, current_state, incoming_state
                         )
                     continue
+                if state_has_battery(incoming_state):
+                    self._remember_battery_capability(device_id)
+                else:
+                    self._forget_battery_capability(device_id)
                 merged = self._merge_state_payload(
                     self._with_stored_th_measurements(device_id, current_state),
                     incoming_state,
@@ -715,7 +765,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Send a command, recovering one ambiguous transport failure."""
         try:
             return await self._async_set_state_with_retry(device, params)
-        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as err:
+        except (TimeoutError, aiohttp.ClientConnectionError) as err:
             if hasattr(self._client, "switch_host"):
                 self._client.switch_host()
             await asyncio.sleep(SET_STATE_TRANSPORT_RETRY_DELAY)
@@ -738,8 +788,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
             try:
                 return await self._async_set_state_with_retry(device, params, attempts=1)
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
-                raise err
+            except (TimeoutError, aiohttp.ClientConnectionError):
+                raise err from None
 
     def _state_matches_command(
         self,
@@ -789,36 +839,80 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
-        for mqtt_client in [
+        clients = [
             *self._retired_mqtt_clients,
             *self._mqtt_clients.values(),
-        ]:
-            await mqtt_client.disconnect()
+        ]
+        results = await asyncio.gather(
+            *(mqtt_client.disconnect() for mqtt_client in clients),
+            return_exceptions=True,
+        )
+        for mqtt_client, result in zip(clients, results, strict=True):
+            if isinstance(result, Exception):
+                _LOGGER.warning(
+                    "Error disconnecting MQTT client at %s: %s",
+                    mqtt_client.host,
+                    result,
+                )
         self._retired_mqtt_clients.clear()
         self._mqtt_clients.clear()
         await self._session.close()
 
+    async def _async_connect_hosts(self, hosts: list[str]) -> dict[str, Exception]:
+        """Connect hosts concurrently and return failures keyed by host.
+
+        Interfaces are attempted in parallel so a dead address cannot make a
+        healthy one wait out the connect timeout before it is even tried.
+        """
+        if not hosts:
+            return {}
+        results = await asyncio.gather(
+            *(self._connect_mqtt_host(host) for host in hosts),
+            return_exceptions=True,
+        )
+        failures: dict[str, Exception] = {}
+        for host, result in zip(hosts, results, strict=True):
+            if isinstance(result, BaseException):
+                if not isinstance(result, Exception):
+                    raise result
+                failures[host] = result
+        return failures
+
+    async def _async_close_retired_clients(self) -> None:
+        """Close retired clients concurrently so one wedge delays no other."""
+        if not self._retired_mqtt_clients:
+            return
+        retired = list(self._retired_mqtt_clients)
+        self._retired_mqtt_clients.clear()
+        results = await asyncio.gather(
+            *(client.disconnect() for client in retired),
+            return_exceptions=True,
+        )
+        for client, result in zip(retired, results, strict=True):
+            if isinstance(result, BaseException):
+                if not isinstance(result, Exception):
+                    raise result
+                _LOGGER.warning(
+                    "Failed to close disconnected MQTT client at %s: %s",
+                    client.host,
+                    type(result).__name__,
+                )
+
     async def _connect_mqtt(self) -> None:
         """Connect to all configured MQTT brokers."""
-        connected_hosts: list[str] = []
-        last_error: Exception | None = None
-        for host in self._mqtt_hosts:
-            try:
-                await self._connect_mqtt_host(host)
-            except Exception as err:
-                last_error = err
-                _LOGGER.warning(
-                    "Failed to connect to YoLink MQTT broker at %s",
-                    host,
-                    exc_info=True,
-                )
-            else:
-                connected_hosts.append(host)
-
-        if not connected_hosts:
-            if last_error is not None:
-                raise last_error
+        hosts = list(self._mqtt_hosts)
+        if not hosts:
             raise ConnectionError("No YoLink MQTT hosts configured")
+
+        failures = await self._async_connect_hosts(hosts)
+        for host, err in failures.items():
+            _LOGGER.warning(
+                "Failed to connect to YoLink MQTT broker at %s",
+                host,
+                exc_info=err,
+            )
+        if len(failures) == len(hosts):
+            raise list(failures.values())[-1]
 
     @property
     def _mqtt_hosts(self) -> tuple[str, ...]:
@@ -876,6 +970,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if device is None:
             _LOGGER.debug("Ignoring event for unknown device: %s", device_id)
             return
+        if state_has_battery(event.data):
+            self._remember_battery_capability(device_id)
         if self._is_duplicate_mqtt_event(event):
             _LOGGER.debug(
                 "Ignoring duplicate MQTT event for %s: %s",
@@ -890,7 +986,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 event.event,
             )
             return
-        if self._is_replayed_contact_event(event):
+        if self._claim_contact_event(event):
             _LOGGER.debug(
                 "Ignoring replayed MQTT event for %s: %s",
                 device_id,
@@ -1368,16 +1464,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Reconnect missing MQTT clients with backoff."""
         backoff_seconds = 5
         while not self._shutdown:
-            while self._retired_mqtt_clients:
-                client = self._retired_mqtt_clients[0]
-                try:
-                    await client.disconnect()
-                except Exception as err:
-                    _LOGGER.warning(
-                        "Failed to close disconnected MQTT client: %s",
-                        type(err).__name__,
-                    )
-                self._retired_mqtt_clients.pop(0)
+            await self._async_close_retired_clients()
 
             missing_hosts = [
                 host for host in self._mqtt_hosts if host not in self._mqtt_clients
@@ -1385,15 +1472,13 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             if not missing_hosts:
                 return
 
-            for host in missing_hosts:
-                try:
-                    await self._connect_mqtt_host(host)
-                except Exception:
-                    _LOGGER.warning(
-                        "Failed to reconnect YoLink MQTT broker at %s",
-                        host,
-                        exc_info=True,
-                    )
+            failures = await self._async_connect_hosts(missing_hosts)
+            for host, err in failures.items():
+                _LOGGER.warning(
+                    "Failed to reconnect YoLink MQTT broker at %s",
+                    host,
+                    exc_info=err,
+                )
 
             if (
                 all(host in self._mqtt_clients for host in self._mqtt_hosts)

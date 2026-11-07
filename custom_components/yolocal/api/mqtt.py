@@ -98,6 +98,11 @@ class YoLinkMQTTClient:
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
+    def host(self) -> str:
+        """Return the broker address this client connects to."""
+        return self._host
+
+    @property
     def topic(self) -> str:
         """Return the subscription topic."""
         return f"ylsubnet/{self._net_id}/+/report"

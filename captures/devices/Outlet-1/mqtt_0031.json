@@ -1,0 +1,25 @@
+{
+  "captured_at": "2026-11-07T01:19:58.211508+00:00",
+  "device_id": "Outlet-1",
+  "device_name": "Outlet-1",
+  "display_type": "Outlet",
+  "env_name": "YOLINK_OUTLET_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "state": "open"
+    },
+    "deviceId": "Outlet-1",
+    "event": "Outlet.StatusChange",
+    "msgid": "1794014398206",
+    "time": 1794014398208
+  },
+  "raw_type": "Outlet",
+  "sequence": 43,
+  "topic": "ylsubnet/REDACTED_NET_ID/Outlet-1/report"
+}

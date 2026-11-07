@@ -12,8 +12,7 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import YoLocalCoordinator
-from .entity import async_setup_device_entities, YoLocalEntity
-
+from .entity import YoLocalEntity, async_setup_device_entities
 
 DEVICE_TYPE_TO_CLASS = {
     "DoorSensor": BinarySensorDeviceClass.DOOR,

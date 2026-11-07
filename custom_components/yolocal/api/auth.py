@@ -8,6 +8,8 @@ from collections.abc import Sequence
 
 import aiohttp
 
+from ..const import TOKEN_ENDPOINT
+
 
 class AuthenticationError(Exception):
     """Raised when authentication fails."""
@@ -89,12 +91,6 @@ class TokenManager:
                 return cached_token
             return await self._refresh_host(host)
 
-    def _is_expired(self) -> bool:
-        """Check if the token is expired or about to expire."""
-        if self._token is None:
-            return True
-        return time.time() >= (self._expires_at - self.REFRESH_BUFFER_SECONDS)
-
     def _cached_token(self, host: str) -> str | None:
         """Return the cached token for a host when it is still valid."""
         cached = self._host_tokens.get(host)
@@ -162,7 +158,7 @@ class TokenManager:
             "client_id": self._client_id,
             "client_secret": self._client_secret,
         }
-        url = f"http://{host}:{self._port}/open/yolink/token"
+        url = f"http://{host}:{self._port}{TOKEN_ENDPOINT}"
         async with self._session.post(url, data=data) as resp:
             resp.raise_for_status()
             result = await resp.json()

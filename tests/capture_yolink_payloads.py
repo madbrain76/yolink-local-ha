@@ -5,25 +5,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import json
-import os
 from pathlib import Path
-import time
 from typing import Any
 
 import aiohttp
 import paho.mqtt.client as mqtt
-
 from yolink_tooling_common import (
     HUB_HTTP_PORT,
     HUB_MQTT_PORT,
     normalize_display_type,
     normalize_host,
 )
-
 
 SERIAL_SUFFIX = "_SERIAL"
 REDACTED = "REDACTED"
@@ -102,9 +99,7 @@ def sanitize_value(
                 sanitized[key] = "REDACTED_HOST"
             elif key in {"net_id", "netId", "net"}:
                 sanitized[key] = "REDACTED_NET_ID"
-            elif key in {"deviceId", "targetDevice", "device_id"} and isinstance(item, str):
-                sanitized[key] = device_aliases.get(item, REDACTED)
-            elif key in {"name", "device_name"} and isinstance(item, str):
+            elif (key in {"deviceId", "targetDevice", "device_id"} and isinstance(item, str)) or (key in {"name", "device_name"} and isinstance(item, str)):
                 sanitized[key] = device_aliases.get(item, REDACTED)
             elif key in {"appEui"}:
                 sanitized[key] = REDACTED
@@ -528,7 +523,7 @@ async def run_capture(args: argparse.Namespace) -> int:
     finally:
         if mqtt_client:
             mqtt_client.disconnect()
-            time.sleep(0.2)
+            await asyncio.sleep(0.2)
             mqtt_client.loop_stop()
         for task in list(pending_http):
             task.cancel()

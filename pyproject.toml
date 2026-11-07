@@ -8,3 +8,22 @@ dependencies = [
     "aiohttp>=3.9.0",
     "paho-mqtt>=2.1.0",
 ]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# CI pins this ruff version, so the enforced rules are declared here rather than
+# inherited from defaults: ruff's default set changed materially between 0.15 and
+# 0.17, which silently redefined what a passing lint meant.
+select = ["E4", "E7", "E9", "F", "I", "UP", "SIM", "B", "RET", "RUF", "ASYNC", "EXE"]
+# SIM102 wants nested conditions collapsed; this project's review style keeps
+# conditions explicit. BLE001 is deliberately left unselected because broad
+# excepts at Home Assistant boundaries are intentional: a storage or callback
+# failure must never take down setup or the poll cycle.
+ignore = ["SIM102"]
+
+[tool.ruff.lint.per-file-ignores]
+# These are one-shot operator CLIs, not integration code on the Home Assistant
+# event loop, so brief blocking file I/O during setup is not a defect.
+"tests/capture_yolink_payloads.py" = ["ASYNC240"]

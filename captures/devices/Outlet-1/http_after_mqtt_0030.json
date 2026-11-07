@@ -1,0 +1,38 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-11-07T01:19:36.107574+00:00",
+  "device_id": "Outlet-1",
+  "device_name": "Outlet-1",
+  "display_type": "Outlet",
+  "env_name": "YOLINK_OUTLET_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "signal": 0
+      },
+      "state": "closed"
+    },
+    "deviceId": "Outlet-1",
+    "event": "Outlet.StatusChange",
+    "msgid": "1794014376091",
+    "time": 1794014376093
+  },
+  "raw_type": "Outlet",
+  "request": {
+    "method": "Outlet.getState",
+    "targetDevice": "Outlet-1",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "020104",
+    "data": {},
+    "desc": "Device is busy, try again later.",
+    "method": "Outlet.getState",
+    "msgid": 1794014376106,
+    "time": 1794014376106
+  },
+  "sequence": 7
+}

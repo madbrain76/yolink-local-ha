@@ -8,6 +8,7 @@ from typing import Any
 
 import aiohttp
 
+from ..const import API_ENDPOINT
 from .auth import TokenManager
 from .device import Device
 
@@ -109,7 +110,7 @@ class YoLinkClient:
 
         for attempt in range(1, attempts + 1):
             token = await self._token_manager.get_token()
-            url = f"{self.base_url}/open/yolink/v2/api"
+            url = f"{self.base_url}{API_ENDPOINT}"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
@@ -123,7 +124,7 @@ class YoLinkClient:
                 ) as resp:
                     resp.raise_for_status()
                     result = await resp.json()
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            except (TimeoutError, aiohttp.ClientConnectionError):
                 if attempt >= attempts:
                     raise
                 self.switch_host()
@@ -148,7 +149,7 @@ async def create_client(
     client_secret: str,
     port: int = 1080,
     hosts: Sequence[str] | None = None,
-) -> tuple["YoLinkClient", TokenManager, aiohttp.ClientSession]:
+) -> tuple[YoLinkClient, TokenManager, aiohttp.ClientSession]:
     """Create an authenticated client.
 
     Returns the client, token manager, and session. Caller is responsible

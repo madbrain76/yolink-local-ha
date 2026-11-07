@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from types import SimpleNamespace
 import asyncio
 import json
 import logging
 import threading
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
+from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -21,8 +23,7 @@ import custom_components.yolocal.api.client as client_module
 import custom_components.yolocal.config_flow as config_flow_module
 from custom_components.yolocal import _configured_hosts
 from custom_components.yolocal.api.auth import TokenManager
-from custom_components.yolocal.api.client import ApiError
-from custom_components.yolocal.api.client import YoLinkClient
+from custom_components.yolocal.api.client import ApiError, YoLinkClient
 from custom_components.yolocal.api.device import Device
 from custom_components.yolocal.api.mqtt import (
     DeviceEvent,
@@ -36,22 +37,28 @@ from custom_components.yolocal.binary_sensor import (
 )
 from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import (
+    CONTACT_STORE_VERSION,
     YoLocalCoordinator,
     device_contact_timestamp,
 )
-from custom_components.yolocal.entity import YoLocalEntity
+from custom_components.yolocal.entity import (
+    YoLocalEntity,
+    async_setup_device_entities,
+)
 from custom_components.yolocal.sensor import (
     YoLocalBatterySensor,
     YoLocalLastReportedSensor,
     YoLocalOutletPowerSensor,
     YoLocalTHLimitSensor,
     YoLocalWaterMeterReadingSensor,
-    async_setup_entry as async_setup_sensor_entry,
+    _sensor_discovery_needed,
     build_sensor_entities,
+)
+from custom_components.yolocal.sensor import (
+    async_setup_entry as async_setup_sensor_entry,
 )
 from custom_components.yolocal.switch import YoLocalSwitch
 from custom_components.yolocal.valve import YoLocalValve, build_valve_entities
-from capture_yolink_payloads import sanitize_value
 
 
 class FakeClosableSession:
@@ -59,17 +66,21 @@ class FakeClosableSession:
 
     async def close(self) -> None:
         """Close the fake session."""
-        return None
+        return
 
 
 class FakeMqttClient:
     """Minimal MQTT client for coordinator tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, host: str = "fake.local", fail_disconnect: bool = False) -> None:
+        self.host = host
         self.disconnect_calls = 0
+        self._fail_disconnect = fail_disconnect
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+        if self._fail_disconnect:
+            raise ConnectionError("broker join failed")
 
 
 def make_device_id(label: str = "device") -> str:
@@ -139,7 +150,7 @@ class FakeApiResponse:
 
     def raise_for_status(self) -> None:
         """No-op status validation."""
-        return None
+        return
 
     async def json(self) -> dict[str, object]:
         """Return the configured JSON payload."""
@@ -161,7 +172,7 @@ class FakePostContext:
 
     async def __aexit__(self, *_args: object) -> None:
         """Exit the fake request context."""
-        return None
+        return
 
 
 class FakeSession:
@@ -921,6 +932,7 @@ def test_battery_sensor_is_created_only_when_payload_has_battery() -> None:
         display_type="UnknownDevice",
     )
     coordinator._states[unknown.device_id] = {"state": {"battery": 4}}
+    coordinator._battery_device_ids.add(unknown.device_id)
 
     door_entities = build_sensor_entities(coordinator, door)
     unknown_entities = build_sensor_entities(coordinator, unknown)
@@ -1191,10 +1203,12 @@ def test_saved_motion_alerts_with_matching_data_are_distinct(monkeypatch) -> Non
     for payload in payloads:
         now = datetime.fromtimestamp(payload["time"] / 1000, UTC)
         monkeypatch.setattr(
-            "custom_components.yolocal.coordinator.dt_util.utcnow", lambda: now
+            "custom_components.yolocal.coordinator.dt_util.utcnow",
+            lambda now=now: now,
         )
         monkeypatch.setattr(
-            "custom_components.yolocal.coordinator.monotonic", lambda: now.timestamp()
+            "custom_components.yolocal.coordinator.monotonic",
+            lambda now=now: now.timestamp(),
         )
         event = DeviceEvent.from_payload(payload)
         coordinator._on_device_event(event)
@@ -2399,6 +2413,7 @@ def test_thsensor_000201_stays_offline_until_new_radio_report() -> None:
             "state": {"battery": 3, "temperature": 21},
         },
     )
+    coordinator._battery_device_ids.add(device.device_id)
     coordinator._on_device_event(
         DeviceEvent.from_payload(
             {
@@ -2812,10 +2827,83 @@ def test_new_mqtt_disconnect_wakes_existing_reconnect_backoff() -> None:
             task = coordinator._reconnect_task
             if task is not None:
                 task.cancel()
-                try:
+                with suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
+
+    asyncio.run(scenario())
+
+
+def test_dead_mqtt_host_does_not_delay_healthy_host() -> None:
+    """A dead interface must not hold up reconnecting a healthy one."""
+    coordinator = make_coordinator()
+    coordinator._client = SimpleNamespace(
+        host="ethernet.local",
+        hosts=("ethernet.local", "wifi.local"),
+    )
+    coordinator._mqtt_clients = {}
+
+    async def scenario() -> None:
+        ethernet_release = asyncio.Event()
+        wifi_connected = asyncio.Event()
+
+        async def connect_host(host: str) -> None:
+            if host == "ethernet.local":
+                # A dead address holds its connect open until wifi gets its turn.
+                await asyncio.wait_for(ethernet_release.wait(), timeout=2)
+                raise ConnectionError("ethernet down")
+            wifi_connected.set()
+            coordinator._mqtt_clients[host] = FakeMqttClient()
+            ethernet_release.set()
+
+        coordinator._connect_mqtt_host = connect_host
+        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator._on_mqtt_disconnect()
+        try:
+            # Serialised attempts would stall here on the dead host's timeout.
+            await asyncio.wait_for(wifi_connected.wait(), timeout=1)
+        finally:
+            coordinator._shutdown = True
+            task = coordinator._reconnect_task
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    asyncio.run(scenario())
+
+
+def test_retired_mqtt_clients_close_concurrently() -> None:
+    """One wedged client must not hold up closing the others."""
+    coordinator = make_coordinator()
+    wedged = asyncio.Event()
+    fast_closed = asyncio.Event()
+
+    class WedgingClient:
+        def __init__(self, host: str, *, block: bool) -> None:
+            self.host = host
+            self._block = block
+
+        async def disconnect(self) -> None:
+            if self._block:
+                await wedged.wait()
+                return
+            fast_closed.set()
+
+    coordinator._retired_mqtt_clients = [
+        WedgingClient("ethernet.local", block=True),
+        WedgingClient("wifi.local", block=False),
+    ]
+
+    async def scenario() -> None:
+        task = asyncio.create_task(coordinator._async_close_retired_clients())
+        try:
+            # A serial drain would never reach the healthy client.
+            await asyncio.wait_for(fast_closed.wait(), timeout=1)
+            assert coordinator._retired_mqtt_clients == []
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     asyncio.run(scenario())
 
@@ -2963,6 +3051,26 @@ def test_shutdown_closes_retired_mqtt_client() -> None:
     assert retired.disconnect_calls == 1
     assert active.disconnect_calls == 1
 
+
+
+def test_shutdown_names_failing_mqtt_client_and_keeps_disconnecting_others(
+    caplog,
+) -> None:
+    """A failed broker join is logged with its host and must not skip the rest."""
+    coordinator = make_coordinator()
+    failing = FakeMqttClient(host="ethernet.local", fail_disconnect=True)
+    healthy = FakeMqttClient(host="wifi.local")
+    coordinator._mqtt_clients = {"ethernet.local": failing, "wifi.local": healthy}
+    coordinator._session = SimpleNamespace(close=lambda: asyncio.sleep(0))
+
+    with caplog.at_level(
+        logging.WARNING, logger="custom_components.yolocal.coordinator"
+    ):
+        asyncio.run(coordinator.async_shutdown())
+
+    assert failing.disconnect_calls == 1
+    assert healthy.disconnect_calls == 1
+    assert "ethernet.local" in caplog.text
 
 
 def test_stale_mqtt_client_disconnect_does_not_evict_live_client() -> None:
@@ -3688,6 +3796,7 @@ def test_valve_creates_battery_sensor_when_payload_has_battery() -> None:
         display_type="Manipulator",
     )
     coordinator._states[device.device_id] = {"state": {"battery": 3, "state": "closed"}}
+    coordinator._battery_device_ids.add(device.device_id)
 
     entities = build_sensor_entities(coordinator, device)
 
@@ -3742,6 +3851,7 @@ def test_water_meter_controller_capture_updates_entities() -> None:
         },
         device,
     )
+    coordinator._battery_device_ids.add(device.device_id)
 
     valve = build_valve_entities(coordinator, device)[0]
     flow = YoLocalWaterFlowSensor(coordinator, device)
@@ -3834,19 +3944,10 @@ def test_water_meter_controller_entities_survive_initial_read_failure() -> None:
     coordinator = make_coordinator()
     device = make_device(device_type="WaterMeterController", model="YS5009-UC")
     coordinator._states[device.device_id] = {"online": False}
-    registry = er.async_get(coordinator.hass)
-    entity_id = "sensor.test_water_meter_battery"
-    registry.entities[entity_id] = SimpleNamespace(
-        entity_id=entity_id,
-        unique_id=f"{device.device_id}_battery",
-        platform=DOMAIN,
-        config_entry_id="entry",
-    )
+    # Durable payload evidence, not a registry row, is what keeps this entity.
+    coordinator._battery_device_ids.add(device.device_id)
 
-    try:
-        entities = build_sensor_entities(coordinator, device)
-    finally:
-        registry.async_remove(entity_id)
+    entities = build_sensor_entities(coordinator, device)
 
     assert any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
     assert len([entity for entity in entities if isinstance(entity, YoLocalWaterMeterReadingSensor)]) == 5
@@ -3894,10 +3995,18 @@ def test_battery_entity_added_when_first_payload_arrives_after_setup() -> None:
     )
     assert not any(isinstance(entity, YoLocalBatterySensor) for entity in added)
 
-    coordinator._states[device.device_id] = {
-        "online": True,
-        "state": {"battery": 3},
-    }
+    # Deliver it as a real payload, which is what records the capability.
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "WaterMeterController.Report",
+                "msgid": "late-battery-1",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"battery": 3, "valve": "close"},
+            }
+        )
+    )
     coordinator.async_set_updated_data(coordinator._states.copy())
     coordinator.async_set_updated_data(coordinator._states.copy())
 
@@ -4003,6 +4112,7 @@ def test_water_meter_command_refresh_does_not_revive_stale_contact() -> None:
         device.device_id,
         {"online": False, "state": {"battery": 4, "valve": "close"}},
     )
+    coordinator._battery_device_ids.add(device.device_id)
 
     async def set_state(_device: Device, _params: dict[str, object]) -> dict[str, object]:
         return {}
@@ -4016,6 +4126,238 @@ def test_water_meter_command_refresh_does_not_revive_stale_contact() -> None:
 
     assert coordinator.get_state(device.device_id)["online"] is False
     assert YoLocalBatterySensor(coordinator, device).native_value == 0
+
+
+def test_registered_battery_entity_is_not_resurrected_without_evidence() -> None:
+    """A hub that never reports a level must not keep a stale battery entity."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS5704-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": "open",
+        "power": 753,
+        "watt": 14039,
+    }
+    registry = er.async_get(coordinator.hass)
+    entity_id = "sensor.test-device_battery"
+    registry.entities[entity_id] = SimpleNamespace(
+        entity_id=entity_id,
+        unique_id=f"{device.device_id}_battery",
+        platform=DOMAIN,
+        config_entry_id="entry",
+    )
+
+    try:
+        entities = build_sensor_entities(coordinator, device)
+    finally:
+        registry.async_remove(entity_id)
+
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
+    assert coordinator.device_has_battery(device.device_id, {}) is False
+
+
+def test_battery_capability_survives_restart_from_payload_evidence() -> None:
+    """One payload carrying a level keeps the entity across a bare restart."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="DoorSensor", model="YS7704-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "DoorSensor.Report",
+                "msgid": "battery-capability-1",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"battery": 3, "state": "closed"},
+            }
+        )
+    )
+    assert device.device_id in coordinator._battery_device_ids
+
+    restored = make_coordinator()
+    restored._devices[device.device_id] = device
+    restored._contact_store.data = coordinator._contact_store_data()
+    asyncio.run(restored._async_load_contact_state())
+
+    assert restored._states.get(device.device_id, {}) == {}
+    entities = build_sensor_entities(restored, device)
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
+
+
+def test_cached_battery_key_never_becomes_durable_capability() -> None:
+    """A stale cached field must not be promoted into permanent capability."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+    # Left over from an earlier release; no live payload ever carried this.
+    coordinator._states[device.device_id] = {"online": True, "battery": 4}
+
+    async def get_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "state": "open", "power": 754, "watt": 14040}
+
+    coordinator._client = SimpleNamespace(get_state=get_state)
+    asyncio.run(coordinator._async_update_data())
+
+    assert device.device_id not in coordinator._battery_device_ids
+    built = build_sensor_entities(coordinator, device)
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in built)
+
+
+def test_authoritative_read_without_battery_clears_capability() -> None:
+    """A battery-less getState retires capability, and one with it restores."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._battery_device_ids.add(device.device_id)
+
+    async def bare_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "state": "open"}
+
+    coordinator._client = SimpleNamespace(get_state=bare_state)
+    asyncio.run(coordinator._async_update_data())
+    assert device.device_id not in coordinator._battery_device_ids
+
+    async def battery_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "battery": 3, "state": "closed"}
+
+    coordinator._client = SimpleNamespace(get_state=battery_state)
+    asyncio.run(coordinator._async_update_data())
+    assert device.device_id in coordinator._battery_device_ids
+    built = build_sensor_entities(coordinator, device)
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in built)
+
+
+def test_battery_entity_disappears_after_authoritative_read(monkeypatch) -> None:
+    """End to end: a battery-less getState retires the entity with no manual step."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+
+    async def battery_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "battery": 3, "state": "open"}
+
+    coordinator._client = SimpleNamespace(get_state=battery_state)
+    asyncio.run(coordinator._async_update_data())
+    assert device.device_id in coordinator._battery_device_ids
+
+    removed: list[str] = []
+
+    async def fake_remove(self) -> None:
+        removed.append(str(self._attr_unique_id))
+
+    monkeypatch.setattr(YoLocalEntity, "async_remove_from_hass", fake_remove)
+
+    pending: list[object] = []
+    listeners: list[object] = []
+    coordinator.async_add_listener = lambda cb: listeners.append(cb) or (lambda: None)
+    hass = SimpleNamespace(
+        data={DOMAIN: {"entry": coordinator}},
+        async_create_task=lambda coro, *_a, **_k: pending.append(coro),
+    )
+    entry = SimpleNamespace(entry_id="entry", async_on_unload=lambda _cb: None)
+    added: list[object] = []
+    asyncio.run(async_setup_sensor_entry(hass, entry, lambda e, *_a, **_k: added.extend(e)))
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in added)
+
+    # The hub's authoritative read says this device has no battery at all.
+    async def bare_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "state": "open"}
+
+    coordinator._client = SimpleNamespace(get_state=bare_state)
+    asyncio.run(coordinator._async_update_data())
+    assert device.device_id not in coordinator._battery_device_ids
+
+    listeners[0]()  # type: ignore[operator]
+    for coro in pending:
+        asyncio.run(coro)
+    assert removed == [f"{device.device_id}_battery"]
+
+
+def test_stale_battery_registry_row_is_deleted_at_setup(monkeypatch) -> None:
+    """A leftover battery row from an older release is deleted, not restored."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS5704-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True, "state": "open"}
+    coordinator.async_add_listener = lambda _cb: (lambda: None)
+    monkeypatch.setattr(
+        coordinator, "register_device_registry_listener", lambda _cb: (lambda: None)
+    )
+
+    hass = SimpleNamespace(
+        data={DOMAIN: {"entry": coordinator}},
+        async_create_task=lambda coro, *_a, **_k: asyncio.iscoroutine(coro)
+        and asyncio.run(coro),
+    )
+    entry = SimpleNamespace(entry_id="entry", async_on_unload=lambda _cb: None)
+    registry = er.async_get(hass)
+    stale_id = "sensor.theater_pdu_battery"
+    keeper_id = "sensor.theater_pdu_low_battery"
+    for entity_id, suffix in (
+        (stale_id, "_battery"),
+        (keeper_id, "_low_battery"),
+    ):
+        registry.entities[entity_id] = SimpleNamespace(
+            entity_id=entity_id,
+            unique_id=f"{device.device_id}{suffix}",
+            platform=DOMAIN,
+            config_entry_id="entry",
+        )
+
+    asyncio.run(async_setup_sensor_entry(hass, entry, lambda _e, *_a, **_k: None))
+
+    assert stale_id not in registry.entities
+    # A neighbouring platform owns that row; the sensor platform must leave it.
+    assert keeper_id in registry.entities
+
+
+def test_entity_builder_retires_a_stale_battery_entity(monkeypatch) -> None:
+    """A battery entity the payload no longer supports is removed, not cached."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS5704-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True, "state": "open"}
+
+    removed: list[str] = []
+
+    async def fake_remove(self) -> None:
+        removed.append(str(self._attr_unique_id))
+
+    monkeypatch.setattr(YoLocalEntity, "async_remove_from_hass", fake_remove)
+
+    pending: list[object] = []
+    listeners: list[object] = []
+    coordinator.async_add_listener = lambda cb: listeners.append(cb) or (lambda: None)
+    hass = SimpleNamespace(
+        data={DOMAIN: {"entry": coordinator}},
+        async_create_task=lambda coro, *_a, **_k: pending.append(coro),
+    )
+    entry = SimpleNamespace(entry_id="entry", async_on_unload=lambda _cb: None)
+    added: list[object] = []
+
+    # First pass sees a device that did report a level, so the entity exists.
+    coordinator._battery_device_ids.add(device.device_id)
+    asyncio.run(
+        async_setup_device_entities(
+            hass,
+            entry,
+            lambda entities, *_a, **_k: added.extend(entities),
+            build_sensor_entities,
+            refresh_needed=_sensor_discovery_needed,
+        )
+    )
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in added)
+
+    # Payload evidence says this hub never reports a level; a refresh must prune.
+    coordinator._battery_device_ids.clear()
+    assert listeners
+    listeners[0]()  # type: ignore[operator]
+
+    assert pending, "stale entity was never scheduled for removal"
+    for coro in pending:
+        asyncio.run(coro)
+    assert removed == [f"{device.device_id}_battery"]
 
 
 def test_water_meter_new_mqtt_event_recovers_inferred_contact() -> None:
@@ -4105,6 +4447,48 @@ def test_contact_ledger_survives_restart_and_rejects_replayed_event() -> None:
     restored._on_device_event(DeviceEvent.from_payload(payload))
 
     assert restored.get_state(device.device_id)["online"] is False
+
+
+def test_unsupported_contact_store_version_disables_persistence() -> None:
+    """A version mismatch warns and stops saving instead of blocking startup."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="WaterMeterController", model="YS5009-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "WaterMeterController.StatusChange",
+                "msgid": "old-version-water-meter-event",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"state": {"valve": "open"}, "battery": 4},
+            }
+        )
+    )
+    saved = coordinator._contact_store_data()
+
+    restored = make_coordinator()
+    restored._devices[device.device_id] = device
+    restored._contact_store.data = saved
+    restored._contact_store.stored_version = CONTACT_STORE_VERSION - 1
+    asyncio.run(restored._async_load_contact_state())
+
+    assert restored._contact_store_enabled is False
+
+    restored._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "WaterMeterController.StatusChange",
+                "msgid": "old-version-second-event",
+                "time": int(datetime.now(UTC).timestamp() * 1000) + 1000,
+                "data": {"state": {"valve": "close"}, "battery": 4},
+            }
+        )
+    )
+
+    # The unreadable ledger is left alone rather than overwritten with a partial one.
+    assert restored._contact_store.data == saved
 
 
 def _parse_timestamp_for_test(value: str) -> datetime:

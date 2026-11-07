@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import YoLocalCoordinator
-from .entity import async_setup_device_entities, YoLocalEntity
+from .entity import YoLocalEntity, async_setup_device_entities
 
 
 async def async_setup_entry(

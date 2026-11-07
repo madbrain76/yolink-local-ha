@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-import sys
-
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -267,22 +266,35 @@ def _install_homeassistant_stubs() -> None:
     storage = ModuleType("homeassistant.helpers.storage")
 
     class Store:
-        """In-memory subset of Home Assistant's persistent Store helper."""
+        """In-memory subset of Home Assistant's persistent Store helper.
 
-        def __init__(self, _hass, _version, _key) -> None:
+        Mirrors the version gate in homeassistant.helpers.storage: loading data
+        written by another version raises unless the integration supplies a
+        migrate function, which this integration does not.
+        """
+
+        def __init__(self, _hass, version, _key) -> None:
+            self.version = version
             self.data = None
+            self.stored_version = version
 
         def __class_getitem__(cls, _item):
             return cls
 
         async def async_load(self):
+            if self.data is None:
+                return None
+            if self.stored_version != self.version:
+                raise NotImplementedError
             return self.data
 
         async def async_save(self, data) -> None:
             self.data = data
+            self.stored_version = self.version
 
         def async_delay_save(self, data_func, _delay) -> None:
             self.data = data_func()
+            self.stored_version = self.version
 
     storage.Store = Store
 

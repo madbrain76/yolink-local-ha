@@ -7,10 +7,10 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
@@ -28,10 +28,16 @@ async def async_setup_device_entities(
     async_add_entities: AddEntitiesCallback,
     build_entities: EntityBuilder,
     refresh_needed: EntityRefreshNeeded | None = None,
+    retirable_suffixes: tuple[str, ...] = (),
 ) -> None:
     """Set up entities that follow the YoLink dynamic device registry."""
     coordinator: YoLocalCoordinator = hass.data[DOMAIN][entry.entry_id]
     entities_by_device_id: dict[str, list[Entity]] = {}
+
+    async def _remove_entities(entities: list[Entity]) -> None:
+        for entity in entities:
+            if isinstance(entity, YoLocalEntity):
+                await entity.async_remove_from_hass()
 
     def add_devices(devices: Iterable[Device]) -> None:
         new_entities: list[Entity] = []
@@ -43,16 +49,26 @@ async def async_setup_device_entities(
             ):
                 continue
             built = list(build_entities(coordinator, device))
-            if existing is not None:
-                known_ids = {entity.unique_id for entity in existing}
-                built = [entity for entity in built if entity.unique_id not in known_ids]
-            if not built:
-                continue
             if existing is None:
                 entities_by_device_id[device.device_id] = built
-            else:
-                existing.extend(built)
-            new_entities.extend(built)
+                new_entities.extend(built)
+                continue
+            known_ids = {entity.unique_id for entity in existing}
+            wanted_ids = {entity.unique_id for entity in built}
+            stale = [
+                entity for entity in existing if entity.unique_id not in wanted_ids
+            ]
+            additions = [
+                entity for entity in built if entity.unique_id not in known_ids
+            ]
+            if stale:
+                entities_by_device_id[device.device_id] = [
+                    entity for entity in existing if entity.unique_id in wanted_ids
+                ]
+                hass.async_create_task(_remove_entities(stale))
+            if additions:
+                entities_by_device_id[device.device_id].extend(additions)
+                new_entities.extend(additions)
         if new_entities:
             async_add_entities(new_entities)
 
@@ -75,12 +91,47 @@ async def async_setup_device_entities(
         coordinator.register_device_registry_listener(handle_registry_change)
     )
     add_devices(coordinator.devices.values())
+    _retire_orphan_entities(hass, entry, coordinator, build_entities, retirable_suffixes)
     if refresh_needed is not None:
         entry.async_on_unload(
             coordinator.async_add_listener(
                 lambda: add_devices(coordinator.devices.values())
             )
         )
+
+
+def _retire_orphan_entities(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: YoLocalCoordinator,
+    build_entities: EntityBuilder,
+    retirable_suffixes: tuple[str, ...],
+) -> None:
+    """Delete registry rows for diagnostics the hub does not support.
+
+    In-session pruning cannot reach an entity that was left over from an earlier
+    release, because Home Assistant restores it without the platform ever
+    creating it again. Only suffixes with durable payload backing belong here,
+    so a value that is merely not cached yet is not mistaken for unsupported.
+    """
+    if not retirable_suffixes:
+        return
+    registry = er.async_get(hass)
+    if hasattr(er, "async_entries_for_config_entry"):
+        rows = list(er.async_entries_for_config_entry(registry, entry.entry_id))
+    else:
+        rows = list(getattr(registry, "entities", {}).values())
+    for device in coordinator.devices.values():
+        wanted = {entity.unique_id for entity in build_entities(coordinator, device)}
+        for row in rows:
+            unique_id = getattr(row, "unique_id", None)
+            if not unique_id or unique_id in wanted:
+                continue
+            if unique_id not in {
+                f"{device.device_id}{suffix}" for suffix in retirable_suffixes
+            }:
+                continue
+            registry.async_remove(row.entity_id)
 
 
 class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):

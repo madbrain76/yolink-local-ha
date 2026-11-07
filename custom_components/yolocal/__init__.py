@@ -5,10 +5,9 @@ from __future__ import annotations
 import logging
 
 import aiohttp
-
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 from .api import AuthenticationError
 from .const import (

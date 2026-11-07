@@ -6,7 +6,6 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 
 from .api import AuthenticationError, create_client
@@ -99,7 +98,7 @@ class YoLocalConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             config_data = _clean_config_data(user_input)
             try:
-                client, _, session = await create_client(
+                _client, _, session = await create_client(
                     host=config_data[CONF_HUB_IP],
                     client_id=config_data[CONF_CLIENT_ID],
                     client_secret=config_data[CONF_CLIENT_SECRET],

@@ -8,12 +8,10 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import time
 from typing import Any
 
 import aiohttp
 import paho.mqtt.client as mqtt
-
 from yolink_tooling_common import (
     HUB_HTTP_PORT,
     HUB_MQTT_PORT,
@@ -365,13 +363,13 @@ async def run(args: argparse.Namespace) -> int:
         try:
             await asyncio.wait_for(done.wait(), timeout=args.timeout)
             return 0
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print("TIMEOUT: no matching change observed")
             return 1
     finally:
         if mqtt_client:
             mqtt_client.disconnect()
-            time.sleep(0.2)
+            await asyncio.sleep(0.2)
             mqtt_client.loop_stop()
         await session.close()
 
