@@ -149,7 +149,7 @@ To add, remove, or change the secondary address later, use **Settings -> Devices
 
 ## How It Works
 
-- **Device Discovery**: On startup, the integration queries the hub for all connected devices
+- **Device Discovery**: On startup, the integration queries the hub for all connected devices, then repeats every minute so newly paired devices appear without a restart. When the hub reports a device the integration has never seen, that event triggers a discovery pass immediately, subject to a ten second minimum spacing so a burst of queued reports cannot poll in a loop.
 - **Initial State**: Each device's current state is fetched via HTTP
 - **Real-time Updates**: MQTT subscription receives instant state changes (door opens, temperature changes, etc.)
 - **Dual-host resilience**: When both hub addresses are configured, the integration keeps independent MQTT subscriptions to both interfaces and deduplicates copies of the same event for five minutes. Separate reports with identical sensor values are still processed, using the message ID (or packet timestamp when no ID is supplied) to distinguish them. HTTP reads can fail over between configured addresses.

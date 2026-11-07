@@ -42,6 +42,7 @@ TRANSIENT_DEVICE_UNREACHABLE = "000201"
 STALE_REPORT_AGE = timedelta(hours=12)
 MQTT_EVENT_MAX_DELAY = timedelta(minutes=30)
 SET_STATE_TRANSPORT_RETRY_DELAY = 2.0
+DEVICE_DISCOVERY_MIN_SPACING = timedelta(seconds=10)
 HUB_HEALTH_FAILURE_THRESHOLD = 2
 MQTT_DUPLICATE_WINDOW = 300.0
 MQTT_DUPLICATE_CACHE_LIMIT = 256
@@ -180,6 +181,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._reconnect_task: asyncio.Task[None] | None = None
         self._mqtt_reconnect_wakeup = asyncio.Event()
         self._discovery_task: asyncio.Task[None] | None = None
+        self._device_discovery_wakeup = asyncio.Event()
+        self._last_discovery_at: datetime | None = None
+        self._discovery_hinted: set[str] = set()
         self._state_refresh_task: asyncio.Task[None] | None = None
         self._device_registry_listeners: list[DeviceRegistryListener] = []
         self._shutdown = False
@@ -226,8 +230,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     def _forget_battery_capability(self, device_id: str) -> None:
         """Drop capability when an authoritative read reports no battery.
 
-        Only a successful, non-empty ``getState`` qualifies, so a partial command
-        read-back can never strip a real battery device.
+        Callers may only pass a read whose raw payload carried contents, so an
+        empty success cannot strip a real battery device. The command read-back
+        path never calls this at all.
         """
         if device_id not in self._battery_device_ids:
             return
@@ -585,7 +590,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         )
 
         refreshed_states = self._states.copy()
-        for device_id, incoming_state, unreachable in results:
+        for device_id, incoming_state, unreachable, authoritative in results:
             current_state = refreshed_states.get(device_id, {})
             if unreachable:
                 refreshed_states[device_id] = self._mark_unreachable(
@@ -616,7 +621,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     continue
                 if state_has_battery(incoming_state):
                     self._remember_battery_capability(device_id)
-                else:
+                elif authoritative:
                     self._forget_battery_capability(device_id)
                 merged = self._merge_state_payload(
                     self._with_stored_th_measurements(device_id, current_state),
@@ -652,12 +657,17 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self,
         device_id: str,
         device: Device,
-    ) -> tuple[str, dict[str, Any] | None, bool]:
-        """Fetch one device state and return the HTTP payload to merge."""
+    ) -> tuple[str, dict[str, Any] | None, bool, bool]:
+        """Fetch one device state and return it with reliability flags.
+
+        The last flag reports whether the hub returned any contents at all.
+        ``_normalize_http_state`` always injects ``online``, so emptiness is only
+        observable on the raw payload, never on the normalized one.
+        """
         try:
             state = await self._async_get_state_with_retry(device)
             if state is None:
-                return device_id, None, True
+                return device_id, None, True, False
         except Exception as err:
             cached = self._states.get(device_id, {})
             error_code = (
@@ -689,9 +699,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 _diagnostic_timestamp(cached.get("lastReportedAt")),
                 _diagnostic_timestamp(cached.get("lastSeenAt")),
             )
-            return device_id, None, False
+            return device_id, None, False, False
 
-        return device_id, self._normalize_http_state(state, device), False
+        return device_id, self._normalize_http_state(state, device), False, bool(state)
 
     def _is_older_report(
         self,
@@ -968,7 +978,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         device_id = event.device_id
         device = self._devices.get(device_id)
         if device is None:
-            _LOGGER.debug("Ignoring event for unknown device: %s", device_id)
+            if device_id in self._discovery_hinted:
+                _LOGGER.debug("Ignoring event for unknown device: %s", device_id)
+                return
+            # The hub has started reporting a device we never learned about,
+            # most often one that was just paired. One hint per device keeps a
+            # report flush for a removed device from spamming the log.
+            self._discovery_hinted.add(device_id)
+            _LOGGER.info(
+                "MQTT event from untracked device %s; refreshing the device list",
+                device_id,
+            )
+            self._request_device_discovery()
             return
         if state_has_battery(event.data):
             self._remember_battery_capability(device_id)
@@ -1497,12 +1518,48 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             finally:
                 self._mqtt_reconnect_wakeup.clear()
 
+    def _request_device_discovery(self) -> None:
+        """Ask the discovery loop to run a pass as soon as spacing allows."""
+        self._device_discovery_wakeup.set()
+
     async def _async_device_discovery_loop(self) -> None:
         """Periodically check for device additions/removals."""
         interval = DEVICE_DISCOVERY_INTERVAL.total_seconds()
+        min_spacing = DEVICE_DISCOVERY_MIN_SPACING.total_seconds()
         while not self._shutdown:
-            await asyncio.sleep(interval)
-            await self._async_refresh_devices()
+            last = self._last_discovery_at
+            if last is None:
+                wait_for = interval
+            else:
+                wait_for = interval - (dt_util.utcnow() - last).total_seconds()
+            if wait_for > 0:
+                try:
+                    await asyncio.wait_for(
+                        self._device_discovery_wakeup.wait(), timeout=wait_for
+                    )
+                except TimeoutError:
+                    pass
+                finally:
+                    self._device_discovery_wakeup.clear()
+            if self._shutdown:
+                return
+            if last is not None:
+                # A hub flushes queued reports for many devices at once, so
+                # hints must not be able to turn discovery into a tight loop.
+                since_last = (dt_util.utcnow() - last).total_seconds()
+                if since_last < min_spacing:
+                    await asyncio.sleep(min_spacing - since_last)
+                    if self._shutdown:
+                        return
+            self._last_discovery_at = dt_util.utcnow()
+            try:
+                await self._async_refresh_devices()
+            except Exception:
+                # Discovery must outlive an unexpected fault, or a hub can
+                # never be learned again until Home Assistant restarts.
+                _LOGGER.warning(
+                    "Unexpected error in YoLink device discovery", exc_info=True
+                )
 
     async def _async_state_refresh_loop(self) -> None:
         """Periodically poll getState independent of HA coordinator scheduling."""
@@ -1527,6 +1584,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         self._mark_hub_api_available()
         new_devices = {device.device_id: device for device in devices}
+        self._discovery_hinted.difference_update(new_devices)
         if set(new_devices) == set(self._devices):
             self._devices = new_devices
             return False

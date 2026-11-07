@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import threading
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -3282,6 +3283,165 @@ def test_async_setup_removes_stale_registry_devices() -> None:
         coro.close()
 
 
+def _unknown_device_event(device_id: str, msgid: str) -> DeviceEvent:
+    """Build an MQTT report for a device the coordinator has never seen."""
+    return DeviceEvent.from_payload(
+        {
+            "deviceId": device_id,
+            "event": "THSensor.Report",
+            "msgid": msgid,
+            "time": int(datetime.now(UTC).timestamp() * 1000),
+            "data": {"temperature": 20.0, "humidity": 40.0},
+        }
+    )
+
+
+def _run_until_discovery_stops(
+    coordinator: YoLocalCoordinator,
+    refresh: Callable[[], Awaitable[bool]],
+    hint: Callable[[], None],
+    settle: float = 0.05,
+) -> None:
+    """Drive the discovery loop with one hint, then stop it."""
+    passes = asyncio.Event()
+
+    async def counting_refresh() -> bool:
+        result = await refresh()
+        passes.set()
+        return result
+
+    async def scenario() -> None:
+        coordinator._async_refresh_devices = counting_refresh
+        task = asyncio.create_task(coordinator._async_device_discovery_loop())
+        await asyncio.sleep(0)
+        hint()
+        try:
+            await asyncio.wait_for(passes.wait(), timeout=2)
+            await asyncio.sleep(settle)
+        finally:
+            coordinator._shutdown = True
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(scenario())
+
+
+def test_unknown_device_event_triggers_immediate_discovery() -> None:
+    """A report from an unlearned device must not wait out the timer."""
+    coordinator = make_coordinator()
+    calls = 0
+
+    async def refresh() -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    _run_until_discovery_stops(
+        coordinator,
+        refresh,
+        lambda: coordinator._on_device_event(
+            _unknown_device_event(make_device_id("ghost"), "hint-1")
+        ),
+    )
+    assert calls == 1
+
+
+def test_discovery_hint_burst_causes_a_single_pass() -> None:
+    """A hub flushing queued reports must not queue a pass per report."""
+    coordinator = make_coordinator()
+    calls = 0
+
+    async def refresh() -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    def hint() -> None:
+        for index in range(5):
+            coordinator._on_device_event(
+                _unknown_device_event(make_device_id(f"ghost{index}"), f"burst-{index}")
+            )
+
+    _run_until_discovery_stops(coordinator, refresh, hint)
+    assert calls == 1
+
+
+def test_discovery_hints_respect_minimum_spacing(monkeypatch) -> None:
+    """Two hints in quick succession cannot cause back-to-back passes."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.DEVICE_DISCOVERY_MIN_SPACING",
+        timedelta(seconds=0.3),
+    )
+    coordinator = make_coordinator()
+    calls = 0
+    first_pass = asyncio.Event()
+
+    async def refresh() -> bool:
+        nonlocal calls
+        calls += 1
+        first_pass.set()
+        return False
+
+    async def scenario() -> None:
+        coordinator._async_refresh_devices = refresh
+        task = asyncio.create_task(coordinator._async_device_discovery_loop())
+        await asyncio.sleep(0)
+        coordinator._on_device_event(
+            _unknown_device_event(make_device_id("ghost-a"), "hint-a")
+        )
+        try:
+            await asyncio.wait_for(first_pass.wait(), timeout=2)
+            coordinator._on_device_event(
+                _unknown_device_event(make_device_id("ghost-b"), "hint-b")
+            )
+            await asyncio.sleep(0.05)
+            assert calls == 1, "second hint bypassed the spacing guard"
+            await asyncio.sleep(0.5)
+            assert calls == 2, "a spaced hint never produced a second pass"
+        finally:
+            coordinator._shutdown = True
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(scenario())
+
+
+def test_repeated_unknown_device_events_hint_once() -> None:
+    """Continued reports from a device we cannot learn must not spam."""
+    coordinator = make_coordinator()
+    hints = 0
+
+    def request() -> None:
+        nonlocal hints
+        hints += 1
+
+    coordinator._request_device_discovery = request
+    device_id = make_device_id("ghost")
+    for index in range(3):
+        coordinator._on_device_event(_unknown_device_event(device_id, f"same-{index}"))
+
+    assert hints == 1
+    assert coordinator._discovery_hinted == {device_id}
+
+
+def test_discovery_hint_clears_once_the_device_is_known() -> None:
+    """A learned device must be able to hint again after a later removal."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor")
+    coordinator._devices[device.device_id] = device
+    coordinator._discovery_hinted.add(device.device_id)
+
+    async def get_devices() -> list[Device]:
+        return [device]
+
+    coordinator._client = SimpleNamespace(get_devices=get_devices, host="127.0.0.1")
+    asyncio.run(coordinator._async_refresh_devices())
+
+    assert device.device_id not in coordinator._discovery_hinted
+
+
 def test_async_refresh_devices_notifies_listeners_for_new_device() -> None:
     """Device additions should notify listeners and seed initial state."""
     listener_calls: list[tuple[list[str], list[str]]] = []
@@ -3483,36 +3643,50 @@ def test_state_refresh_failure_does_not_mark_hub_unhealthy() -> None:
     assert coordinator.last_exception is None
 
 
-def test_device_discovery_loop_keeps_running_after_change() -> None:
-    """Discovery loop should keep polling after a membership change."""
+def test_device_discovery_loop_keeps_running_after_change(monkeypatch) -> None:
+    """Discovery keeps polling through a membership change and a fault."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.DEVICE_DISCOVERY_INTERVAL",
+        timedelta(seconds=0),
+    )
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.DEVICE_DISCOVERY_MIN_SPACING",
+        timedelta(seconds=0),
+    )
     coordinator = make_coordinator()
-    sleep_calls: list[float] = []
-    refresh_results = iter([True, False, RuntimeError("stop")])
+    # A membership change, an unchanged pass, then an unexpected fault.
+    refresh_results: list[object] = [True, False, RuntimeError("boom"), False]
     refresh_calls: list[str] = []
 
-    async def fake_sleep(interval: float) -> None:
-        sleep_calls.append(interval)
+    enough = asyncio.Event()
 
     async def fake_refresh_devices() -> bool:
+        # An interval of zero leaves no other suspension point, so the stub
+        # must yield or the loop starves the task watching it.
+        await asyncio.sleep(0)
         refresh_calls.append("called")
-        result = next(refresh_results)
+        if len(refresh_calls) >= 4:
+            enough.set()
+        result = refresh_results[min(len(refresh_calls) - 1, len(refresh_results) - 1)]
         if isinstance(result, Exception):
             raise result
-        return result
+        return bool(result)
 
-    original_sleep = asyncio.sleep
     coordinator._async_refresh_devices = fake_refresh_devices
-    asyncio.sleep = fake_sleep
-    try:
-        try:
-            asyncio.run(coordinator._async_device_discovery_loop())
-        except RuntimeError as exc:
-            assert str(exc) == "stop"
-    finally:
-        asyncio.sleep = original_sleep
 
-    assert len(refresh_calls) == 3
-    assert len(sleep_calls) == 3
+    async def scenario() -> None:
+        task = asyncio.create_task(coordinator._async_device_discovery_loop())
+        try:
+            await asyncio.wait_for(enough.wait(), timeout=5)
+        finally:
+            coordinator._shutdown = True
+            coordinator._request_device_discovery()
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+
+    assert len(refresh_calls) >= 4, "the loop died on a refresh fault"
 
 
 def test_device_from_api_preserves_motion_sensor_type_for_7805() -> None:
@@ -4228,6 +4402,24 @@ def test_authoritative_read_without_battery_clears_capability() -> None:
     assert any(isinstance(entity, YoLocalBatterySensor) for entity in built)
 
 
+def test_empty_getState_payload_does_not_strip_battery_capability() -> None:
+    """A successful read with no data is not evidence a device lacks a battery."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._battery_device_ids.add(device.device_id)
+
+    async def empty_state(_device: Device) -> dict[str, object]:
+        return {}
+
+    coordinator._client = SimpleNamespace(get_state=empty_state)
+    asyncio.run(coordinator._async_update_data())
+
+    assert device.device_id in coordinator._battery_device_ids
+    built = build_sensor_entities(coordinator, device)
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in built)
+
+
 def test_battery_entity_disappears_after_authoritative_read(monkeypatch) -> None:
     """End to end: a battery-less getState retires the entity with no manual step."""
     coordinator = make_coordinator()
@@ -4358,6 +4550,62 @@ def test_entity_builder_retires_a_stale_battery_entity(monkeypatch) -> None:
     for coro in pending:
         asyncio.run(coro)
     assert removed == [f"{device.device_id}_battery"]
+
+
+def test_registry_removal_tears_down_that_devices_entities(monkeypatch) -> None:
+    """A device leaving the hub removes its entities, not only its cached state."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="THSensor", model="YS8015-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._battery_device_ids.add(device.device_id)
+
+    removed: list[str] = []
+
+    async def fake_remove(self) -> None:
+        removed.append(str(self._attr_unique_id))
+
+    monkeypatch.setattr(YoLocalEntity, "async_remove_from_hass", fake_remove)
+
+    pending: list[object] = []
+    registry_listeners: list[object] = []
+    coordinator.async_add_listener = lambda _cb: lambda: None
+    coordinator.register_device_registry_listener = lambda cb: (
+        registry_listeners.append(cb) or (lambda: None)
+    )
+    hass = SimpleNamespace(
+        data={DOMAIN: {"entry": coordinator}},
+        async_create_task=lambda coro, *_a, **_k: pending.append(coro),
+    )
+    entry = SimpleNamespace(entry_id="entry", async_on_unload=lambda _cb: None)
+    added: list[object] = []
+
+    asyncio.run(
+        async_setup_device_entities(
+            hass,
+            entry,
+            lambda entities, *_a, **_k: added.extend(entities),
+            build_sensor_entities,
+            refresh_needed=_sensor_discovery_needed,
+        )
+    )
+    created = {
+        str(entity._attr_unique_id)
+        for entity in added
+        if isinstance(entity, YoLocalEntity)
+    }
+    assert created, "initial setup produced no entities"
+
+    registry_listeners[0]([], [device])
+    assert pending, "entity removal was never scheduled"
+    for coro in pending:
+        asyncio.run(coro)
+
+    assert set(removed) == created
+
+    # The tracker must forget the device, or it could never be re-added.
+    added.clear()
+    registry_listeners[0]([device], [])
+    assert added, "a returning device could not be re-registered"
 
 
 def test_water_meter_new_mqtt_event_recovers_inferred_contact() -> None:
