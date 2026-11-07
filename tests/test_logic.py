@@ -4402,6 +4402,42 @@ def test_authoritative_read_without_battery_clears_capability() -> None:
     assert any(isinstance(entity, YoLocalBatterySensor) for entity in built)
 
 
+def test_battery_capability_transitions_are_logged(caplog) -> None:
+    """The log names the source and fields behind each capability change."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+    caplog.set_level(logging.INFO, logger="custom_components.yolocal.coordinator")
+
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "Outlet.Report",
+                "msgid": "cap-1",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"battery": 3, "state": "open", "watt": 55},
+            }
+        )
+    )
+    assert device.device_id in coordinator._battery_device_ids
+    assert "battery capability added" in caplog.text
+    assert "source=mqtt_report" in caplog.text
+    assert "battery" in caplog.text
+
+    caplog.clear()
+
+    async def bare_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "state": "closed", "watt": 40}
+
+    coordinator._client = SimpleNamespace(get_state=bare_state)
+    asyncio.run(coordinator._async_update_data())
+
+    assert device.device_id not in coordinator._battery_device_ids
+    assert "battery capability removed" in caplog.text
+    assert "source=getState" in caplog.text
+
+
 def test_empty_getState_payload_does_not_strip_battery_capability() -> None:
     """A successful read with no data is not evidence a device lacks a battery."""
     coordinator = make_coordinator()

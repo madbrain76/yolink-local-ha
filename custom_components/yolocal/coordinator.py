@@ -129,6 +129,28 @@ def _diagnostic_timestamp(value: Any) -> str:
     return parsed.isoformat()
 
 
+def _diagnostic_payload_keys(payload: Any) -> str:
+    """List payload field names only, never the values the hub sent us."""
+    if not isinstance(payload, dict):
+        return "<invalid>"
+    names: list[str] = []
+    for key in payload:
+        if isinstance(key, str) and key.isidentifier() and len(key) <= 32:
+            names.append(key)
+    nested = payload.get("state")
+    if isinstance(nested, dict):
+        for key in nested:
+            if isinstance(key, str) and key.isidentifier() and len(key) <= 32:
+                names.append(f"state.{key}")
+    unique = sorted(set(names))
+    if not unique:
+        return "<none>"
+    shown = unique[:12]
+    if len(unique) > len(shown):
+        shown.append("...")
+    return ",".join(shown)
+
+
 def _diagnostic_online(value: Any) -> str:
     """Format only the expected API boolean, never an arbitrary payload."""
     if value is True:
@@ -215,7 +237,16 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """
         return device_id in self._battery_device_ids
 
-    def _remember_battery_capability(self, device_id: str) -> None:
+    def _device_label(self, device_id: str) -> tuple[str, str]:
+        """Return a log-safe name and model for a device id."""
+        device = self._devices.get(device_id)
+        if device is None:
+            return "<unknown>", "<unknown>"
+        return device.name, device.model
+
+    def _remember_battery_capability(
+        self, device_id: str, source: str, payload: dict[str, Any] | None = None
+    ) -> None:
         """Record durable evidence that a device reports a battery level.
 
         Callers must pass a freshly received payload. Merged cache state always
@@ -226,8 +257,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return
         self._battery_device_ids.add(device_id)
         self._schedule_contact_store_save()
+        name, model = self._device_label(device_id)
+        _LOGGER.info(
+            "YoLink battery capability added for %s (%s): source=%s payload_keys=%s",
+            name,
+            model,
+            source,
+            _diagnostic_payload_keys(payload),
+        )
 
-    def _forget_battery_capability(self, device_id: str) -> None:
+    def _forget_battery_capability(
+        self, device_id: str, source: str, payload: dict[str, Any] | None = None
+    ) -> None:
         """Drop capability when an authoritative read reports no battery.
 
         Callers may only pass a read whose raw payload carried contents, so an
@@ -238,6 +279,14 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return
         self._battery_device_ids.discard(device_id)
         self._schedule_contact_store_save()
+        name, model = self._device_label(device_id)
+        _LOGGER.info(
+            "YoLink battery capability removed for %s (%s): source=%s payload_keys=%s",
+            name,
+            model,
+            source,
+            _diagnostic_payload_keys(payload),
+        )
 
     async def _async_load_contact_state(self) -> None:
         """Restore durable device-contact and replay-detection state."""
@@ -620,9 +669,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                         )
                     continue
                 if state_has_battery(incoming_state):
-                    self._remember_battery_capability(device_id)
+                    self._remember_battery_capability(device_id, "getState", incoming_state)
                 elif authoritative:
-                    self._forget_battery_capability(device_id)
+                    self._forget_battery_capability(device_id, "getState", incoming_state)
                 merged = self._merge_state_payload(
                     self._with_stored_th_measurements(device_id, current_state),
                     incoming_state,
@@ -992,7 +1041,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._request_device_discovery()
             return
         if state_has_battery(event.data):
-            self._remember_battery_capability(device_id)
+            self._remember_battery_capability(device_id, "mqtt_report", event.data)
         if self._is_duplicate_mqtt_event(event):
             _LOGGER.debug(
                 "Ignoring duplicate MQTT event for %s: %s",
