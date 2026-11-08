@@ -1557,17 +1557,172 @@ def test_last_reported_sensor_keeps_value_during_partial_updates() -> None:
     assert sensor.native_value == datetime(2026, 5, 27, 5, 56, tzinfo=UTC)
 
 
-def test_last_reported_sensor_prefers_device_report_over_mqtt_envelope() -> None:
-    """A hub heartbeat must not make Last reported look like a radio report."""
+def test_last_reported_advances_on_motion_reports_without_report_at(monkeypatch) -> None:
+    """Motion reports carry no reportAt, so the last poll must not pin the sensor.
+
+    Only ``getState`` supplies a device ``reportAt``; MQTT reports never do. The
+    diagnostic has to follow live contact evidence rather than freeze between
+    polls, which is what regressed in 0.5.8.
+    """
+    capture_dir = Path(__file__).resolve().parents[1] / "captures/devices/MotionSensor-1"
+    payloads = [
+        json.loads((capture_dir / filename).read_text())["mqtt_payload"]
+        for filename in ("mqtt_0002.json", "mqtt_0009.json", "mqtt_0015.json")
+    ]
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=payloads[0]["deviceId"], device_type="MotionSensor"
+    )
+    coordinator._devices[device.device_id] = device
+    sensor = YoLocalLastReportedSensor(coordinator, device)
+
+    first_event = datetime.fromtimestamp(payloads[0]["time"] / 1000, UTC)
+    poll_at = first_event - timedelta(minutes=10)
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "reportAt": poll_at.isoformat(),
+        "state": {"state": "normal"},
+    }
+    assert sensor.native_value == poll_at
+
+    for payload in payloads:
+        now = datetime.fromtimestamp(payload["time"] / 1000, UTC)
+        monkeypatch.setattr(
+            "custom_components.yolocal.coordinator.dt_util.utcnow",
+            lambda now=now: now,
+        )
+        monkeypatch.setattr(
+            "custom_components.yolocal.coordinator.monotonic",
+            lambda now=now: now.timestamp(),
+        )
+        coordinator._on_device_event(DeviceEvent.from_payload(payload))
+
+    last_event = datetime.fromtimestamp(payloads[-1]["time"] / 1000, UTC)
+    assert sensor.native_value == last_event
+
+
+def test_last_reported_follows_contact_for_devices_without_report_at(monkeypatch) -> None:
+    """Outlet getState carries no reportAt, so contact receipt is the only clock."""
+    capture_dir = Path(__file__).resolve().parents[1] / "captures/devices/Outlet-1"
+    payloads = [
+        json.loads((capture_dir / filename).read_text())["mqtt_payload"]
+        for filename in ("mqtt_0030.json", "mqtt_0031.json")
+    ]
+    coordinator = make_coordinator()
+    device = make_device(device_id=payloads[0]["deviceId"], device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+    sensor = YoLocalLastReportedSensor(coordinator, device)
+
+    coordinator._states[device.device_id] = {
+        "online": True,
+        "state": {"state": "closed"},
+        "watt": 5.5,
+    }
+    assert sensor.native_value is None
+
+    received = None
+    for payload in payloads:
+        received = datetime.fromtimestamp(payload["time"] / 1000, UTC)
+        monkeypatch.setattr(
+            "custom_components.yolocal.coordinator.dt_util.utcnow",
+            lambda now=received: now,
+        )
+        monkeypatch.setattr(
+            "custom_components.yolocal.coordinator.monotonic",
+            lambda now=received: now.timestamp(),
+        )
+        coordinator._on_device_event(DeviceEvent.from_payload(payload))
+
+    assert sensor.native_value == received
+    assert sensor.available is True
+
+
+def test_last_reported_sensor_never_shows_a_replayed_heartbeat(monkeypatch) -> None:
+    """A hub re-delivering one packet must not make Last reported look renewed.
+
+    The hub republishes on its own schedule, so transport time is never treated
+    as contact. The diagnostic has to stay pinned until genuinely new evidence
+    arrives, which is what makes the twelve-hour offline rule trustworthy.
+    """
+    capture_dir = Path(__file__).resolve().parents[1] / "captures/devices/MotionSensor-1"
+    payload = json.loads((capture_dir / "mqtt_0002.json").read_text())["mqtt_payload"]
+    coordinator = make_coordinator()
+    device = make_device(device_id=payload["deviceId"], device_type="MotionSensor")
+    coordinator._devices[device.device_id] = device
+    sensor = YoLocalLastReportedSensor(coordinator, device)
+
+    received = datetime.fromtimestamp(payload["time"] / 1000, UTC)
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.dt_util.utcnow",
+        lambda: received,
+    )
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.monotonic",
+        lambda: received.timestamp(),
+    )
+
+    coordinator._on_device_event(DeviceEvent.from_payload(payload))
+    first = sensor.native_value
+    assert first == received
+
+    for _ in range(3):
+        coordinator._on_device_event(DeviceEvent.from_payload(payload))
+    assert sensor.native_value == first
+
+    # A genuinely later report does move it.
+    later = payload | {"msgid": "renewed-motion-event", "time": payload["time"] + 60_000}
+    renewed = received + timedelta(minutes=1)
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.dt_util.utcnow",
+        lambda: renewed,
+    )
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.monotonic",
+        lambda: renewed.timestamp(),
+    )
+    coordinator._on_device_event(DeviceEvent.from_payload(later))
+    assert sensor.native_value == renewed
+
+
+def test_last_reported_survives_restart_from_the_contact_ledger(monkeypatch) -> None:
+    """A restart has no poll and no event yet, but the ledger still proves contact."""
+    capture_dir = Path(__file__).resolve().parents[1] / "captures/devices/MotionSensor-1"
+    payload = json.loads((capture_dir / "mqtt_0002.json").read_text())["mqtt_payload"]
+    received = datetime.fromtimestamp(payload["time"] / 1000, UTC)
+    coordinator = make_coordinator()
+    device = make_device(device_id=payload["deviceId"], device_type="MotionSensor")
+    coordinator._devices[device.device_id] = device
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.dt_util.utcnow", lambda: received
+    )
+    monkeypatch.setattr(
+        "custom_components.yolocal.coordinator.monotonic",
+        lambda: received.timestamp(),
+    )
+    coordinator._on_device_event(DeviceEvent.from_payload(payload))
+    assert YoLocalLastReportedSensor(coordinator, device).native_value == received
+
+    restored = make_coordinator()
+    restored._devices[device.device_id] = device
+    restored._contact_store.data = coordinator._contact_store_data()
+    asyncio.run(restored._async_load_contact_state())
+
+    sensor = YoLocalLastReportedSensor(restored, device)
+    assert sensor.native_value == received
+    assert sensor.available is True
+
+
+def test_last_reported_sensor_keeps_device_report_authority() -> None:
+    """A device report newer than the contact record is the best evidence."""
     coordinator = make_coordinator()
     device = make_device(device_type="THSensor")
     coordinator._states[device.device_id] = {
-        "reportAt": "2026-10-18T21:30:58Z",
-        "lastReportedAt": "2026-10-19T00:30:59Z",
+        "reportAt": "2026-10-19T00:30:59Z",
+        "lastContactAt": "2026-10-18T21:30:58Z",
     }
 
     assert YoLocalLastReportedSensor(coordinator, device).native_value == datetime(
-        2026, 10, 18, 21, 30, 58, tzinfo=UTC
+        2026, 10, 19, 0, 30, 59, tzinfo=UTC
     )
 
 

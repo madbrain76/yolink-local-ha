@@ -525,6 +525,18 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             "lastContactSource": record["source"],
         }
 
+    def last_contact_at(self, device_id: str) -> datetime | None:
+        """Return the durable proof of contact before any state is cached.
+
+        The ledger is overlaid onto state only when a payload arrives, so right
+        after a restart the entities would otherwise read nothing while the
+        contact record is already loaded.
+        """
+        record = self._contacts.get(device_id)
+        if record is None:
+            return None
+        return _parse_timestamp(record.get("at"))
+
     def _record_report_contact(self, device_id: str, state: dict[str, Any]) -> bool:
         """Use a device-provided report timestamp as authoritative contact evidence."""
         if (reported_at := _parse_timestamp(state.get("reportAt"))) is None:

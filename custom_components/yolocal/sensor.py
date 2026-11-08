@@ -14,9 +14,12 @@ from homeassistant.const import PERCENTAGE, UnitOfPower, UnitOfTemperature, Unit
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.util import dt as dt_util
 
-from .coordinator import NO_BATTERY_SENTINEL, YoLocalCoordinator
+from .coordinator import (
+    NO_BATTERY_SENTINEL,
+    YoLocalCoordinator,
+    device_contact_timestamp,
+)
 from .entity import YoLocalEntity, async_setup_device_entities
 
 METER_STEP_FACTOR_SCALE = 100_000
@@ -277,18 +280,20 @@ class YoLocalLastReportedSensor(YoLocalEntity, SensorEntity):
 
     @property
     def native_value(self) -> datetime | None:
-        """Return the last reported timestamp."""
-        for key in ("reportAt", "lastContactAt", "lastReportedAt"):
-            report_at = self.device_state.get(key)
-            if not report_at:
-                continue
-            try:
-                parsed = dt_util.parse_datetime(report_at)
-            except (TypeError, ValueError):
-                continue
-            if parsed is not None:
-                self._last_native_value = parsed
-                return parsed
+        """Return the most recent evidence of device contact.
+
+        ``reportAt`` arrives only from ``getState``, while MQTT reports carry no
+        device timestamp at all, so a fixed field precedence would freeze this
+        diagnostic between polls. Reading the same contact value the availability
+        rule uses keeps the displayed age and the offline decision from ever
+        disagreeing.
+        """
+        reported = device_contact_timestamp(self.device_state)
+        if reported is None:
+            reported = self.coordinator.last_contact_at(self._device.device_id)
+        if reported is not None:
+            self._last_native_value = reported
+            return reported
         return self._last_native_value
 
 
