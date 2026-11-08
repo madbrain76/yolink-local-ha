@@ -123,11 +123,10 @@ def reported_battery_level(state: dict[str, Any]) -> Any:
 def state_has_battery(state: dict[str, Any]) -> bool:
     """Recognize battery support from a reported level.
 
-    Key presence alone is not evidence. The hub puts ``battery: 255`` on
-    ``Outlet.Report`` for mains powered plugs, which is its way of saying the
-    device has no battery at all, while real devices use the documented 0-4
-    scale. Treating presence as capability gave a battery-less smart plug a
-    battery sensor that every getState poll then took away again.
+    Capability itself is decided by ``Outlet.getState`` and friends, which carry
+    this key in every poll for battery devices and in none of 8,494 polls for the
+    mains powered plug. A raw value of 255 is outside the documented 0-4 scale, so
+    it is treated as no reading and never as a level worth graphing.
     """
     value = reported_battery_level(state)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -272,9 +271,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     ) -> None:
         """Record durable evidence that a device reports a battery level.
 
-        Callers must pass a freshly received payload. Merged cache state always
-        keeps its earlier keys, so testing that instead would promote one stray
-        field into permanent capability.
+        Only the authoritative ``getState`` path calls this, and it must pass the
+        raw payload rather than merged cache state, which always keeps its earlier
+        keys and would promote one stray field into permanent capability.
         """
         if device_id in self._battery_device_ids:
             return
@@ -1076,8 +1075,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             )
             self._request_device_discovery()
             return
-        if state_has_battery(event.data):
-            self._remember_battery_capability(device_id, "mqtt_report", event.data)
+        # Capability is decided only by the authoritative HTTP read. Hub-pushed
+        # Outlet.Report frames carry a battery field for mains powered plugs and
+        # fill it with 0xFF, occasionally with an in-range stray value, so an
+        # MQTT payload can never establish that a device has a battery.
         if self._is_duplicate_mqtt_event(event):
             _LOGGER.debug(
                 "Ignoring duplicate MQTT event for %s: %s",

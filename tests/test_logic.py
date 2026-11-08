@@ -4301,6 +4301,35 @@ def test_water_meter_controller_without_battery_evidence_has_no_battery_entity()
     assert not any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
 
 
+def poll_authoritative_state(coordinator, device, payload) -> None:
+    """Serve one authoritative getState payload for a device.
+
+    Capability is established only by this channel, so tests that need a battery
+    device must go through it rather than through an MQTT report.
+    """
+
+    async def _get_state(_device: Device) -> dict[str, object]:
+        return dict(payload)
+
+    coordinator._client = SimpleNamespace(get_state=_get_state)
+    asyncio.run(coordinator._async_update_data())
+
+
+def mqtt_report(coordinator, device, event, data, msgid) -> None:
+    """Deliver one hub-pushed MQTT report for a device."""
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": event,
+                "msgid": msgid,
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": dict(data),
+            }
+        )
+    )
+
+
 def test_battery_entity_added_when_first_payload_arrives_after_setup() -> None:
     """A new offline controller gains a battery entity without a reload."""
     coordinator = make_coordinator()
@@ -4324,17 +4353,9 @@ def test_battery_entity_added_when_first_payload_arrives_after_setup() -> None:
     )
     assert not any(isinstance(entity, YoLocalBatterySensor) for entity in added)
 
-    # Deliver it as a real payload, which is what records the capability.
-    coordinator._on_device_event(
-        DeviceEvent.from_payload(
-            {
-                "deviceId": device.device_id,
-                "event": "WaterMeterController.Report",
-                "msgid": "late-battery-1",
-                "time": int(datetime.now(UTC).timestamp() * 1000),
-                "data": {"battery": 3, "valve": "close"},
-            }
-        )
+    # The authoritative read is what records the capability.
+    poll_authoritative_state(
+        coordinator, device, {"online": True, "battery": 3, "valve": "close"}
     )
     coordinator.async_set_updated_data(coordinator._states.copy())
     coordinator.async_set_updated_data(coordinator._states.copy())
@@ -4342,7 +4363,6 @@ def test_battery_entity_added_when_first_payload_arrives_after_setup() -> None:
     batteries = [entity for entity in added if isinstance(entity, YoLocalBatterySensor)]
     assert len(batteries) == 1
     assert batteries[0].native_value == 75
-
 
 def test_water_meter_controller_000201_forces_offline_until_new_report() -> None:
     """A controller handles an explicit 000201 like other battery devices."""
@@ -4487,20 +4507,15 @@ def test_registered_battery_entity_is_not_resurrected_without_evidence() -> None
 
 
 def test_battery_capability_survives_restart_from_payload_evidence() -> None:
-    """One payload carrying a level keeps the entity across a bare restart."""
+    """One authoritative level keeps the entity across a bare restart."""
     coordinator = make_coordinator()
     device = make_device(device_type="DoorSensor", model="YS7704-UC")
     coordinator._devices[device.device_id] = device
-    coordinator._on_device_event(
-        DeviceEvent.from_payload(
-            {
-                "deviceId": device.device_id,
-                "event": "DoorSensor.Report",
-                "msgid": "battery-capability-1",
-                "time": int(datetime.now(UTC).timestamp() * 1000),
-                "data": {"battery": 3, "state": "closed"},
-            }
-        )
+    poll_authoritative_state(
+        coordinator,
+        device,
+        {"online": True, "reportAt": "2026-11-08T12:11:53.897Z",
+         "state": {"battery": 3, "state": "closed"}},
     )
     assert device.device_id in coordinator._battery_device_ids
 
@@ -4512,7 +4527,6 @@ def test_battery_capability_survives_restart_from_payload_evidence() -> None:
     assert restored._states.get(device.device_id, {}) == {}
     entities = build_sensor_entities(restored, device)
     assert any(isinstance(entity, YoLocalBatterySensor) for entity in entities)
-
 
 def test_cached_battery_key_never_becomes_durable_capability() -> None:
     """A stale cached field must not be promoted into permanent capability."""
@@ -4558,26 +4572,21 @@ def test_authoritative_read_without_battery_clears_capability() -> None:
 
 
 def test_battery_capability_transitions_are_logged(caplog) -> None:
-    """The log names the source and fields behind each capability change."""
+    """The log names the authoritative read behind each capability change."""
     coordinator = make_coordinator()
-    device = make_device(device_type="Outlet", model="YS6614-UC")
+    device = make_device(device_type="DoorSensor", model="YS7704-UC")
     coordinator._devices[device.device_id] = device
     caplog.set_level(logging.INFO, logger="custom_components.yolocal.coordinator")
 
-    coordinator._on_device_event(
-        DeviceEvent.from_payload(
-            {
-                "deviceId": device.device_id,
-                "event": "Outlet.Report",
-                "msgid": "cap-1",
-                "time": int(datetime.now(UTC).timestamp() * 1000),
-                "data": {"battery": 3, "state": "open", "watt": 55},
-            }
-        )
+    poll_authoritative_state(
+        coordinator,
+        device,
+        {"online": True, "reportAt": "2026-11-08T12:11:53.897Z",
+         "state": {"battery": 2, "state": "closed"}},
     )
     assert device.device_id in coordinator._battery_device_ids
     assert "battery capability added" in caplog.text
-    assert "source=mqtt_report" in caplog.text
+    assert "source=getState" in caplog.text
     assert "battery" in caplog.text
     # Home Assistant OS only surfaces WARNING and above, so a lower level here
     # would make the evidence unreachable exactly when it is needed.
@@ -4585,17 +4594,16 @@ def test_battery_capability_transitions_are_logged(caplog) -> None:
 
     caplog.clear()
 
-    async def bare_state(_device: Device) -> dict[str, object]:
-        return {"online": True, "state": "closed", "watt": 40}
-
-    coordinator._client = SimpleNamespace(get_state=bare_state)
-    asyncio.run(coordinator._async_update_data())
-
+    poll_authoritative_state(
+        coordinator,
+        device,
+        {"online": True, "reportAt": "2026-11-08T12:16:53.897Z",
+         "state": {"state": "open"}},
+    )
     assert device.device_id not in coordinator._battery_device_ids
     assert "battery capability removed" in caplog.text
     assert "source=getState" in caplog.text
     assert any(r.levelno == logging.WARNING for r in caplog.records)
-
 
 def test_lost_battery_capability_deletes_the_restored_registry_row() -> None:
     """Losing capability removes the row, so the sensor cannot flash back on."""
@@ -4662,28 +4670,110 @@ def test_battery_level_sensors_ignore_the_sentinel() -> None:
     assert YoLocalBatterySensor(coordinator, device).native_value == 100
 
 
+OUTLET_REPORT_FRAME = {
+    "delay": {"ch": 1, "off": 0, "on": 0},
+    "led": {"status": "off"},
+    "loraInfo": {"devNetType": "A", "gatewayId": "", "gateways": 1, "signal": 0},
+    "power": 752,
+    "state": "open",
+    "time": {},
+    "tz": -8,
+    "version": "1404",
+    "watt": 14288,
+}
+
+OUTLET_GET_STATE = {
+    "delay": {"ch": 1, "off": 0, "on": 0},
+    "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "",
+        "gateways": 1,
+        "location": {"altitude": 0, "latitude": 0, "longitude": 0},
+        "signal": 0,
+    },
+    "power": 754,
+    "state": "open",
+    "time": {},
+    "tz": -8,
+    "version": "1404",
+    "watt": 14441,
+}
+
+
+def test_outlet_report_battery_frames_never_grant_capability() -> None:
+    """The hub's own Outlet.Report battery field cannot create the sensor.
+
+    Replays the observed mix for the mains powered plug: nineteen reports carrying
+    0xFF and one carrying an in-range 3, interleaved with an authoritative read
+    that has never once included the key in 8,494 polls.
+    """
+    coordinator = make_coordinator()
+    device = make_device(device_id="Outlet-1", device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+
+    for index in range(19):
+        mqtt_report(
+            coordinator,
+            device,
+            "Outlet.Report",
+            {**OUTLET_REPORT_FRAME, "battery": 255},
+            f"outlet-255-{index}",
+        )
+    mqtt_report(
+        coordinator,
+        device,
+        "Outlet.Report",
+        {**OUTLET_REPORT_FRAME, "battery": 3},
+        "outlet-stray-level",
+    )
+
+    assert device.device_id not in coordinator._battery_device_ids
+    built = build_sensor_entities(coordinator, device)
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in built)
+
+    poll_authoritative_state(coordinator, device, OUTLET_GET_STATE)
+    assert device.device_id not in coordinator._battery_device_ids
+    built = build_sensor_entities(coordinator, device)
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in built)
+
+
+def test_mqtt_cannot_revoke_battery_capability() -> None:
+    """Reports without a level must not strip a device the poll says has one."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="DoorSensor", model="YS7704-UC")
+    coordinator._devices[device.device_id] = device
+    poll_authoritative_state(
+        coordinator,
+        device,
+        {"online": True, "reportAt": "2026-11-08T12:11:53.897Z",
+         "state": {"battery": 2, "state": "closed"}},
+    )
+    assert device.device_id in coordinator._battery_device_ids
+
+    mqtt_report(coordinator, device, "DoorSensor.Report", {"state": "open"}, "drop-1")
+    mqtt_report(
+        coordinator, device, "DoorSensor.Report", {"battery": 255, "state": "open"}, "drop-2"
+    )
+
+    assert device.device_id in coordinator._battery_device_ids
+
+
 def test_real_battery_levels_still_create_capability() -> None:
     """Guard the other direction: documented 0-4 levels stay supported."""
     coordinator = make_coordinator()
-    device = make_device(device_type="Outlet", model="YS6614-UC")
+    device = make_device(device_type="DoorSensor", model="YS7704-UC")
     coordinator._devices[device.device_id] = device
 
-    coordinator._on_device_event(
-        DeviceEvent.from_payload(
-            {
-                "deviceId": device.device_id,
-                "event": "Outlet.Report",
-                "msgid": "sentinel-2",
-                "time": int(datetime.now(UTC).timestamp() * 1000),
-                "data": {"battery": 3, "state": "open"},
-            }
-        )
+    poll_authoritative_state(
+        coordinator,
+        device,
+        {"online": True, "reportAt": "2026-11-08T12:11:53.897Z",
+         "state": {"battery": 3, "state": "closed"}},
     )
 
     assert device.device_id in coordinator._battery_device_ids
     built = build_sensor_entities(coordinator, device)
     assert any(isinstance(entity, YoLocalBatterySensor) for entity in built)
-
 
 def test_empty_getState_payload_does_not_strip_battery_capability() -> None:
     """A successful read with no data is not evidence a device lacks a battery."""
