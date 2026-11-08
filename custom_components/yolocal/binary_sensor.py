@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .coordinator import YoLocalCoordinator
+from .coordinator import NO_BATTERY_SENTINEL, YoLocalCoordinator
 from .entity import YoLocalEntity, async_setup_device_entities
 
 DEVICE_TYPE_TO_CLASS = {
@@ -132,7 +132,7 @@ class YoLocalBinarySensor(YoLocalEntity, BinarySensorEntity):
         }
         state = self.nested_device_state
         battery_level = state.get("battery")
-        if battery_level is not None:
+        if battery_level is not None and battery_level != NO_BATTERY_SENTINEL:
             attrs["battery_level"] = min(battery_level * 25, 100)
             attrs["battery_raw"] = battery_level
         if "devTemperature" in state:

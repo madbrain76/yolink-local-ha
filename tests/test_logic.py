@@ -4424,6 +4424,9 @@ def test_battery_capability_transitions_are_logged(caplog) -> None:
     assert "battery capability added" in caplog.text
     assert "source=mqtt_report" in caplog.text
     assert "battery" in caplog.text
+    # Home Assistant OS only surfaces WARNING and above, so a lower level here
+    # would make the evidence unreachable exactly when it is needed.
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
 
     caplog.clear()
 
@@ -4436,6 +4439,95 @@ def test_battery_capability_transitions_are_logged(caplog) -> None:
     assert device.device_id not in coordinator._battery_device_ids
     assert "battery capability removed" in caplog.text
     assert "source=getState" in caplog.text
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_lost_battery_capability_deletes_the_restored_registry_row() -> None:
+    """Losing capability removes the row, so the sensor cannot flash back on."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._battery_device_ids.add(device.device_id)
+
+    registry = er.async_get(coordinator.hass)
+    registry.entities["sensor.theater_pdu_battery"] = SimpleNamespace(
+        entity_id="sensor.theater_pdu_battery",
+        unique_id=f"{device.device_id}_battery",
+        config_entry_id="entry",
+    )
+
+    async def bare_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "state": "open"}
+
+    coordinator._client = SimpleNamespace(get_state=bare_state)
+    asyncio.run(coordinator._async_update_data())
+
+    assert device.device_id not in coordinator._battery_device_ids
+    assert registry.async_get("sensor.theater_pdu_battery") is None
+
+
+def test_sentinel_battery_report_is_not_capability() -> None:
+    """The hub's battery: 255 on an outlet means no battery, not a full one."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "Outlet.Report",
+                "msgid": "sentinel-1",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {
+                    "battery": 255,
+                    "led": {"status": "off"},
+                    "power": 752,
+                    "state": "open",
+                    "watt": 14288,
+                },
+            }
+        )
+    )
+
+    assert device.device_id not in coordinator._battery_device_ids
+    built = build_sensor_entities(coordinator, device)
+    assert not any(isinstance(entity, YoLocalBatterySensor) for entity in built)
+
+
+def test_battery_level_sensors_ignore_the_sentinel() -> None:
+    """A 255 level must not render as a confident 100 percent."""
+    coordinator = make_coordinator()
+    device = make_device()
+
+    coordinator._states[device.device_id] = {"online": True, "battery": 255}
+    assert YoLocalBatterySensor(coordinator, device).native_value is None
+
+    coordinator._states[device.device_id] = {"online": True, "battery": 4}
+    assert YoLocalBatterySensor(coordinator, device).native_value == 100
+
+
+def test_real_battery_levels_still_create_capability() -> None:
+    """Guard the other direction: documented 0-4 levels stay supported."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+
+    coordinator._on_device_event(
+        DeviceEvent.from_payload(
+            {
+                "deviceId": device.device_id,
+                "event": "Outlet.Report",
+                "msgid": "sentinel-2",
+                "time": int(datetime.now(UTC).timestamp() * 1000),
+                "data": {"battery": 3, "state": "open"},
+            }
+        )
+    )
+
+    assert device.device_id in coordinator._battery_device_ids
+    built = build_sensor_entities(coordinator, device)
+    assert any(isinstance(entity, YoLocalBatterySensor) for entity in built)
 
 
 def test_empty_getState_payload_does_not_strip_battery_capability() -> None:

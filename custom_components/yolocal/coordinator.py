@@ -104,12 +104,35 @@ def _is_measurement(value: Any) -> bool:
         return False
 
 
+BATTERY_ENTITY_SUFFIX = "_battery"
+NO_BATTERY_SENTINEL = 255
+
+
+def reported_battery_level(state: dict[str, Any]) -> Any:
+    """Return the raw battery level a payload carries, or None."""
+    if not isinstance(state, dict):
+        return None
+    value = state.get("battery")
+    if value is None:
+        nested = state.get("state")
+        if isinstance(nested, dict):
+            value = nested.get("battery")
+    return value
+
+
 def state_has_battery(state: dict[str, Any]) -> bool:
-    """Recognize battery capability from the device payload."""
-    if "battery" in state:
-        return True
-    nested = state.get("state")
-    return isinstance(nested, dict) and "battery" in nested
+    """Recognize battery support from a reported level.
+
+    Key presence alone is not evidence. The hub puts ``battery: 255`` on
+    ``Outlet.Report`` for mains powered plugs, which is its way of saying the
+    device has no battery at all, while real devices use the documented 0-4
+    scale. Treating presence as capability gave a battery-less smart plug a
+    battery sensor that every getState poll then took away again.
+    """
+    value = reported_battery_level(state)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value != NO_BATTERY_SENTINEL
 
 
 def _diagnostic_timestamp(value: Any) -> str:
@@ -258,7 +281,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._battery_device_ids.add(device_id)
         self._schedule_contact_store_save()
         name, model = self._device_label(device_id)
-        _LOGGER.info(
+        _LOGGER.warning(
             "YoLink battery capability added for %s (%s): source=%s payload_keys=%s",
             name,
             model,
@@ -279,8 +302,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return
         self._battery_device_ids.discard(device_id)
         self._schedule_contact_store_save()
+        self._retire_battery_entity_row(device_id)
         name, model = self._device_label(device_id)
-        _LOGGER.info(
+        _LOGGER.warning(
             "YoLink battery capability removed for %s (%s): source=%s payload_keys=%s",
             name,
             model,
@@ -1713,16 +1737,39 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._remove_entity_registry_entries(device_id)
             registry.async_remove_device(entry.id)
 
+    def _entity_registry_rows(self) -> list[Any]:
+        """Return entity-registry rows owned by this config entry."""
+        registry = er.async_get(self.hass)
+        if hasattr(er, "async_entries_for_config_entry"):
+            return list(
+                er.async_entries_for_config_entry(
+                    registry,
+                    self._config_entry_id,
+                )
+            )
+        return list(getattr(registry, "entities", {}).values())
+
+    def _retire_battery_entity_row(self, device_id: str) -> None:
+        """Delete a battery row the hub gives no evidence for.
+
+        Home Assistant restores a registry row even though the platform never
+        created the entity, so the sensor shows up in the UI and stays there
+        until the next reload clears it. Removing the row when the evidence goes
+        is what stops that appear-then-vanish behaviour.
+        """
+        unique_id = f"{device_id}{BATTERY_ENTITY_SUFFIX}"
+        registry = er.async_get(self.hass)
+        for row in self._entity_registry_rows():
+            if getattr(row, "unique_id", None) != unique_id:
+                continue
+            entity_id = getattr(row, "entity_id", None)
+            if entity_id is not None:
+                registry.async_remove(entity_id)
+
     def _remove_entity_registry_entries(self, device_id: str) -> None:
         """Remove orphaned entity-registry entries for a missing device."""
         registry = er.async_get(self.hass)
-        if hasattr(er, "async_entries_for_config_entry"):
-            entity_entries = er.async_entries_for_config_entry(
-                registry,
-                self._config_entry_id,
-            )
-        else:
-            entity_entries = list(getattr(registry, "entities", {}).values())
+        entity_entries = self._entity_registry_rows()
 
         for entry in list(entity_entries):
             entity_id = getattr(entry, "entity_id", None)

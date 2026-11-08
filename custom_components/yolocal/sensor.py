@@ -16,7 +16,7 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .coordinator import YoLocalCoordinator
+from .coordinator import NO_BATTERY_SENTINEL, YoLocalCoordinator
 from .entity import YoLocalEntity, async_setup_device_entities
 
 METER_STEP_FACTOR_SCALE = 100_000
@@ -235,7 +235,7 @@ class YoLocalBatterySensor(YoLocalEntity, SensorEntity):
 
         level = self.state_value("battery", fallback=True)
 
-        if level is None:
+        if level is None or level == NO_BATTERY_SENTINEL:
             return None
         return min(level * 25, 100)
 
