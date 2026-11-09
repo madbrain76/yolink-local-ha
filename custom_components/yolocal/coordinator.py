@@ -16,6 +16,7 @@ import aiohttp
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.recorder import DATA_INSTANCE
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -1721,6 +1722,34 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._hub_health_failures >= HUB_HEALTH_FAILURE_THRESHOLD:
             self.async_set_update_error(err)
 
+    def async_clear_entity_statistics(self, entity_ids: list[str]) -> None:
+        """Drop long-term statistics for entities this integration is deleting.
+
+        Home Assistant keeps long-term statistics after an entity registry row is
+        removed, on every route including its own delete button, and the rows
+        then outlive the device by the recorder retention window. A device that
+        is gone from the hub can never produce another reading, so the history
+        is unreachable from the UI and only surfaces as an orphaned-statistics
+        repair. The integration's own availability state lives in the contact
+        store, so nothing here depends on these rows.
+        """
+        if not entity_ids:
+            return
+        data = getattr(self.hass, "data", None)
+        if not isinstance(data, dict):
+            return
+        instance = data.get(DATA_INSTANCE)
+        if instance is None:
+            return
+        try:
+            instance.async_clear_statistics(list(entity_ids))
+        except Exception:
+            _LOGGER.warning(
+                "Failed to clear YoLink long-term statistics for %s",
+                entity_ids,
+                exc_info=True,
+            )
+
     def _remove_device_from_registry(self, device_id: str) -> None:
         """Remove a deleted device from the HA device registry."""
         self._remove_entity_registry_entries(device_id)
@@ -1772,18 +1801,22 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """
         unique_id = f"{device_id}{BATTERY_ENTITY_SUFFIX}"
         registry = er.async_get(self.hass)
+        removed: list[str] = []
         for row in self._entity_registry_rows():
             if getattr(row, "unique_id", None) != unique_id:
                 continue
             entity_id = getattr(row, "entity_id", None)
             if entity_id is not None:
                 registry.async_remove(entity_id)
+                removed.append(entity_id)
+        self.async_clear_entity_statistics(removed)
 
     def _remove_entity_registry_entries(self, device_id: str) -> None:
         """Remove orphaned entity-registry entries for a missing device."""
         registry = er.async_get(self.hass)
         entity_entries = self._entity_registry_rows()
 
+        removed: list[str] = []
         for entry in list(entity_entries):
             entity_id = getattr(entry, "entity_id", None)
             unique_id = getattr(entry, "unique_id", None)
@@ -1792,6 +1825,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             ):
                 if entity_id is not None:
                     registry.async_remove(entity_id)
+                    removed.append(entity_id)
+        self.async_clear_entity_statistics(removed)
 
     def get_state(self, device_id: str) -> dict[str, Any]:
         """Get the current state for a device."""

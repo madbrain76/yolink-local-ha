@@ -263,6 +263,9 @@ def _install_homeassistant_stubs() -> None:
     entity_registry.async_get = async_get_entity_registry
     entity_registry.async_entries_for_config_entry = async_entries_for_config_entry
 
+    recorder_helper = ModuleType("homeassistant.helpers.recorder")
+    recorder_helper.DATA_INSTANCE = "recorder_instance"
+
     storage = ModuleType("homeassistant.helpers.storage")
 
     class Store:
@@ -420,6 +423,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.helpers.entity"] = entity
     sys.modules["homeassistant.helpers.device_registry"] = device_registry
     sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
+    sys.modules["homeassistant.helpers.recorder"] = recorder_helper
     sys.modules["homeassistant.helpers.storage"] = storage
     sys.modules["homeassistant.util"] = util
     sys.modules["homeassistant.util.dt"] = dt

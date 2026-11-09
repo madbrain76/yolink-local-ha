@@ -35,9 +35,14 @@ async def async_setup_device_entities(
     entities_by_device_id: dict[str, list[Entity]] = {}
 
     async def _remove_entities(entities: list[Entity]) -> None:
+        removed: list[str] = []
         for entity in entities:
             if isinstance(entity, YoLocalEntity):
+                entity_id = getattr(entity, "entity_id", None)
                 await entity.async_remove_from_hass()
+                if entity_id:
+                    removed.append(entity_id)
+        coordinator.async_clear_entity_statistics(removed)
 
     def add_devices(devices: Iterable[Device]) -> None:
         new_entities: list[Entity] = []
@@ -73,10 +78,15 @@ async def async_setup_device_entities(
             async_add_entities(new_entities)
 
     async def remove_devices(device_ids: list[str]) -> None:
+        removed: list[str] = []
         for device_id in device_ids:
             for entity in entities_by_device_id.pop(device_id, []):
                 if isinstance(entity, YoLocalEntity):
+                    entity_id = getattr(entity, "entity_id", None)
                     await entity.async_remove_from_hass()
+                    if entity_id:
+                        removed.append(entity_id)
+        coordinator.async_clear_entity_statistics(removed)
 
     def handle_registry_change(
         added_devices: list[Device],
@@ -123,6 +133,7 @@ def _retire_orphan_entities(
         rows = list(getattr(registry, "entities", {}).values())
     for device in coordinator.devices.values():
         wanted = {entity.unique_id for entity in build_entities(coordinator, device)}
+        removed: list[str] = []
         for row in rows:
             unique_id = getattr(row, "unique_id", None)
             if not unique_id or unique_id in wanted:
@@ -132,6 +143,8 @@ def _retire_orphan_entities(
             }:
                 continue
             registry.async_remove(row.entity_id)
+            removed.append(row.entity_id)
+    coordinator.async_clear_entity_statistics(removed)
 
 
 class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):

@@ -5115,3 +5115,132 @@ def test_unsupported_contact_store_version_disables_persistence() -> None:
 def _parse_timestamp_for_test(value: str) -> datetime:
     """Parse the coordinator's serialized UTC timestamp in test assertions."""
     return datetime.fromisoformat(value)
+
+
+class _RecordingFakeRecorder:
+    """Stand-in for the recorder instance, capturing statistics clears."""
+
+    def __init__(self) -> None:
+        self.cleared: list[list[str]] = []
+
+    def async_clear_statistics(self, statistic_ids) -> None:
+        self.cleared.append(list(statistic_ids))
+
+
+def test_retired_battery_row_also_clears_statistics() -> None:
+    """A deleted battery row must not leave long-term statistics behind."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS6614-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._battery_device_ids.add(device.device_id)
+
+    recorder = _RecordingFakeRecorder()
+    coordinator.hass.data = {"recorder_instance": recorder}
+
+    registry = er.async_get(coordinator.hass)
+    registry.entities["sensor.theater_pdu_battery"] = SimpleNamespace(
+        entity_id="sensor.theater_pdu_battery",
+        unique_id=f"{device.device_id}_battery",
+        config_entry_id="entry",
+    )
+
+    async def bare_state(_device: Device) -> dict[str, object]:
+        return {"online": True, "state": "open"}
+
+    coordinator._client = SimpleNamespace(get_state=bare_state)
+    asyncio.run(coordinator._async_update_data())
+
+    assert recorder.cleared == [["sensor.theater_pdu_battery"]]
+
+
+def test_removed_device_clears_statistics_for_its_entities() -> None:
+    """Removing a device drops statistics for its rows and only its rows."""
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=make_device_id("gone"), device_type="MotionSensor", model="YS7804-UC"
+    )
+    other = make_device(
+        device_id=make_device_id("staying"),
+        device_type="MotionSensor",
+        model="YS7804-UC",
+    )
+    coordinator._devices[device.device_id] = device
+    coordinator._devices[other.device_id] = other
+
+    recorder = _RecordingFakeRecorder()
+    coordinator.hass.data = {"recorder_instance": recorder}
+
+    registry = er.async_get(coordinator.hass)
+    rows = (
+        ("sensor.gone_battery", f"{device.device_id}_battery"),
+        ("sensor.gone_device_temperature", f"{device.device_id}_device_temperature"),
+        ("sensor.staying_battery", f"{other.device_id}_battery"),
+    )
+    for entity_id, unique_id in rows:
+        registry.entities[entity_id] = SimpleNamespace(
+            entity_id=entity_id,
+            unique_id=unique_id,
+            config_entry_id="entry",
+        )
+
+    coordinator._remove_entity_registry_entries(device.device_id)
+
+    assert recorder.cleared == [
+        ["sensor.gone_battery", "sensor.gone_device_temperature"]
+    ]
+    assert registry.async_get("sensor.staying_battery") is not None
+
+
+def test_in_session_pruning_clears_statistics(monkeypatch) -> None:
+    """The prune path clears statistics too, not just the device-removal path."""
+    coordinator = make_coordinator()
+    device = make_device(device_type="Outlet", model="YS5704-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True, "state": "open"}
+
+    recorder = _RecordingFakeRecorder()
+    coordinator.hass.data = {"recorder_instance": recorder}
+
+    async def fake_remove(self) -> None:
+        return None
+
+    monkeypatch.setattr(YoLocalEntity, "async_remove_from_hass", fake_remove)
+
+    pending: list[object] = []
+    listeners: list[object] = []
+    coordinator.async_add_listener = lambda cb: listeners.append(cb) or (lambda: None)
+    hass = SimpleNamespace(
+        data={DOMAIN: {"entry": coordinator}, "recorder_instance": recorder},
+        async_create_task=lambda coro, *_a, **_k: pending.append(coro),
+    )
+    entry = SimpleNamespace(entry_id="entry", async_on_unload=lambda _cb: None)
+    added: list[object] = []
+
+    coordinator._battery_device_ids.add(device.device_id)
+    asyncio.run(
+        async_setup_device_entities(
+            hass,
+            entry,
+            lambda entities, *_a, **_k: added.extend(entities),
+            build_sensor_entities,
+            refresh_needed=_sensor_discovery_needed,
+        )
+    )
+    for entity in added:
+        if isinstance(entity, YoLocalBatterySensor):
+            entity.entity_id = "sensor.plug_battery"
+
+    coordinator._battery_device_ids.clear()
+    assert listeners
+    listeners[0]()  # type: ignore[operator]
+    for coro in pending:
+        asyncio.run(coro)
+
+    assert recorder.cleared == [["sensor.plug_battery"]]
+
+
+def test_clearing_statistics_without_a_recorder_is_harmless() -> None:
+    """A host without the recorder must not break entity removal."""
+    coordinator = make_coordinator()
+    coordinator.async_clear_entity_statistics(["sensor.anything"])
+    coordinator.async_clear_entity_statistics([])
