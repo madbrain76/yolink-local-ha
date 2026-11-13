@@ -100,6 +100,26 @@ class YoLinkClient:
             "params": params,
         })
 
+    async def call_method(
+        self,
+        device: Device,
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Invoke an arbitrary device method (e.g. GarageDoor.toggle).
+
+        Never retried at the transport level: methods like ``toggle`` are not
+        idempotent, so replaying one could reverse the action.
+        """
+        payload: dict[str, Any] = {
+            "method": f"{device.device_type}.{method}",
+            "targetDevice": device.device_id,
+            "token": device.token,
+        }
+        if params is not None:
+            payload["params"] = params
+        return await self._request(payload)
+
     async def _request(
         self,
         payload: dict[str, Any],

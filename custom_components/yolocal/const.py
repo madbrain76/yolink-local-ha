@@ -30,4 +30,11 @@ PLATFORMS: list[str] = [
     "switch",
     "siren",
     "valve",
+    "event",
+    "number",
+    "select",
 ]
+
+# Smart locks whose getState nests lock/door under `state` and keeps battery,
+# attributes and alerts beside it (same shape as their MQTT reports).
+LOCK_V2_DEVICE_TYPE = "LockV2"

@@ -1,0 +1,153 @@
+get_lock_users:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+
+get_lock_user_credentials:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    user_id:
+      required: true
+      selector:
+        number: {min: 0, max: 11, mode: box}
+    include_codes:
+      default: false
+      selector:
+        boolean:
+
+add_lock_pin:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    user_id:
+      required: true
+      selector:
+        number: {min: 0, max: 11, mode: box}
+    pin:
+      required: true
+      selector:
+        text: {type: password}
+    uses:
+      default: 0
+      selector:
+        number: {min: 0, max: 255, mode: box}
+    daily_start:
+      selector:
+        time:
+    daily_end:
+      selector:
+        time:
+
+enroll_lock_credential:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    user_id:
+      required: true
+      selector:
+        number: {min: 0, max: 11, mode: box}
+    credential_type:
+      required: true
+      selector:
+        select:
+          options: [fingerprint, card, fob]
+
+delete_lock_credential:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    user_id:
+      required: true
+      selector:
+        number: {min: 0, max: 11, mode: box}
+    credential_id:
+      required: true
+      selector:
+        number: {min: 0, max: 255, mode: box}
+    credential_type:
+      required: true
+      selector:
+        select:
+          options: [pin, fingerprint, card, fob]
+
+delete_lock_user:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    user_id:
+      required: true
+      selector:
+        number: {min: 0, max: 11, mode: box}
+
+get_lock_temporary_codes:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    code_type:
+      selector:
+        select:
+          options: [one_time, time_range, recurring]
+    include_codes:
+      default: false
+      selector:
+        boolean:
+
+add_lock_temporary_code:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    code:
+      required: true
+      selector:
+        text: {type: password}
+    code_type:
+      required: true
+      selector:
+        select:
+          options: [one_time, time_range, recurring]
+    start:
+      selector:
+        datetime:
+    end:
+      selector:
+        datetime:
+    repeat:
+      selector:
+        select:
+          options: [weekly, monthly]
+    days:
+      selector:
+        text: {multiple: true}
+    daily_start:
+      selector:
+        time:
+    daily_end:
+      selector:
+        time:
+
+delete_lock_temporary_code:
+  target:
+    entity:
+      integration: yolocal
+      domain: lock
+  fields:
+    code_id:
+      required: true
+      selector:
+        number: {min: 0, max: 255, mode: box}
