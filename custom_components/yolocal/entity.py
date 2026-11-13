@@ -7,6 +7,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
@@ -14,7 +15,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .api import Device
+from .api import ApiError, Device
 from .const import DOMAIN
 from .coordinator import STALE_REPORT_AGE, YoLocalCoordinator, device_contact_timestamp
 
@@ -225,3 +226,69 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
                 return False
 
         return True
+
+
+def refresh_when_missing(
+    build_entities: EntityBuilder, device_types: frozenset[str]
+) -> EntityRefreshNeeded:
+    """Rebuild a device's entities once its payload supports one not yet created.
+
+    Optional setting entities depend on keys the hub only returns once the
+    device has answered a poll, which can be after setup (a sleeping lock at
+    startup, or a lock paired while Home Assistant is running). Only the given
+    device types are rechecked, so other devices keep their one-time build.
+    """
+
+    def refresh_needed(
+        coordinator: YoLocalCoordinator, device: Device, existing: list[Entity]
+    ) -> bool:
+        if device.device_type not in device_types:
+            return False
+        known = {entity.unique_id for entity in existing}
+        return any(
+            entity.unique_id not in known
+            for entity in build_entities(coordinator, device)
+        )
+
+    return refresh_needed
+
+
+def device_attributes(coordinator: YoLocalCoordinator, device: Device) -> dict[str, Any]:
+    """Return a device's `attributes` settings block from cached state."""
+    state = coordinator.get_state(device.device_id)
+    nested = state.get("state")
+    attributes = nested.get("attributes") if isinstance(nested, dict) else None
+    if not isinstance(attributes, dict):
+        attributes = state.get("attributes")
+    return attributes if isinstance(attributes, dict) else {}
+
+
+class YoLocalAttributeEntity(YoLocalEntity):
+    """Base for config entities backed by one key of a device's `attributes`."""
+
+    def __init__(
+        self,
+        coordinator: YoLocalCoordinator,
+        device: Device,
+        attribute: str,
+        key: str,
+        name: str,
+    ) -> None:
+        super().__init__(coordinator, device)
+        self._attribute = attribute
+        self._attr_name = name
+        self._attr_unique_id = f"{device.device_id}_{key}"
+
+    @property
+    def attribute_value(self) -> Any:
+        return device_attributes(self.coordinator, self._device).get(self._attribute)
+
+    async def async_set_attribute(self, value: Any) -> None:
+        try:
+            await self.coordinator.async_set_attributes(
+                self._device.device_id, {self._attribute: value}
+            )
+        except ApiError as err:
+            raise HomeAssistantError(
+                f"YoLink hub rejected {self._attribute} change for {self._device.name}: {err}"
+            ) from err

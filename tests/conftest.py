@@ -112,7 +112,16 @@ def _install_homeassistant_stubs() -> None:
     class ConfigEntryNotReady(Exception):
         """Minimal not-ready stub."""
 
+    class HomeAssistantError(Exception):
+        """Minimal generic Home Assistant error stub."""
+
     exceptions.ConfigEntryAuthFailed = ConfigEntryAuthFailed
+    exceptions.HomeAssistantError = HomeAssistantError
+
+    class ServiceValidationError(HomeAssistantError):
+        """Minimal service validation error stub."""
+
+    exceptions.ServiceValidationError = ServiceValidationError
     exceptions.ConfigEntryNotReady = ConfigEntryNotReady
 
     helpers = ModuleType("homeassistant.helpers")
@@ -183,6 +192,7 @@ def _install_homeassistant_stubs() -> None:
         """Minimal entity stub."""
 
     class EntityCategory:
+        CONFIG = "config"
         DIAGNOSTIC = "diagnostic"
 
     entity.Entity = Entity
@@ -367,6 +377,18 @@ def _install_homeassistant_stubs() -> None:
     switch.SwitchDeviceClass = SwitchDeviceClass
 
 
+    event = ModuleType("homeassistant.components.event")
+
+    class EventEntity:
+        async def async_remove(self) -> None:
+            return None
+
+    class EventDeviceClass:
+        DOORBELL = "doorbell"
+
+    event.EventEntity = EventEntity
+    event.EventDeviceClass = EventDeviceClass
+
     valve = ModuleType("homeassistant.components.valve")
 
     class ValveEntity:
@@ -432,6 +454,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.binary_sensor"] = binary_sensor
     sys.modules["homeassistant.components.switch"] = switch
     sys.modules["homeassistant.components.valve"] = valve
+    sys.modules["homeassistant.components.event"] = event
     sys.modules["homeassistant.const"] = const
 
 
