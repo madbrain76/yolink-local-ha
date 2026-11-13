@@ -31,6 +31,9 @@ PLATFORMS: list[str] = [
     "siren",
     "valve",
     "button",
+    "event",
+    "number",
+    "select",
 ]
 
 # Garage door controllers only pulse their relay. They get a toggle button;
@@ -38,3 +41,7 @@ PLATFORMS: list[str] = [
 # Assistant (for example a template cover). Finger (YS4908) is not enabled:
 # no captures confirm its behavior yet.
 GARAGE_DOOR_DEVICE_TYPES = frozenset({"GarageDoor"})
+
+# Smart locks whose getState nests lock/door under `state` and keeps battery,
+# attributes and alerts beside it (same shape as their MQTT reports).
+LOCK_V2_DEVICE_TYPE = "LockV2"

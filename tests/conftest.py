@@ -192,6 +192,7 @@ def _install_homeassistant_stubs() -> None:
         """Minimal entity stub."""
 
     class EntityCategory:
+        CONFIG = "config"
         DIAGNOSTIC = "diagnostic"
 
     entity.Entity = Entity
@@ -384,6 +385,18 @@ def _install_homeassistant_stubs() -> None:
 
     button.ButtonEntity = ButtonEntity
 
+    event = ModuleType("homeassistant.components.event")
+
+    class EventEntity:
+        async def async_remove(self) -> None:
+            return None
+
+    class EventDeviceClass:
+        DOORBELL = "doorbell"
+
+    event.EventEntity = EventEntity
+    event.EventDeviceClass = EventDeviceClass
+
     valve = ModuleType("homeassistant.components.valve")
 
     class ValveEntity:
@@ -450,6 +463,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.switch"] = switch
     sys.modules["homeassistant.components.valve"] = valve
     sys.modules["homeassistant.components.button"] = button
+    sys.modules["homeassistant.components.event"] = event
     sys.modules["homeassistant.const"] = const
 
 
