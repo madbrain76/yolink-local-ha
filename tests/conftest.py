@@ -33,6 +33,7 @@ def _install_homeassistant_stubs() -> None:
 
     core.HomeAssistant = HomeAssistant
     core.callback = callback
+    core.CALLBACK_TYPE = object
 
     config_entries = ModuleType("homeassistant.config_entries")
     config_entries.ConfigFlowResult = dict
@@ -389,6 +390,33 @@ def _install_homeassistant_stubs() -> None:
     event.EventEntity = EventEntity
     event.EventDeviceClass = EventDeviceClass
 
+    cover = ModuleType("homeassistant.components.cover")
+
+    class CoverEntity:
+        async def async_remove(self) -> None:
+            return None
+
+        async def async_will_remove_from_hass(self) -> None:
+            return None
+
+    class CoverDeviceClass:
+        GARAGE = "garage"
+
+    class CoverEntityFeature:
+        OPEN = 1
+        CLOSE = 2
+
+    cover.CoverEntity = CoverEntity
+    cover.CoverDeviceClass = CoverDeviceClass
+    cover.CoverEntityFeature = CoverEntityFeature
+
+    helpers_event = ModuleType("homeassistant.helpers.event")
+
+    def async_call_later(_hass, _delay, _action):
+        return lambda: None
+
+    helpers_event.async_call_later = async_call_later
+
     valve = ModuleType("homeassistant.components.valve")
 
     class ValveEntity:
@@ -455,6 +483,8 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.switch"] = switch
     sys.modules["homeassistant.components.valve"] = valve
     sys.modules["homeassistant.components.event"] = event
+    sys.modules["homeassistant.components.cover"] = cover
+    sys.modules["homeassistant.helpers.event"] = helpers_event
     sys.modules["homeassistant.const"] = const
 
 

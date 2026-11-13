@@ -16,6 +16,7 @@ import aiohttp
 import pytest
 from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
@@ -42,6 +43,7 @@ from custom_components.yolocal.coordinator import (
     YoLocalCoordinator,
     device_contact_timestamp,
 )
+from custom_components.yolocal.cover import YoLocalGarageDoor
 from custom_components.yolocal.entity import (
     YoLocalAttributeEntity,
     YoLocalEntity,
@@ -5425,3 +5427,66 @@ def test_lock_credentials_are_masked_unless_requested() -> None:
         "code": "••••13",
     }
     assert _describe_credential(credential, include_codes=True)["code"] == "482913"
+
+
+def make_garage(label: str, device_type: str, name: str, parent_id: str | None = None) -> Device:
+    """Create a garage controller or sensor with an optional parent link."""
+    device = make_device(device_id=make_device_id(label), device_type=device_type)
+    device.name = name
+    device.parent_id = parent_id
+    return device
+
+
+def test_device_parent_id_treats_null_string_as_missing() -> None:
+    """The hub reports an unlinked sensor's parent as the string "null"."""
+    base = {"deviceId": "d1", "name": "Sensor", "token": "t", "type": "DoorSensor"}
+
+    assert Device.from_api({**base, "parentDeviceId": "null"}).parent_id is None
+    assert Device.from_api({**base, "parentDeviceId": "g1"}).parent_id == "g1"
+
+
+def test_garage_controller_pairs_with_linked_or_uniquely_named_sensor() -> None:
+    """The hub's parent link wins; the name fallback needs exactly one match."""
+    coordinator = make_coordinator()
+    controller = make_garage("garage", "GarageDoor", "Garage Door")
+    linked = make_garage("linked", "DoorSensor", "Side Door", controller.device_id)
+    for device in (controller, linked):
+        coordinator._devices[device.device_id] = device
+    assert coordinator.paired_sensor_id(controller.device_id) == linked.device_id
+
+    del coordinator._devices[linked.device_id]
+    named = make_garage("named", "DoorSensor", "Garage Door Sensor")
+    coordinator._devices[named.device_id] = named
+    assert coordinator.paired_sensor_id(controller.device_id) == named.device_id
+
+    other = make_garage("other", "DoorSensor", "Garage Door Tilt")
+    coordinator._devices[other.device_id] = other
+    assert coordinator.paired_sensor_id(controller.device_id) is None
+
+
+def test_garage_door_reports_sensor_position_and_refuses_blind_toggle() -> None:
+    """A toggle-only controller must not be driven when its position is unknown."""
+    coordinator = make_coordinator()
+    controller = make_garage("garage-cover", "GarageDoor", "Garage Door")
+    sensor = make_garage("garage-sensor", "DoorSensor", "Garage Door Sensor")
+    for device in (controller, sensor):
+        coordinator._devices[device.device_id] = device
+    toggles: list[str] = []
+
+    async def async_toggle(device_id: str) -> None:
+        toggles.append(device_id)
+
+    coordinator.async_toggle = async_toggle
+    cover = YoLocalGarageDoor(coordinator, controller)
+    cover.hass = SimpleNamespace()
+    cover.async_write_ha_state = lambda: None
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(cover.async_close_cover())
+    assert toggles == []
+
+    coordinator._states[sensor.device_id] = {"online": True, "state": {"state": "open"}}
+    assert cover.is_closed is False
+    asyncio.run(cover.async_close_cover())
+    assert toggles == [controller.device_id]
+    assert cover.is_closing is True

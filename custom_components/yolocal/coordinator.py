@@ -34,6 +34,7 @@ from .const import (
     DEVICE_DISCOVERY_INTERVAL,
     DOMAIN,
     EVENT_DATA_RECORD,
+    GARAGE_SENSOR_DEVICE_TYPES,
     LOCK_V2_DEVICE_TYPE,
     UPDATE_INTERVAL,
 )
@@ -1870,6 +1871,40 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Get the current state for a device."""
         return self._states.get(device_id, {})
 
+    def paired_sensor_id(self, device_id: str) -> str | None:
+        """Return the door/tilt sensor paired with a garage door controller.
+
+        YoLink links the sensor to its controller through the sensor's
+        ``parentDeviceId``. If the hub's device list doesn't carry that link,
+        fall back to a sensor whose name starts with the controller's name
+        (e.g. "Garage Door" -> "Garage Door Sensor") when exactly one matches.
+        """
+        controller = self._devices.get(device_id)
+        if controller is None:
+            return None
+
+        sensors = [
+            device
+            for device in self._devices.values()
+            if device.device_type in GARAGE_SENSOR_DEVICE_TYPES
+        ]
+        for sensor in sensors:
+            if sensor.parent_id == device_id:
+                return sensor.device_id
+
+        prefix = controller.name.strip().casefold()
+        if not prefix:
+            return None
+        name_matches = [
+            sensor
+            for sensor in sensors
+            if sensor.parent_id is None
+            and sensor.name.strip().casefold().startswith(prefix)
+        ]
+        if len(name_matches) == 1:
+            return name_matches[0].device_id
+        return None
+
     async def async_set_attributes(
         self, device_id: str, attributes: dict[str, Any]
     ) -> None:
@@ -1924,6 +1959,13 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if not device:
             raise ValueError(f"Unknown device: {device_id}")
         return await self._client.call_method(device, "userManagement", params)
+
+    async def async_toggle(self, device_id: str) -> None:
+        """Send a single, non-retried toggle to a garage door controller."""
+        device = self._devices.get(device_id)
+        if not device:
+            raise ValueError(f"Unknown device: {device_id}")
+        await self._client.call_method(device, "toggle")
 
     async def async_send_command(
         self, device_id: str, params: dict[str, Any]

@@ -30,10 +30,16 @@ PLATFORMS: list[str] = [
     "switch",
     "siren",
     "valve",
+    "cover",
     "event",
     "number",
     "select",
 ]
+
+# Garage door controllers have no position feedback of their own; their
+# open/closed state comes from a paired door or tilt sensor.
+GARAGE_DOOR_DEVICE_TYPES = frozenset({"GarageDoor", "Finger"})
+GARAGE_SENSOR_DEVICE_TYPES = frozenset({"DoorSensor"})
 
 # Smart locks whose getState nests lock/door under `state` and keeps battery,
 # attributes and alerts beside it (same shape as their MQTT reports).
