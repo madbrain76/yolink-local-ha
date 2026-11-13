@@ -1566,7 +1566,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._reconnect_task and not self._reconnect_task.done():
             self._mqtt_reconnect_wakeup.set()
             return
-        self._reconnect_task = self.hass.async_create_task(self._async_reconnect_mqtt())
+        self._reconnect_task = self._create_background_task(
+            self._async_reconnect_mqtt(),
+            "yolocal_mqtt_reconnect",
+        )
 
     async def _async_reconnect_mqtt(self) -> None:
         """Reconnect missing MQTT clients with backoff."""
