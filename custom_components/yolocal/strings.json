@@ -39,5 +39,156 @@
     "abort": {
       "already_configured": "This hub is already configured"
     }
+  },
+  "services": {
+    "get_lock_users": {
+      "name": "Get lock users",
+      "description": "List the user slots that are in use on a YoLink lock.",
+      "fields": {}
+    },
+    "get_lock_user_credentials": {
+      "name": "Get lock user credentials",
+      "description": "List the PINs, fingerprints, cards and fobs registered to a lock user.",
+      "fields": {
+        "user_id": {
+          "name": "User slot",
+          "description": "Lock user slot, 0-11."
+        },
+        "include_codes": {
+          "name": "Show full codes",
+          "description": "Return codes in full instead of masked (only the last two digits shown)."
+        }
+      }
+    },
+    "add_lock_pin": {
+      "name": "Add lock PIN",
+      "description": "Add a 4-8 digit PIN to a lock user. Use an unused slot to add a new user.",
+      "fields": {
+        "user_id": {
+          "name": "User slot",
+          "description": "Lock user slot, 0-11."
+        },
+        "pin": {
+          "name": "PIN",
+          "description": "4-8 digits."
+        },
+        "uses": {
+          "name": "Number of uses",
+          "description": "How many times the PIN works; 0 = unlimited."
+        },
+        "daily_start": {
+          "name": "Daily start",
+          "description": "Optional time of day the code starts working."
+        },
+        "daily_end": {
+          "name": "Daily end",
+          "description": "Optional time of day the code stops working."
+        }
+      }
+    },
+    "enroll_lock_credential": {
+      "name": "Enroll lock fingerprint/card/fob",
+      "description": "Put the lock into enrollment mode for a user; then scan the finger, card or fob at the lock.",
+      "fields": {
+        "user_id": {
+          "name": "User slot",
+          "description": "Lock user slot, 0-11."
+        },
+        "credential_type": {
+          "name": "Credential type",
+          "description": "fingerprint, card or fob."
+        }
+      }
+    },
+    "delete_lock_credential": {
+      "name": "Delete lock credential",
+      "description": "Remove one PIN, fingerprint, card or fob from a lock user.",
+      "fields": {
+        "user_id": {
+          "name": "User slot",
+          "description": "Lock user slot, 0-11."
+        },
+        "credential_id": {
+          "name": "Credential ID",
+          "description": "ID from Get lock user credentials."
+        },
+        "credential_type": {
+          "name": "Credential type",
+          "description": "pin, fingerprint, card or fob."
+        }
+      }
+    },
+    "delete_lock_user": {
+      "name": "Delete lock user",
+      "description": "Remove a lock user and all of their credentials.",
+      "fields": {
+        "user_id": {
+          "name": "User slot",
+          "description": "Lock user slot, 0-11."
+        }
+      }
+    },
+    "get_lock_temporary_codes": {
+      "name": "Get lock temporary codes",
+      "description": "List temporary guest codes on the lock.",
+      "fields": {
+        "code_type": {
+          "name": "Code type",
+          "description": "Only list this type; leave empty for all."
+        },
+        "include_codes": {
+          "name": "Show full codes",
+          "description": "Return codes in full instead of masked (only the last two digits shown)."
+        }
+      }
+    },
+    "add_lock_temporary_code": {
+      "name": "Add lock temporary code",
+      "description": "Add a guest code: one_time (single use), time_range (valid between start and end) or recurring (on given days within start-end). Max 3 per type.",
+      "fields": {
+        "code": {
+          "name": "Code",
+          "description": "4-8 digits."
+        },
+        "code_type": {
+          "name": "Code type",
+          "description": "one_time, time_range or recurring."
+        },
+        "start": {
+          "name": "Start",
+          "description": "When the code becomes valid (required for time_range/recurring)."
+        },
+        "end": {
+          "name": "End",
+          "description": "When the code expires (required for time_range/recurring)."
+        },
+        "repeat": {
+          "name": "Repeat",
+          "description": "Recurring codes: weekly or monthly."
+        },
+        "days": {
+          "name": "Days",
+          "description": "Recurring codes: days the code works, as the lock expects them (e.g. weekday or day-of-month values)."
+        },
+        "daily_start": {
+          "name": "Daily start",
+          "description": "Optional time of day the code starts working."
+        },
+        "daily_end": {
+          "name": "Daily end",
+          "description": "Optional time of day the code stops working."
+        }
+      }
+    },
+    "delete_lock_temporary_code": {
+      "name": "Delete lock temporary code",
+      "description": "Remove a temporary guest code.",
+      "fields": {
+        "code_id": {
+          "name": "Code ID",
+          "description": "ID from Get lock temporary codes."
+        }
+      }
+    }
   }
 }
