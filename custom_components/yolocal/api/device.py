@@ -16,6 +16,7 @@ class Device:
     device_type: str
     display_type: str
     model: str | None = None
+    parent_id: str | None = None
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> Device:
@@ -31,6 +32,10 @@ class Device:
                 elif model_num == "8004":
                     display_type = "TempSensor"
 
+        parent_id = data.get("parentDeviceId")
+        if not parent_id or parent_id == "null":
+            parent_id = None
+
         return cls(
             device_id=data["deviceId"],
             name=data["name"],
@@ -38,4 +43,5 @@ class Device:
             device_type=data["type"],
             display_type=display_type,
             model=model,
+            parent_id=parent_id,
         )

@@ -37,7 +37,9 @@ For devices with a Battery entity, an offline device reports 0% so it appears in
 | Device Type | Entity Type | Features | Models               |
 |-------------|-------------|----------|----------------------|
 | DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
+| GarageDoor | Cover | Open/close by toggling the controller; position from the door or tilt sensor paired with it | YS4906-UC
 | LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
+| LockV2 | Lock, Event, Binary Sensor, Number, Select, Switch, Sensor | Lock/unlock with who operated it, doorbell and activity events, built-in door sensor, lock settings, user and PIN management actions, battery | YS7618-UC, YS7616-UC
 | Manipulator | Valve, Sensor | Open/closed control, battery | YS4909-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
 | Outlet | Switch, Sensor | On/off state, power | YS6614-UC
@@ -55,6 +57,7 @@ This project includes additional entities and diagnostics, not available in the 
 - All devices: `Firmware`, `Last reported`
 - Battery-powered devices: `Battery`, `Low battery`
 - DoorSensor: `Alert interval`, `Delay`, `Open remind delay`
+- LockV2: `Activity` and `Doorbell` events, `Door` (models with a door sensor), `Auto-lock delay`, `Sound level`, `Door handing`, `Set button`, `Open remind delay`
 - LeakSensor: `Detector error`, `Device temperature`, `Freeze error`, `Reminder`
 - MotionSensor : `Alert interval`, `Device temperature`, `LED alarm`, `No-motion delay`, `Sensitivity`
 - Outlet: `Power`
@@ -69,6 +72,10 @@ Diagnostics entities listed as "bug" are being returned from the Yolink local AP
 This bug would be best fixed by Yolink in their local API implementation, rather than manually blacklisted in this project.
 
 Outlet `Power` is derived from the local API `power` field, which reports deciwatts on the tested YS6614-UC smart plug. The local API `watt` field was observed to remain at `0` and is not exposed.
+
+GarageDoor (and Finger) controllers only pulse a relay, so the cover takes its open/closed state from the sensor linked to the controller in the YoLink app. If the hub does not report that link, a single DoorSensor whose name starts with the controller's name (for example "Garage Door Sensor") is used. Open and close are refused while the position is unknown, because a toggle could move the door the wrong way.
+
+LockV2 locks also get Home Assistant actions to list users and credentials, add PINs and temporary codes, enroll fingerprints, cards or fobs at the lock, and delete credentials. Codes are masked in responses unless `include_codes` is set. A PIN you pass to an action, or full codes you request, are visible in automation traces and action responses, so treat those like any other secret.
 
 WaterMeterController meter and usage readings are shown in liters. Recent usage duration is shown in minutes.
 

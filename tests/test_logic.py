@@ -16,6 +16,7 @@ import aiohttp
 import pytest
 from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
@@ -42,9 +43,19 @@ from custom_components.yolocal.coordinator import (
     YoLocalCoordinator,
     device_contact_timestamp,
 )
+from custom_components.yolocal.cover import YoLocalGarageDoor
 from custom_components.yolocal.entity import (
+    YoLocalAttributeEntity,
     YoLocalEntity,
     async_setup_device_entities,
+    device_attributes,
+    refresh_when_missing,
+)
+from custom_components.yolocal.event import parse_lock_event
+from custom_components.yolocal.lock_users import (
+    _decode_secret,
+    _describe_credential,
+    _encode_secret,
 )
 from custom_components.yolocal.sensor import (
     YoLocalBatterySensor,
@@ -5244,3 +5255,238 @@ def test_clearing_statistics_without_a_recorder_is_harmless() -> None:
     coordinator = make_coordinator()
     coordinator.async_clear_entity_statistics(["sensor.anything"])
     coordinator.async_clear_entity_statistics([])
+
+
+def make_lock_v2(label: str = "lockv2") -> Device:
+    """Create a LockV2 smart lock device."""
+    return make_device(
+        device_id=make_device_id(label), device_type="LockV2", model="YS7618-UC"
+    )
+
+
+# getState shape with lock/door under `state` and settings beside it, the same
+# layout LockV2 uses in its MQTT reports.
+LOCK_V2_GET_STATE = {
+    "online": True,
+    "state": {"lock": "locked", "door": "closed"},
+    "battery": 4,
+    "alert": {"type": "unlock", "source": "app"},
+    "attributes": {"autoLock": 30, "soundLevel": 2, "rlSet": "left"},
+}
+
+
+def test_lock_v2_get_state_keeps_nested_lock_and_attributes() -> None:
+    """LockV2 getState goes through the MQTT path so settings land under `state`."""
+    coordinator = make_coordinator()
+    device = make_lock_v2()
+    coordinator._devices[device.device_id] = device
+
+    state = coordinator._normalize_http_state(LOCK_V2_GET_STATE, device)
+    coordinator._states[device.device_id] = state
+
+    assert state["state"]["lock"] == "locked"
+    assert state["state"]["door"] == "closed"
+    assert state["state"]["battery"] == 4
+    assert device_attributes(coordinator, device) == {
+        "autoLock": 30,
+        "soundLevel": 2,
+        "rlSet": "left",
+    }
+
+
+def test_lock_user_management_reply_never_reaches_state_cache() -> None:
+    """Credential replies may carry secrets and must not be merged or dispatched."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-users")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"lock": "locked"}}
+    received: list[str] = []
+    coordinator.register_device_event_listener(
+        device.device_id, lambda name, _data: received.append(name)
+    )
+    event = DeviceEvent(
+        device_id=device.device_id,
+        event="LockV2.userManagement",
+        data={"credentials": [{"cipher": {"secret": "MTIzNA=="}}]},
+        raw={"deviceId": device.device_id, "event": "LockV2.userManagement"},
+    )
+
+    coordinator._on_device_event(event)
+
+    assert coordinator._states[device.device_id] == {"state": {"lock": "locked"}}
+    assert received == []
+
+
+def test_lock_v2_report_is_dispatched_to_device_listeners() -> None:
+    """Entities that follow raw events see each report after the state update."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-report")
+    coordinator._devices[device.device_id] = device
+    seen: list[tuple[str, object]] = []
+
+    def listener(name: str, data: dict[str, object]) -> None:
+        seen.append((name, coordinator._states[device.device_id]["state"]["lock"]))
+
+    unsubscribe = coordinator.register_device_event_listener(device.device_id, listener)
+    event = DeviceEvent(
+        device_id=device.device_id,
+        event="LockV2.Report",
+        data={"state": {"lock": "unlocked"}, "source": "keypad"},
+        raw={"deviceId": device.device_id, "event": "LockV2.Report", "msgid": "1"},
+    )
+
+    coordinator._on_device_event(event)
+    unsubscribe()
+    coordinator._on_device_event(
+        DeviceEvent(
+            device_id=device.device_id,
+            event="LockV2.Report",
+            data={"state": {"lock": "locked"}},
+            raw={"deviceId": device.device_id, "event": "LockV2.Report", "msgid": "2"},
+        )
+    )
+
+    assert seen == [("LockV2.Report", "unlocked")]
+
+
+def test_parse_lock_event_reads_alerts_only_from_alert_events() -> None:
+    """A report echoing the last alert must not look like a new one."""
+    alert, lock_state, attributes = parse_lock_event(
+        "LockV2.Alert",
+        {"alert": {"type": "UnLock", "source": "fingerprint"}, "user": 3},
+    )
+    assert (alert, lock_state, attributes) == (
+        "UnLock",
+        None,
+        {"source": "fingerprint", "user": 3},
+    )
+
+    alert, lock_state, _ = parse_lock_event(
+        "LockV2.Report", {"alert": {"type": "UnLock"}, "state": {"lock": "unlocked"}}
+    )
+    assert (alert, lock_state) == (None, "unlocked")
+
+    _, lock_state, _ = parse_lock_event("Lock.Report", {"state": "jammed"})
+    assert lock_state is None
+
+
+def test_lock_setting_entities_appear_once_attributes_arrive() -> None:
+    """A lock asleep at startup still gets its setting entities later."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-late")
+    outlet = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+
+    def build(coord, dev):
+        attributes = device_attributes(coord, dev)
+        return [
+            YoLocalAttributeEntity(coord, dev, key, key.lower(), key)
+            for key in ("autoLock", "soundLevel")
+            if key in attributes
+        ]
+
+    refresh_needed = refresh_when_missing(build, frozenset({"LockV2"}))
+    existing = build(coordinator, device)
+    assert existing == []
+    assert refresh_needed(coordinator, device, existing) is False
+
+    coordinator._states[device.device_id] = coordinator._normalize_http_state(
+        LOCK_V2_GET_STATE, device
+    )
+    assert refresh_needed(coordinator, device, existing) is True
+    assert refresh_needed(coordinator, device, build(coordinator, device)) is False
+    assert refresh_needed(coordinator, outlet, []) is False
+
+
+def test_lock_attribute_entities_use_snake_case_unique_ids() -> None:
+    """Setting entity ids follow the integration's snake_case convention."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-ids")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = coordinator._normalize_http_state(
+        LOCK_V2_GET_STATE, device
+    )
+
+    entity = YoLocalAttributeEntity(
+        coordinator, device, "autoLock", "auto_lock", "Auto-lock delay"
+    )
+
+    assert entity.unique_id == f"{device.device_id}_auto_lock"
+    assert entity.attribute_value == 30
+
+
+def test_lock_credentials_are_masked_unless_requested() -> None:
+    """PINs decode from the hub's base64 and are masked by default."""
+    credential = {"id": 7, "cipher": {"type": "Code", "secret": _encode_secret("482913")}}
+
+    assert _decode_secret(_encode_secret("482913")) == "482913"
+    assert _decode_secret("not base64!") is None
+    assert _describe_credential(credential, include_codes=False) == {
+        "id": 7,
+        "type": "pin",
+        "code": "••••13",
+    }
+    assert _describe_credential(credential, include_codes=True)["code"] == "482913"
+
+
+def make_garage(label: str, device_type: str, name: str, parent_id: str | None = None) -> Device:
+    """Create a garage controller or sensor with an optional parent link."""
+    device = make_device(device_id=make_device_id(label), device_type=device_type)
+    device.name = name
+    device.parent_id = parent_id
+    return device
+
+
+def test_device_parent_id_treats_null_string_as_missing() -> None:
+    """The hub reports an unlinked sensor's parent as the string "null"."""
+    base = {"deviceId": "d1", "name": "Sensor", "token": "t", "type": "DoorSensor"}
+
+    assert Device.from_api({**base, "parentDeviceId": "null"}).parent_id is None
+    assert Device.from_api({**base, "parentDeviceId": "g1"}).parent_id == "g1"
+
+
+def test_garage_controller_pairs_with_linked_or_uniquely_named_sensor() -> None:
+    """The hub's parent link wins; the name fallback needs exactly one match."""
+    coordinator = make_coordinator()
+    controller = make_garage("garage", "GarageDoor", "Garage Door")
+    linked = make_garage("linked", "DoorSensor", "Side Door", controller.device_id)
+    for device in (controller, linked):
+        coordinator._devices[device.device_id] = device
+    assert coordinator.paired_sensor_id(controller.device_id) == linked.device_id
+
+    del coordinator._devices[linked.device_id]
+    named = make_garage("named", "DoorSensor", "Garage Door Sensor")
+    coordinator._devices[named.device_id] = named
+    assert coordinator.paired_sensor_id(controller.device_id) == named.device_id
+
+    other = make_garage("other", "DoorSensor", "Garage Door Tilt")
+    coordinator._devices[other.device_id] = other
+    assert coordinator.paired_sensor_id(controller.device_id) is None
+
+
+def test_garage_door_reports_sensor_position_and_refuses_blind_toggle() -> None:
+    """A toggle-only controller must not be driven when its position is unknown."""
+    coordinator = make_coordinator()
+    controller = make_garage("garage-cover", "GarageDoor", "Garage Door")
+    sensor = make_garage("garage-sensor", "DoorSensor", "Garage Door Sensor")
+    for device in (controller, sensor):
+        coordinator._devices[device.device_id] = device
+    toggles: list[str] = []
+
+    async def async_toggle(device_id: str) -> None:
+        toggles.append(device_id)
+
+    coordinator.async_toggle = async_toggle
+    cover = YoLocalGarageDoor(coordinator, controller)
+    cover.hass = SimpleNamespace()
+    cover.async_write_ha_state = lambda: None
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(cover.async_close_cover())
+    assert toggles == []
+
+    coordinator._states[sensor.device_id] = {"online": True, "state": {"state": "open"}}
+    assert cover.is_closed is False
+    asyncio.run(cover.async_close_cover())
+    assert toggles == [controller.device_id]
+    assert cover.is_closing is True
