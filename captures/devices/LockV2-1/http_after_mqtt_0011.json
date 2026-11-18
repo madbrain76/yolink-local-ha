@@ -1,0 +1,86 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-11-18T15:03:58.435928+00:00",
+  "device_id": "LockV2-1",
+  "device_name": "LockV2-1",
+  "display_type": "LockV2",
+  "env_name": "YOLINK_LOCKV2_7616_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alert": {
+        "source": "Fingerprint",
+        "type": "UnLockFailed"
+      },
+      "attributes": {
+        "autoLock": 10,
+        "enableSetButton": true,
+        "openRemind": 0,
+        "rlSet": "right",
+        "soundLevel": 3
+      },
+      "battery": 2,
+      "loraInfo": {
+        "devNetType": "D",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "signal": -45
+      },
+      "loraP2PHash": 0,
+      "state": {
+        "lock": "locked"
+      },
+      "tz": -5,
+      "version": "1607"
+    },
+    "deviceId": "LockV2-1",
+    "event": "LockV2.getState",
+    "msgid": "1795014236937",
+    "time": 1795014236941
+  },
+  "raw_type": "LockV2",
+  "request": {
+    "method": "LockV2.getState",
+    "targetDevice": "LockV2-1",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "alert": {
+        "source": "Fingerprint",
+        "type": "UnLockFailed"
+      },
+      "attributes": {
+        "autoLock": 10,
+        "enableSetButton": true,
+        "openRemind": 0,
+        "rlSet": "right",
+        "soundLevel": 3
+      },
+      "battery": 2,
+      "loraInfo": {
+        "devNetType": "D",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "location": {
+          "altitude": 0,
+          "latitude": 0,
+          "longitude": 0
+        },
+        "signal": -45
+      },
+      "loraP2PHash": 0,
+      "state": {
+        "door": "open",
+        "lock": "unlocked"
+      },
+      "tz": -5,
+      "version": "1607"
+    },
+    "desc": "Success",
+    "method": "LockV2.getState",
+    "msgid": 1795014238437,
+    "time": 1795014238437
+  },
+  "sequence": 11
+}

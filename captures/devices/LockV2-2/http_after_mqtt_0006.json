@@ -1,0 +1,40 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-11-18T15:03:37.589739+00:00",
+  "device_id": "LockV2-2",
+  "device_name": "LockV2-2",
+  "display_type": "LockV2",
+  "env_name": "YOLINK_LOCKV2_7618_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "loraInfo": {
+        "devNetType": "D",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "signal": -62
+      },
+      "state": {
+        "lock": "locked"
+      }
+    },
+    "deviceId": "LockV2-2",
+    "event": "LockV2.setState",
+    "msgid": "1795014217566",
+    "time": 1795014217569
+  },
+  "raw_type": "LockV2",
+  "request": {
+    "method": "LockV2.getState",
+    "targetDevice": "LockV2-2",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "020104",
+    "data": {},
+    "desc": "Device is busy, try again later.",
+    "method": "LockV2.getState",
+    "msgid": 1795014217591,
+    "time": 1795014217591
+  },
+  "sequence": 6
+}
