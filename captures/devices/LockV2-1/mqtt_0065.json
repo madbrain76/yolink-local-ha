@@ -1,0 +1,32 @@
+{
+  "captured_at": "2026-11-18T15:06:27.513154+00:00",
+  "device_id": "LockV2-1",
+  "device_name": "LockV2-1",
+  "display_type": "LockV2",
+  "env_name": "YOLINK_LOCKV2_7616_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alert": {
+        "source": "Manual",
+        "type": "Lock"
+      },
+      "battery": 2,
+      "loraInfo": {
+        "devNetType": "D",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "signal": -46
+      },
+      "state": {
+        "lock": "locked"
+      }
+    },
+    "deviceId": "LockV2-1",
+    "event": "LockV2.Alert",
+    "msgid": "1795014387512",
+    "time": 1795014387514
+  },
+  "raw_type": "LockV2",
+  "sequence": 65,
+  "topic": "ylsubnet/REDACTED_NET_ID/LockV2-1/report"
+}

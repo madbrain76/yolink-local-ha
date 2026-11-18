@@ -1,0 +1,47 @@
+{
+  "capture_kind": "post_mqtt",
+  "captured_at": "2026-11-18T15:05:16.783819+00:00",
+  "device_id": "LockV2-1",
+  "device_name": "LockV2-1",
+  "display_type": "LockV2",
+  "env_name": "YOLINK_LOCKV2_7616_SERIAL",
+  "mqtt_payload": {
+    "data": {
+      "alert": {
+        "credentialId": 0,
+        "source": "Mechanism",
+        "type": "Unlock",
+        "userId": 0
+      },
+      "battery": 2,
+      "loraInfo": {
+        "devNetType": "D",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "signal": -41
+      },
+      "state": {
+        "lock": "unlocked"
+      }
+    },
+    "deviceId": "LockV2-1",
+    "event": "LockV2.Alert",
+    "msgid": "1795014312726",
+    "time": 1795014312729
+  },
+  "raw_type": "LockV2",
+  "request": {
+    "method": "LockV2.getState",
+    "targetDevice": "LockV2-1",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "000201",
+    "data": {},
+    "desc": "Cannot connect to the device",
+    "method": "LockV2.getState",
+    "msgid": 1795014316784,
+    "time": 1795014316784
+  },
+  "sequence": 37
+}
