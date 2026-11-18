@@ -2971,7 +2971,9 @@ def test_new_mqtt_disconnect_wakes_existing_reconnect_backoff() -> None:
             ethernet_reconnected.set()
 
         coordinator._connect_mqtt_host = connect_host
-        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator.hass.async_create_background_task = (
+            lambda coro, name: asyncio.create_task(coro, name=name)
+        )
         coordinator._on_mqtt_disconnect()
         try:
             await asyncio.wait_for(wifi_attempted.wait(), timeout=1)
@@ -3012,7 +3014,9 @@ def test_dead_mqtt_host_does_not_delay_healthy_host() -> None:
             ethernet_release.set()
 
         coordinator._connect_mqtt_host = connect_host
-        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator.hass.async_create_background_task = (
+            lambda coro, name: asyncio.create_task(coro, name=name)
+        )
         coordinator._on_mqtt_disconnect()
         try:
             # Serialised attempts would stall here on the dead host's timeout.
