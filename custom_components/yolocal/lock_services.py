@@ -16,7 +16,8 @@ from .lock_users import (
 )
 
 USER_ID = vol.All(vol.Coerce(int), vol.Range(min=0, max=MAX_USER_ID))
-CODE = vol.All(cv.string, vol.Match(r"^\d{4,8}$"))
+# [0-9], not \d: \d also matches non-ASCII digits that cannot be encoded.
+CODE = vol.All(cv.string, vol.Match(r"^[0-9]{4,8}\Z"))
 
 
 def async_register_lock_services() -> None:

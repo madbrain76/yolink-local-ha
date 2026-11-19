@@ -26,6 +26,9 @@ CREDENTIAL_TYPES = {**ENROLLABLE_TYPES, "pin": "Code"}
 TEMP_CODE_TYPES = {"one_time": "OneTime", "time_range": "RangeTime", "recurring": "PeriodTime"}
 TEMP_CODE_TYPES_REVERSE = {v: k for k, v in TEMP_CODE_TYPES.items()}
 REPEAT_TYPES = {"weekly", "monthly"}
+# addUserCredential requires a daily window. Credentials created in the YoLink
+# app read back as 0:0-0:0, which the lock treats as all day.
+ALL_DAY = {"effectiveStartTime": "0:0", "effectiveEndTime": "0:0"}
 
 
 def _encode_secret(code: str) -> str:
@@ -36,9 +39,18 @@ def _decode_secret(secret: Any) -> str | None:
     if not isinstance(secret, str):
         return None
     try:
-        return base64.b64decode(secret, validate=True).decode("ascii")
+        code = base64.b64decode(secret, validate=True).decode("ascii")
     except (binascii.Error, UnicodeDecodeError):
         return None
+    # Only report something that looks like a PIN; the hub can return padded
+    # or obscured secrets, and those must not be shown, even masked.
+    return code if _is_ascii_digits(code) else None
+
+
+def _is_ascii_digits(code: str) -> bool:
+    # str.isdigit() also accepts non-ASCII digits (e.g. Arabic-Indic or
+    # superscripts), which cannot be encoded for the lock.
+    return code.isascii() and code.isdigit()
 
 
 def _mask(code: str | None) -> str | None:
@@ -49,7 +61,7 @@ def _mask(code: str | None) -> str | None:
 
 def _validate_code(code: str, label: str) -> str:
     code = str(code).strip()
-    if not code.isdigit() or not PIN_MIN_LENGTH <= len(code) <= PIN_MAX_LENGTH:
+    if not _is_ascii_digits(code) or not PIN_MIN_LENGTH <= len(code) <= PIN_MAX_LENGTH:
         raise ServiceValidationError(
             f"{label} must be {PIN_MIN_LENGTH}-{PIN_MAX_LENGTH} digits"
         )
@@ -169,8 +181,8 @@ class LockUserManagementMixin:
             "cipher": {"type": "Code", "secret": _encode_secret(_validate_code(pin, "PIN"))},
             "effectivePeriod": {"type": "disable"},
             "effectiveTimes": int(uses),
+            **(_daily_window(daily_start, daily_end) or ALL_DAY),
         }
-        params.update(_daily_window(daily_start, daily_end))
         result = await self._user_management(params)
         return {"credentials": _credential_ids(result)}
 
@@ -189,6 +201,7 @@ class LockUserManagementMixin:
                 "cipher": {"type": cipher_type},
                 "effectivePeriod": {"type": "disable"},
                 "effectiveTimes": 0,
+                **ALL_DAY,
             }
         )
         return {"credentials": _credential_ids(result)}
@@ -282,6 +295,10 @@ class LockUserManagementMixin:
                 raise ServiceValidationError("recurring codes need repeat: weekly or monthly")
             if not days:
                 raise ServiceValidationError("recurring codes need at least one day")
+            if daily_start is None or daily_end is None:
+                raise ServiceValidationError(
+                    "recurring codes need daily_start and daily_end"
+                )
             params["effectivePeriod"] = {"type": repeat, "value": [str(d) for d in days]}
             params.update(_daily_window(daily_start, daily_end))
         else:

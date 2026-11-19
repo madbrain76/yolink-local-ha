@@ -16,7 +16,7 @@ import aiohttp
 import pytest
 from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
@@ -57,6 +57,7 @@ from custom_components.yolocal.event import (
     parse_lock_event,
 )
 from custom_components.yolocal.lock_users import (
+    LockUserManagementMixin,
     _decode_secret,
     _describe_credential,
     _encode_secret,
@@ -5616,3 +5617,76 @@ def test_lock_credentials_are_masked_unless_requested() -> None:
     }
     assert _describe_credential(credential, include_codes=True)["code"] == "482913"
 
+
+class RecordingLockUsers(LockUserManagementMixin):
+    """Lock user actions that record the userManagement params they send."""
+
+    def __init__(self) -> None:
+        self._device = make_lock_v2("lockv2-users")
+        self.sent: list[dict] = []
+
+        async def async_user_management(_device_id, params):
+            self.sent.append(params)
+            return {}
+
+        self.coordinator = SimpleNamespace(async_user_management=async_user_management)
+
+
+def test_lock_credentials_always_send_a_daily_window() -> None:
+    """addUserCredential requires daily times; omitted means all day (0:0-0:0)."""
+    lock = RecordingLockUsers()
+    asyncio.run(lock.async_add_pin(user_id=0, pin="482913"))
+    asyncio.run(lock.async_enroll_credential(user_id=2, credential_type="fingerprint"))
+    asyncio.run(
+        lock.async_add_pin(
+            user_id=3, pin="1234", daily_start="08:30:00", daily_end="17:05:00"
+        )
+    )
+
+    assert [(p["userId"], p["effectiveStartTime"], p["effectiveEndTime"]) for p in lock.sent] == [
+        (0, "0:0", "0:0"),
+        (2, "0:0", "0:0"),
+        (3, "8:30", "17:5"),
+    ]
+    with pytest.raises(ServiceValidationError):
+        asyncio.run(lock.async_add_pin(user_id=3, pin="1234", daily_start="08:30:00"))
+
+
+def test_recurring_temporary_codes_require_daily_times(monkeypatch) -> None:
+    """PeriodTime codes are refused before sending when the daily window is missing."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    start = datetime(2026, 12, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+
+    with pytest.raises(ServiceValidationError, match="daily_start and daily_end"):
+        asyncio.run(
+            lock.async_add_temporary_code(
+                code="2468", code_type="recurring", start=start, end=end,
+                repeat="weekly", days=["1", "3"],
+            )
+        )
+    assert lock.sent == []
+
+    asyncio.run(
+        lock.async_add_temporary_code(
+            code="2468", code_type="recurring", start=start, end=end,
+            repeat="weekly", days=["1", "3"], daily_start="09:00:00", daily_end="12:00:00",
+        )
+    )
+    assert lock.sent[0]["effectiveStartTime"] == "9:0"
+    assert lock.sent[0]["effectiveEndTime"] == "12:0"
+
+
+def test_lock_codes_must_be_ascii_digits() -> None:
+    """Non-ASCII digits pass str.isdigit() but cannot be encoded for the lock."""
+    lock = RecordingLockUsers()
+    for pin in ("١٢٣٤", "12³4", "12a4", "123"):
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(lock.async_add_pin(user_id=1, pin=pin))
+    assert lock.sent == []
+
+    # Secrets the hub returns that are not plain digits are not shown, even masked.
+    assert _decode_secret(_encode_secret("12*\x00")) is None

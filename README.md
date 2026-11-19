@@ -75,7 +75,9 @@ Outlet `Power` is derived from the local API `power` field, which reports deciwa
 
 GarageDoor controllers only pulse the opener's relay and report no door position, and the local API doesn't report which sensor is paired with them in the YoLink app. So the integration exposes a `Toggle` button: each press sends one `GarageDoor.toggle`, which is never retried, and a press while one is still being sent is ignored. A pulse can start, stop or reverse the door depending on the opener, so anything built on this button, such as a cover combined with a door sensor, has to make sure it never sends a second pulse before the sensor has reported the result of the first.
 
-LockV2 locks also get Home Assistant actions to list users and credentials, add PINs and temporary codes, enroll fingerprints, cards or fobs at the lock, and delete credentials. Codes are masked in responses unless `include_codes` is set. A PIN you pass to an action, or full codes you request, are visible in automation traces and action responses, so treat those like any other secret.
+LockV2 locks also get Home Assistant actions to list users and credentials, add PINs and temporary codes, enroll fingerprints, cards or fobs at the lock, and delete credentials. Codes are masked in responses unless `include_codes` is set. A PIN you pass to an action, or full codes you request, are visible in automation traces and action responses, so treat those like any other secret. Home Assistant also publishes every action's raw input, PIN included, on its event bus as a `call_service` event, where any event listener or recorder can see it, and it can write that input to the debug log when validation fails.
+
+PINs and codes must be 4-8 ASCII digits. PINs, fingerprints, cards and fobs work all day unless you set both `daily_start` and `daily_end`; credentials created in the YoLink app read back with the same all-day window (`0:0`-`0:0`). Recurring temporary codes require `daily_start` and `daily_end`, which the YoLink API marks as required for that type.
 
 WaterMeterController meter and usage readings are shown in liters. Recent usage duration is shown in minutes.
 
