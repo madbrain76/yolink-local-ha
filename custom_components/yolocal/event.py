@@ -52,18 +52,29 @@ def build_event_entities(
 def parse_lock_event(
     event_name: str, data: dict[str, Any]
 ) -> tuple[str | None, str | None, dict[str, Any]]:
-    """Return (alert type, reported lock state, extra attributes) for an MQTT event."""
+    """Return (alert type, reported lock state, extra attributes) for an MQTT event.
+
+    LockV2 echoes its last alert in getState and other reports. Only `.Alert`
+    events describe a new operation, so the alert's type, source and user slot
+    are read from those alone; otherwise a report after an app unlock would be
+    attributed to an earlier failed fingerprint attempt.
+    """
     alert_type = None
-    source = data.get("source")
-    alert = data.get("alert")
-    if isinstance(alert, dict):
-        alert_type = alert.get("type")
-        source = alert.get("source") or source
-    elif data.get("alertType"):
-        alert_type = data.get("alertType")
-    if alert_type is not None and not event_name.endswith(".Alert"):
-        # LockV2 can echo its last alert in reports; only Alert events are new.
-        alert_type = None
+    source = None
+    user = None
+    credential = None
+    if event_name.endswith(".Alert"):
+        alert = data.get("alert")
+        if isinstance(alert, dict):
+            alert_type = alert.get("type")
+            source = alert.get("source")
+            user = alert.get("userId")
+            credential = alert.get("credentialId")
+        else:
+            alert_type = data.get("alertType")
+        source = source or data.get("source")
+        if user is None:
+            user = data.get("user")
 
     state = data.get("state")
     lock_state = state.get("lock") if isinstance(state, dict) else state
@@ -73,9 +84,40 @@ def parse_lock_event(
     attributes: dict[str, Any] = {}
     if source:
         attributes["source"] = source
-    if data.get("user") is not None:
-        attributes["user"] = data["user"]
+    # Slot 0 is a real value (the hub reports it for mechanical and local
+    # keypad operations), so test for None rather than truthiness.
+    if user is not None:
+        attributes["user"] = user
+    if credential is not None:
+        attributes["credential"] = credential
     return alert_type, lock_state, attributes
+
+
+def _operator(source: Any, user: Any) -> str:
+    return f"{source} ({user})" if user is not None else str(source)
+
+
+def event_changed_by(event_name: str, data: dict[str, Any]) -> str | None:
+    """Return who operated the lock in this event, or None if it doesn't say."""
+    _alert_type, lock_state, attributes = parse_lock_event(event_name, data)
+    source = attributes.get("source")
+    if lock_state is None or not source:
+        return None
+    return _operator(source, attributes.get("user"))
+
+
+def initial_changed_by(nested_state: dict[str, Any]) -> str | None:
+    """Return who last operated a LockV2, from the alert its getState echoes.
+
+    Only a successful lock or unlock names the last operator; an echoed
+    failure (for example a rejected fingerprint) does not.
+    """
+    alert = nested_state.get("alert")
+    if not isinstance(alert, dict) or not alert.get("source"):
+        return None
+    if ALERT_TO_ACTIVITY.get(str(alert.get("type", "")).lower()) not in ("locked", "unlocked"):
+        return None
+    return _operator(alert["source"], alert.get("userId"))
 
 
 class _YoLocalLockEvent(YoLocalEntity, EventEntity):
