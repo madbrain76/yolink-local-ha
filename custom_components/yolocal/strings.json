@@ -78,11 +78,11 @@
         },
         "daily_start": {
           "name": "Daily start",
-          "description": "Optional time of day the code starts working."
+          "description": "Time of day the PIN starts working. Leave both daily times empty for all day."
         },
         "daily_end": {
           "name": "Daily end",
-          "description": "Optional time of day the code stops working."
+          "description": "Time of day the PIN stops working. Leave both daily times empty for all day."
         }
       }
     },
@@ -172,11 +172,11 @@
         },
         "daily_start": {
           "name": "Daily start",
-          "description": "Optional time of day the code starts working."
+          "description": "Recurring codes (required): time of day the code starts working."
         },
         "daily_end": {
           "name": "Daily end",
-          "description": "Optional time of day the code stops working."
+          "description": "Recurring codes (required): time of day the code stops working."
         }
       }
     },
