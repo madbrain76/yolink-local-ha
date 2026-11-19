@@ -1,0 +1,20 @@
+{
+  "mqtt_payload": {
+    "data": {
+      "loraInfo": {
+        "devNetType": "C",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "signal": -47
+      },
+      "time": "2026-10-19T23:58:39.000Z",
+      "version": "0630"
+    },
+    "deviceId": "GarageDoor-1",
+    "event": "GarageDoor.getState",
+    "msgid": "1795118320305",
+    "time": 1795118320313
+  },
+  "received_at": 1795118320.3263302,
+  "topic": "ylsubnet/REDACTED_NET_ID/GarageDoor-1/report"
+}

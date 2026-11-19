@@ -1,0 +1,37 @@
+{
+  "request": {
+    "method": "DoorSensor.getState",
+    "targetDevice": "TiltSensor-2",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "online": true,
+      "reportAt": "2026-11-19T19:06:20.283Z",
+      "state": {
+        "alertInterval": 0,
+        "battery": 4,
+        "delay": 0,
+        "loraInfo": {
+          "devNetType": "A",
+          "gatewayId": "REDACTED",
+          "gateways": 1,
+          "location": {
+            "altitude": 0,
+            "latitude": 0,
+            "longitude": 0
+          },
+          "signal": -45
+        },
+        "openRemindDelay": 0,
+        "state": "closed",
+        "version": "0630"
+      }
+    },
+    "desc": "Success",
+    "method": "DoorSensor.getState",
+    "msgid": 1795118320320,
+    "time": 1795118320320
+  }
+}

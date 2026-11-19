@@ -1,0 +1,22 @@
+{
+  "mqtt_payload": {
+    "data": {
+      "alertType": "normal",
+      "battery": 4,
+      "loraInfo": {
+        "devNetType": "A",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "signal": -43
+      },
+      "state": "closed",
+      "version": "0630"
+    },
+    "deviceId": "TiltSensor-2",
+    "event": "DoorSensor.Alert",
+    "msgid": "1795118362702",
+    "time": 1795118362705
+  },
+  "received_at": 1795118362.7131069,
+  "topic": "ylsubnet/REDACTED_NET_ID/TiltSensor-2/report"
+}

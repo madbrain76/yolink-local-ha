@@ -37,6 +37,7 @@ For devices with a Battery entity, an offline device reports 0% so it appears in
 | Device Type | Entity Type | Features | Models               |
 |-------------|-------------|----------|----------------------|
 | DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
+| GarageDoor | Button | Toggle (pulses the opener relay; see below for open/close) | YS4906-UC
 | LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
 | Manipulator | Valve, Sensor | Open/closed control, battery | YS4909-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
@@ -69,6 +70,32 @@ Diagnostics entities listed as "bug" are being returned from the Yolink local AP
 This bug would be best fixed by Yolink in their local API implementation, rather than manually blacklisted in this project.
 
 Outlet `Power` is derived from the local API `power` field, which reports deciwatts on the tested YS6614-UC smart plug. The local API `watt` field was observed to remain at `0` and is not exposed.
+
+GarageDoor controllers only pulse the opener's relay and report no door position, and the local API doesn't report which sensor is paired with them in the YoLink app. So the integration exposes a `Toggle` button, and each press sends one `GarageDoor.toggle` (never retried; a press while one is still being sent is ignored). To get an open/close cover, combine it with any door or tilt sensor in a [template cover](https://www.home-assistant.io/integrations/cover.template/), for example:
+
+```yaml
+template:
+  - cover:
+      - name: Garage Door
+        device_class: garage
+        availability: "{{ states('binary_sensor.garage_door_sensor') in ['on', 'off'] }}"
+        state: "{{ 'open' if is_state('binary_sensor.garage_door_sensor', 'on') else 'closed' }}"
+        open_cover:
+          # A toggle can move the door either way, so only press when it is closed.
+          - condition: state
+            entity_id: binary_sensor.garage_door_sensor
+            state: "off"
+          - action: button.press
+            target:
+              entity_id: button.garage_door_toggle
+        close_cover:
+          - condition: state
+            entity_id: binary_sensor.garage_door_sensor
+            state: "on"
+          - action: button.press
+            target:
+              entity_id: button.garage_door_toggle
+```
 
 WaterMeterController meter and usage readings are shown in liters. Recent usage duration is shown in minutes.
 
