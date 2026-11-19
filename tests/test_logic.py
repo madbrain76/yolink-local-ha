@@ -8,7 +8,7 @@ import logging
 import threading
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,11 +56,13 @@ from custom_components.yolocal.event import (
     initial_changed_by,
     parse_lock_event,
 )
+from custom_components.yolocal.lock import YoLocalLock
 from custom_components.yolocal.lock_users import (
     LockUserManagementMixin,
     _decode_secret,
     _describe_credential,
     _encode_secret,
+    strict_int,
 )
 from custom_components.yolocal.sensor import (
     YoLocalBatterySensor,
@@ -5625,9 +5627,11 @@ class RecordingLockUsers(LockUserManagementMixin):
         self._device = make_lock_v2("lockv2-users")
         self.sent: list[dict] = []
 
+        self.reply: dict = {}
+
         async def async_user_management(_device_id, params):
             self.sent.append(params)
-            return {}
+            return self.reply
 
         self.coordinator = SimpleNamespace(async_user_management=async_user_management)
 
@@ -5690,3 +5694,139 @@ def test_lock_codes_must_be_ascii_digits() -> None:
 
     # Secrets the hub returns that are not plain digits are not shown, even masked.
     assert _decode_secret(_encode_secret("12*\x00")) is None
+
+
+def test_temporary_code_daily_window_is_kept_or_refused(monkeypatch) -> None:
+    """Daily limits only apply to recurring codes, and only to the minute."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    start = datetime(2026, 12, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+
+    # A time range code cannot carry a daily window, so it is refused, not dropped.
+    with pytest.raises(ServiceValidationError, match="only apply to recurring"):
+        asyncio.run(
+            lock.async_add_temporary_code(
+                code="2468", code_type="time_range", start=start, end=end,
+                daily_start="09:00:00", daily_end="17:00:00",
+            )
+        )
+
+    # 00:00:30-00:00:45 would truncate to 0:0-0:0, which means all day.
+    for daily_start, daily_end in (
+        ("00:00:30", "00:00:45"),
+        (time(0, 0, 30), time(0, 0, 45)),
+        ("09:00:00.5", "17:00"),
+        ("24:00", "17:00"),
+    ):
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(
+                lock.async_add_temporary_code(
+                    code="2468", code_type="recurring", start=start, end=end,
+                    repeat="weekly", days=["1"], daily_start=daily_start, daily_end=daily_end,
+                )
+            )
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(
+                lock.async_add_pin(
+                    user_id=1, pin="2468", daily_start=daily_start, daily_end=daily_end
+                )
+            )
+    assert lock.sent == []
+
+    # Whole minutes, as the time selector sends them, are accepted.
+    asyncio.run(
+        lock.async_add_pin(user_id=1, pin="2468", daily_start=time(0, 0), daily_end="00:01:00")
+    )
+    assert lock.sent[0]["effectiveStartTime"] == "0:0"
+    assert lock.sent[0]["effectiveEndTime"] == "0:1"
+
+
+@pytest.mark.parametrize("bad", [2.7, True, False, "1.5", "-1", "two", "", None, -1])
+def test_lock_ids_are_validated_before_any_request(bad) -> None:
+    """Coercion must not turn a bad id into a different user, credential or code."""
+    lock = RecordingLockUsers()
+    calls = (
+        lambda: lock.async_delete_user(user_id=bad),
+        lambda: lock.async_delete_credential(user_id=bad, credential_id=1, credential_type="pin"),
+        lambda: lock.async_delete_credential(user_id=1, credential_id=bad, credential_type="pin"),
+        lambda: lock.async_delete_temporary_code(code_id=bad),
+        lambda: lock.async_add_pin(user_id=1, pin="2468", uses=bad),
+    )
+    for call in calls:
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(call())
+    assert lock.sent == []
+
+
+def test_lock_ids_accept_whole_numbers_only() -> None:
+    """Whole numbers in any form the UI or YAML sends map to themselves."""
+    assert [strict_int(value) for value in (3, 3.0, "3", " 12 ")] == [3, 3, 3, 12]
+    for bad in (2.5, True, "3.0", "1e3", "٣"):
+        with pytest.raises(ValueError):
+            strict_int(bad)
+
+    lock = RecordingLockUsers()
+    asyncio.run(lock.async_delete_temporary_code(code_id="7"))
+    asyncio.run(lock.async_delete_credential(user_id=2.0, credential_id=0, credential_type="pin"))
+    assert lock.sent == [
+        {"command": "delTemporaryCredential", "credentialId": 7},
+        {"command": "delUserCredential", "userId": 2, "credentialId": 0, "cipherType": "Code"},
+    ]
+
+
+def test_lock_code_readback_skips_malformed_values() -> None:
+    """Only 4-8 ASCII digit codes are shown; anything else is left out, not raised."""
+    assert _decode_secret(_encode_secret("12")) is None
+    assert _decode_secret(_encode_secret("123456789")) is None
+    assert _decode_secret("MTI€") is None
+    assert _decode_secret(_encode_secret("4829")) == "4829"
+
+    lock = RecordingLockUsers()
+    lock.reply = {
+        "credentials": [
+            {"id": 1, "cipher": {"type": "Password", "secret": _encode_secret("12")}},
+            {"id": 2, "cipher": {"type": "Password", "secret": "MTI€"}},
+            {"id": 3, "cipher": {"type": "Password", "secret": _encode_secret("482913")}},
+        ]
+    }
+    result = asyncio.run(lock.async_get_temporary_codes(code_type="one_time"))
+    assert [code.get("code") for code in result["codes"]] == [None, None, "••••13"]
+
+
+def test_lock_entity_changed_by_follows_attributed_changes() -> None:
+    """Replay captured events through the lock entity itself."""
+    manual_lock = lock_v2_capture("LockV2-2", "mqtt_0071.json")
+    app_unlock = lock_v2_capture("LockV2-2", "mqtt_0002.json")
+    keypad_unlock = lock_v2_capture("LockV2-2", "mqtt_0075.json")
+    echo = lock_v2_capture("LockV2-2", "mqtt_0003.json")
+    failed = {
+        "alert": {"type": "UnLockFailed", "source": "Fingerprint"},
+        "state": {"lock": "unlocked"},
+    }
+
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=manual_lock["deviceId"], device_type="LockV2", model="YS7618-UC"
+    )
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {
+        "online": True, "state": {"lock": "unlocked"}
+    }
+    lock = YoLocalLock(coordinator, device)
+    lock.async_write_ha_state = lambda: None
+
+    def replay(event_name: str, data: dict) -> str | None:
+        lock._handle_device_event(event_name, data)
+        return lock.changed_by
+
+    assert replay(manual_lock["event"], manual_lock["data"]) == "Manual"
+    # The app unlock only echoes setState: the lock changed, but not by "Manual".
+    assert replay(app_unlock["event"], app_unlock["data"]) is None
+    assert replay(keypad_unlock["event"], keypad_unlock["data"]) == "LocalPassword (0)"
+    # A live failed attempt carries the current state but operated nothing.
+    assert replay("LockV2.Alert", failed) == "LocalPassword (0)"
+    # A report repeating the state keeps the operator.
+    assert replay(echo["event"], echo["data"]) == "LocalPassword (0)"

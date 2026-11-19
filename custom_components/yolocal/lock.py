@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import LOCK_V2_DEVICE_TYPE
 from .coordinator import YoLocalCoordinator
 from .entity import YoLocalEntity, async_setup_device_entities
-from .event import event_changed_by, initial_changed_by
+from .event import event_changed_by, initial_changed_by, parse_lock_event
 from .lock_services import async_register_lock_services
 from .lock_users import LockUserManagementMixin
 
@@ -45,8 +45,11 @@ class YoLocalLock(LockUserManagementMixin, YoLocalEntity, LockEntity):
         """Initialize the lock."""
         super().__init__(coordinator, device)
         self._changed_by: str | None = None
+        # Last lock state seen in an event, to notice a change nobody claimed.
+        self._last_lock_state: str | None = None
         if self._is_v2:
             self._changed_by = initial_changed_by(self.nested_device_state)
+            self._last_lock_state = self.state_value("lock")
 
     @property
     def _is_v2(self) -> bool:
@@ -77,8 +80,17 @@ class YoLocalLock(LockUserManagementMixin, YoLocalEntity, LockEntity):
         )
 
     def _handle_device_event(self, event_name: str, data: dict[str, Any]) -> None:
+        _alert_type, lock_state, _attributes = parse_lock_event(event_name, data)
         changed_by = event_changed_by(event_name, data)
-        if changed_by is not None and changed_by != self._changed_by:
+        if changed_by is None and (lock_state is None or lock_state == self._last_lock_state):
+            # No new operator and no state change: keep the last one.
+            changed_by = self._changed_by
+        # Otherwise the lock changed state without saying who did it (an app
+        # or HA command only echoes setState), so the previous operator no
+        # longer applies and changed_by becomes None.
+        if lock_state is not None:
+            self._last_lock_state = lock_state
+        if changed_by != self._changed_by:
             self._changed_by = changed_by
             # The coordinator has already written the new lock state, so write
             # again or the state would carry the previous operator.
