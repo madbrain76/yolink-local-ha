@@ -12,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import LOCK_V2_DEVICE_TYPE
 from .coordinator import YoLocalCoordinator
 from .entity import YoLocalEntity, async_setup_device_entities
-from .event import parse_lock_event
+from .event import event_changed_by, initial_changed_by
 from .lock_services import async_register_lock_services
 from .lock_users import LockUserManagementMixin
 
@@ -36,14 +36,6 @@ def build_lock_entities(coordinator: YoLocalCoordinator, device) -> list[YoLocal
     return [YoLocalLock(coordinator, device)]
 
 
-def lock_alert(nested_state: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Return (alert type, source) from either LockV2 or V1 alert shapes."""
-    alert = nested_state.get("alert")
-    if isinstance(alert, dict):
-        return alert.get("type"), alert.get("source")
-    return nested_state.get("alertType"), nested_state.get("source")
-
-
 class YoLocalLock(LockUserManagementMixin, YoLocalEntity, LockEntity):
     """Lock entity for YoLink smart locks (Lock and LockV2)."""
 
@@ -54,7 +46,7 @@ class YoLocalLock(LockUserManagementMixin, YoLocalEntity, LockEntity):
         super().__init__(coordinator, device)
         self._changed_by: str | None = None
         if self._is_v2:
-            _alert_type, self._changed_by = lock_alert(self.nested_device_state)
+            self._changed_by = initial_changed_by(self.nested_device_state)
 
     @property
     def _is_v2(self) -> bool:
@@ -85,13 +77,8 @@ class YoLocalLock(LockUserManagementMixin, YoLocalEntity, LockEntity):
         )
 
     def _handle_device_event(self, event_name: str, data: dict[str, Any]) -> None:
-        _alert_type, lock_state, attributes = parse_lock_event(event_name, data)
-        source = attributes.get("source")
-        if lock_state is None or not source:
-            return
-        user = attributes.get("user")
-        changed_by = f"{source} ({user})" if user else str(source)
-        if changed_by != self._changed_by:
+        changed_by = event_changed_by(event_name, data)
+        if changed_by is not None and changed_by != self._changed_by:
             self._changed_by = changed_by
             # The coordinator has already written the new lock state, so write
             # again or the state would carry the previous operator.

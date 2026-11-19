@@ -49,7 +49,11 @@ from custom_components.yolocal.entity import (
     device_attributes,
     refresh_when_missing,
 )
-from custom_components.yolocal.event import parse_lock_event
+from custom_components.yolocal.event import (
+    event_changed_by,
+    initial_changed_by,
+    parse_lock_event,
+)
 from custom_components.yolocal.lock_users import (
     _decode_secret,
     _describe_credential,
@@ -5372,6 +5376,60 @@ def test_parse_lock_event_reads_alerts_only_from_alert_events() -> None:
     assert lock_state is None
 
 
+LOCK_V2_CAPTURES = Path(__file__).resolve().parents[1] / "captures/devices"
+
+
+def lock_v2_capture(label: str, filename: str) -> dict:
+    """Return the MQTT payload of a saved LockV2 capture."""
+    return json.loads((LOCK_V2_CAPTURES / label / filename).read_text())["mqtt_payload"]
+
+
+def test_parse_lock_event_reads_user_slot_from_captured_alerts() -> None:
+    """Real alerts carry the slot in alert.userId, and slot 0 is kept."""
+    keypad = lock_v2_capture("LockV2-1", "mqtt_0064.json")
+    assert parse_lock_event(keypad["event"], keypad["data"]) == (
+        "Unlock",
+        "unlocked",
+        {"source": "Password", "user": 3, "credential": 11},
+    )
+
+    local = lock_v2_capture("LockV2-2", "mqtt_0075.json")
+    assert parse_lock_event(local["event"], local["data"]) == (
+        "Unlock",
+        "unlocked",
+        {"source": "LocalPassword", "user": 0, "credential": 0},
+    )
+
+    echo = lock_v2_capture("LockV2-2", "mqtt_0003.json")
+    assert parse_lock_event(echo["event"], echo["data"]) == (None, "unlocked", {})
+
+
+def test_lock_v2_changed_by_ignores_echoed_alert_in_captures() -> None:
+    """An app unlock followed by getState must not report an old failed fingerprint."""
+    events = [
+        lock_v2_capture("LockV2-2", filename)
+        for filename in ("mqtt_0002.json", "mqtt_0003.json", "mqtt_0075.json", "mqtt_0003.json")
+    ]
+    seen = [event_changed_by(event["event"], event["data"]) for event in events]
+
+    # setState echo and the getState repeating an earlier failed fingerprint
+    # name nobody; the real local keypad unlock keeps its slot 0.
+    assert seen == [None, None, "LocalPassword (0)", None]
+
+
+def test_initial_changed_by_skips_echoed_failures() -> None:
+    """Startup attribution comes only from a successful lock or unlock."""
+    failed = lock_v2_capture("LockV2-2", "mqtt_0003.json")["data"]
+    assert initial_changed_by(failed) is None
+    assert (
+        initial_changed_by(
+            {"alert": {"type": "Unlock", "source": "Mechanism", "userId": 0}}
+        )
+        == "Mechanism (0)"
+    )
+    assert initial_changed_by({"alert": {"type": "Lock", "source": "Manual"}}) == "Manual"
+
+
 def test_lock_setting_entities_appear_once_attributes_arrive() -> None:
     """A lock asleep at startup still gets its setting entities later."""
     coordinator = make_coordinator()
@@ -5429,3 +5487,4 @@ def test_lock_credentials_are_masked_unless_requested() -> None:
         "code": "••••13",
     }
     assert _describe_credential(credential, include_codes=True)["code"] == "482913"
+
