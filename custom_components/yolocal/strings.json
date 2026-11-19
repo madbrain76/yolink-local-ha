@@ -172,11 +172,11 @@
         },
         "daily_start": {
           "name": "Daily start",
-          "description": "Recurring codes (required): time of day the code starts working."
+          "description": "Recurring codes only (required): time of day the code starts working, in hours and minutes."
         },
         "daily_end": {
           "name": "Daily end",
-          "description": "Recurring codes (required): time of day the code stops working."
+          "description": "Recurring codes only (required): time of day the code stops working, in hours and minutes."
         }
       }
     },

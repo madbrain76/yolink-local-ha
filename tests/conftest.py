@@ -32,6 +32,13 @@ def _install_homeassistant_stubs() -> None:
         return func
 
     core.HomeAssistant = HomeAssistant
+
+    class SupportsResponse:
+        NONE = "none"
+        OPTIONAL = "optional"
+        ONLY = "only"
+
+    core.SupportsResponse = SupportsResponse
     core.callback = callback
 
     config_entries = ModuleType("homeassistant.config_entries")
@@ -185,6 +192,11 @@ def _install_homeassistant_stubs() -> None:
 
     entity_platform = ModuleType("homeassistant.helpers.entity_platform")
     entity_platform.AddEntitiesCallback = object
+
+    config_validation = ModuleType("homeassistant.helpers.config_validation")
+    for name in ("boolean", "datetime", "ensure_list", "string", "time"):
+        setattr(config_validation, name, name)
+    helpers.config_validation = config_validation
 
     entity = ModuleType("homeassistant.helpers.entity")
 
@@ -364,6 +376,14 @@ def _install_homeassistant_stubs() -> None:
     binary_sensor.BinarySensorEntity = BinarySensorEntity
     binary_sensor.BinarySensorDeviceClass = BinarySensorDeviceClass
 
+    lock = ModuleType("homeassistant.components.lock")
+
+    class LockEntity:
+        async def async_remove(self) -> None:
+            return None
+
+    lock.LockEntity = LockEntity
+
     switch = ModuleType("homeassistant.components.switch")
 
     class SwitchEntity:
@@ -453,6 +473,8 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.sensor"] = sensor
     sys.modules["homeassistant.components.binary_sensor"] = binary_sensor
     sys.modules["homeassistant.components.switch"] = switch
+    sys.modules["homeassistant.components.lock"] = lock
+    sys.modules["homeassistant.helpers.config_validation"] = config_validation
     sys.modules["homeassistant.components.valve"] = valve
     sys.modules["homeassistant.components.event"] = event
     sys.modules["homeassistant.const"] = const
@@ -481,6 +503,9 @@ def _install_runtime_dependency_stubs() -> None:
             self.schema = schema
 
     voluptuous.Schema = Schema
+    # Schema building blocks: the stubs only record their arguments.
+    for name in ("All", "Coerce", "In", "Match", "Range"):
+        setattr(voluptuous, name, lambda *args, _name=name, **kwargs: (_name, args, kwargs))
     voluptuous.Required = _SchemaKey
     voluptuous.Optional = _SchemaKey
     sys.modules["voluptuous"] = voluptuous

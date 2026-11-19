@@ -8,7 +8,6 @@ and masked in action responses unless explicitly requested.
 from __future__ import annotations
 
 import base64
-import binascii
 from datetime import datetime
 from typing import Any
 
@@ -40,11 +39,17 @@ def _decode_secret(secret: Any) -> str | None:
         return None
     try:
         code = base64.b64decode(secret, validate=True).decode("ascii")
-    except (binascii.Error, UnicodeDecodeError):
+    except ValueError:
+        # binascii.Error, UnicodeDecodeError, and the ValueError b64decode
+        # raises for non-ASCII input are all ValueErrors.
         return None
-    # Only report something that looks like a PIN; the hub can return padded
-    # or obscured secrets, and those must not be shown, even masked.
-    return code if _is_ascii_digits(code) else None
+    # Only report a well-formed code: the hub can return padded or obscured
+    # secrets, and a short value would be shown in full by the mask.
+    return code if _is_valid_code(code) else None
+
+
+def _is_valid_code(code: str) -> bool:
+    return _is_ascii_digits(code) and PIN_MIN_LENGTH <= len(code) <= PIN_MAX_LENGTH
 
 
 def _is_ascii_digits(code: str) -> bool:
@@ -61,18 +66,46 @@ def _mask(code: str | None) -> str | None:
 
 def _validate_code(code: str, label: str) -> str:
     code = str(code).strip()
-    if not _is_ascii_digits(code) or not PIN_MIN_LENGTH <= len(code) <= PIN_MAX_LENGTH:
+    if not _is_valid_code(code):
         raise ServiceValidationError(
             f"{label} must be {PIN_MIN_LENGTH}-{PIN_MAX_LENGTH} digits"
         )
     return code
 
 
-def _validate_user_id(user_id: int) -> int:
-    user_id = int(user_id)
-    if not 0 <= user_id <= MAX_USER_ID:
-        raise ServiceValidationError(f"user_id must be between 0 and {MAX_USER_ID}")
-    return user_id
+def strict_int(value: Any) -> int:
+    """Return value as an int without changing which number it is.
+
+    int() would turn 2.7 into slot 2 and True into slot 1, so booleans,
+    fractional numbers and non-digit strings are rejected (ValueError, which
+    voluptuous also reports as invalid) instead of coerced.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"expected a whole number, got {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if _is_ascii_digits(text):
+            return int(text)
+    raise ValueError(f"expected a whole number, got {value!r}")
+
+
+def _validate_id(value: Any, label: str, maximum: int | None = None) -> int:
+    try:
+        number = strict_int(value)
+    except ValueError as err:
+        raise ServiceValidationError(f"{label} must be a whole number") from err
+    if number < 0 or (maximum is not None and number > maximum):
+        limit = f"between 0 and {maximum}" if maximum is not None else "0 or more"
+        raise ServiceValidationError(f"{label} must be {limit}")
+    return number
+
+
+def _validate_user_id(user_id: Any) -> int:
+    return _validate_id(user_id, "user_id", MAX_USER_ID)
 
 
 def _to_ms(value: datetime) -> int:
@@ -86,14 +119,31 @@ def _from_ms(value: Any) -> str | None:
 
 
 def _hm(value: Any) -> str:
-    """Format a time (or 'HH:MM[:SS]' string) as YoLink's 'H:m'."""
+    """Format a time (or 'HH:MM[:SS]' string) as YoLink's 'H:m'.
+
+    The API takes hours and minutes only. Seconds are refused rather than
+    dropped: truncating 00:00:30-00:00:45 would send 0:0-0:0, the all-day
+    window.
+    """
     if hasattr(value, "hour"):
-        return f"{value.hour}:{value.minute}"
-    parts = str(value).split(":")
-    try:
-        return f"{int(parts[0])}:{int(parts[1])}"
-    except (IndexError, ValueError) as err:
-        raise ServiceValidationError(f"Invalid time of day: {value}") from err
+        hour, minute = value.hour, value.minute
+        extra = (getattr(value, "second", 0), getattr(value, "microsecond", 0))
+    else:
+        parts = str(value).strip().split(":")
+        try:
+            if len(parts) not in (2, 3) or not all(_is_ascii_digits(p) for p in parts):
+                raise ValueError
+            hour, minute = int(parts[0]), int(parts[1])
+            extra = (int(parts[2]) if len(parts) == 3 else 0, 0)
+        except ValueError as err:
+            raise ServiceValidationError(f"Invalid time of day: {value}") from err
+        if not (0 <= hour <= 23 and 0 <= minute <= 59 and extra[0] <= 59):
+            raise ServiceValidationError(f"Invalid time of day: {value}")
+    if any(extra):
+        raise ServiceValidationError(
+            f"Times of day are set in hours and minutes; remove the seconds from {value}"
+        )
+    return f"{hour}:{minute}"
 
 
 def _describe_credential(credential: dict[str, Any], include_codes: bool) -> dict[str, Any]:
@@ -180,7 +230,7 @@ class LockUserManagementMixin:
             "userId": _validate_user_id(user_id),
             "cipher": {"type": "Code", "secret": _encode_secret(_validate_code(pin, "PIN"))},
             "effectivePeriod": {"type": "disable"},
-            "effectiveTimes": int(uses),
+            "effectiveTimes": _validate_id(uses, "uses", 255),
             **(_daily_window(daily_start, daily_end) or ALL_DAY),
         }
         result = await self._user_management(params)
@@ -218,7 +268,7 @@ class LockUserManagementMixin:
             {
                 "command": "delUserCredential",
                 "userId": _validate_user_id(user_id),
-                "credentialId": int(credential_id),
+                "credentialId": _validate_id(credential_id, "credential_id"),
                 "cipherType": cipher_type,
             }
         )
@@ -302,13 +352,19 @@ class LockUserManagementMixin:
             params["effectivePeriod"] = {"type": repeat, "value": [str(d) for d in days]}
             params.update(_daily_window(daily_start, daily_end))
         else:
+            if daily_start is not None or daily_end is not None:
+                # addTemporaryCredential only applies a daily window to
+                # recurring codes; refuse it here rather than drop it.
+                raise ServiceValidationError(
+                    "daily_start and daily_end only apply to recurring codes"
+                )
             params["effectivePeriod"] = {"type": "disable"}
 
         await self._user_management(params)
 
     async def async_delete_temporary_code(self, code_id: int) -> None:
         await self._user_management(
-            {"command": "delTemporaryCredential", "credentialId": int(code_id)}
+            {"command": "delTemporaryCredential", "credentialId": _validate_id(code_id, "code_id")}
         )
 
 

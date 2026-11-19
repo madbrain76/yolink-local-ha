@@ -13,9 +13,13 @@ from .lock_users import (
     MAX_USER_ID,
     REPEAT_TYPES,
     TEMP_CODE_TYPES,
+    strict_int,
 )
 
-USER_ID = vol.All(vol.Coerce(int), vol.Range(min=0, max=MAX_USER_ID))
+# strict_int, not vol.Coerce(int): coercion would turn 2.7 or True into a
+# different slot.
+USER_ID = vol.All(strict_int, vol.Range(min=0, max=MAX_USER_ID))
+SLOT_ID = vol.All(strict_int, vol.Range(min=0))
 # [0-9], not \d: \d also matches non-ASCII digits that cannot be encoded.
 CODE = vol.All(cv.string, vol.Match(r"^[0-9]{4,8}\Z"))
 
@@ -40,7 +44,7 @@ def async_register_lock_services() -> None:
         {
             vol.Required("user_id"): USER_ID,
             vol.Required("pin"): CODE,
-            vol.Optional("uses", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
+            vol.Optional("uses", default=0): vol.All(strict_int, vol.Range(min=0, max=255)),
             vol.Optional("daily_start"): cv.time,
             vol.Optional("daily_end"): cv.time,
         },
@@ -60,7 +64,7 @@ def async_register_lock_services() -> None:
         "delete_lock_credential",
         {
             vol.Required("user_id"): USER_ID,
-            vol.Required("credential_id"): vol.Coerce(int),
+            vol.Required("credential_id"): SLOT_ID,
             vol.Required("credential_type"): vol.In(sorted(CREDENTIAL_TYPES)),
         },
         "async_delete_credential",
@@ -91,6 +95,6 @@ def async_register_lock_services() -> None:
     )
     register(
         "delete_lock_temporary_code",
-        {vol.Required("code_id"): vol.Coerce(int)},
+        {vol.Required("code_id"): SLOT_ID},
         "async_delete_temporary_code",
     )

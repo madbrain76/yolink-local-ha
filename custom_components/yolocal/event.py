@@ -97,11 +97,20 @@ def _operator(source: Any, user: Any) -> str:
     return f"{source} ({user})" if user is not None else str(source)
 
 
+def _is_success(alert_type: Any) -> bool:
+    return ALERT_TO_ACTIVITY.get(str(alert_type or "").lower()) in ("locked", "unlocked")
+
+
 def event_changed_by(event_name: str, data: dict[str, Any]) -> str | None:
-    """Return who operated the lock in this event, or None if it doesn't say."""
-    _alert_type, lock_state, attributes = parse_lock_event(event_name, data)
+    """Return who operated the lock in this event, or None if it doesn't say.
+
+    Only a successful lock or unlock alert names an operator. A failed
+    attempt (for example a rejected fingerprint) also carries the current
+    lock state, but it didn't operate the lock.
+    """
+    alert_type, lock_state, attributes = parse_lock_event(event_name, data)
     source = attributes.get("source")
-    if lock_state is None or not source:
+    if lock_state is None or not source or not _is_success(alert_type):
         return None
     return _operator(source, attributes.get("user"))
 
@@ -115,7 +124,7 @@ def initial_changed_by(nested_state: dict[str, Any]) -> str | None:
     alert = nested_state.get("alert")
     if not isinstance(alert, dict) or not alert.get("source"):
         return None
-    if ALERT_TO_ACTIVITY.get(str(alert.get("type", "")).lower()) not in ("locked", "unlocked"):
+    if not _is_success(alert.get("type")):
         return None
     return _operator(alert["source"], alert.get("userId"))
 
