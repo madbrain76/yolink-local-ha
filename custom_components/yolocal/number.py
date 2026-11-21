@@ -5,6 +5,7 @@ from __future__ import annotations
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -61,6 +62,11 @@ class _YoLocalAttributeNumber(YoLocalAttributeEntity, NumberEntity):
         return value
 
     async def async_set_native_value(self, value: float) -> None:
+        # The lock takes whole numbers. Refuse 2.5 rather than send 2.
+        if not float(value).is_integer():
+            raise ServiceValidationError(
+                f"{self.name} takes whole numbers, got {value}"
+            )
         await self.async_set_attribute(int(value))
 
 

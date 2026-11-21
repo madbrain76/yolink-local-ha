@@ -413,6 +413,21 @@ def _install_homeassistant_stubs() -> None:
     binary_sensor.BinarySensorEntity = BinarySensorEntity
     binary_sensor.BinarySensorDeviceClass = BinarySensorDeviceClass
 
+    number = ModuleType("homeassistant.components.number")
+
+    class NumberEntity:
+        @property
+        def name(self):
+            return getattr(self, "_attr_name", None)
+
+    class NumberMode:
+        AUTO = "auto"
+        BOX = "box"
+        SLIDER = "slider"
+
+    number.NumberEntity = NumberEntity
+    number.NumberMode = NumberMode
+
     lock = ModuleType("homeassistant.components.lock")
 
     class LockEntity:
@@ -511,6 +526,7 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.binary_sensor"] = binary_sensor
     sys.modules["homeassistant.components.switch"] = switch
     sys.modules["homeassistant.components.lock"] = lock
+    sys.modules["homeassistant.components.number"] = number
     sys.modules["homeassistant.helpers.config_validation"] = config_validation
     sys.modules["homeassistant.components.valve"] = valve
     sys.modules["homeassistant.components.event"] = event

@@ -161,6 +161,28 @@ def _hm(value: Any) -> str:
     return f"{parsed.hour}:{parsed.minute}"
 
 
+# YoLink numbers weekdays 0-6 (Sunday to Saturday) and month days 1-31.
+PERIOD_DAY_RANGES = {"weekly": (0, 6), "monthly": (1, 31)}
+
+
+def _period_days(repeat: str, days: list[Any]) -> list[str]:
+    """Validate recurring-code days for the repeat type, refusing anything else."""
+    low, high = PERIOD_DAY_RANGES[repeat]
+    numbers: list[int] = []
+    for day in days:
+        try:
+            number = strict_int(day)
+        except ValueError as err:
+            raise ServiceValidationError(f"days must be whole numbers, got {day!r}") from err
+        if not low <= number <= high:
+            names = "0-6 (Sunday to Saturday)" if repeat == "weekly" else "1-31"
+            raise ServiceValidationError(f"{repeat} days must be {names}, got {day!r}")
+        if number in numbers:
+            raise ServiceValidationError(f"day {number} is listed twice")
+        numbers.append(number)
+    return [str(number) for number in sorted(numbers)]
+
+
 def _describe_credential(credential: dict[str, Any], include_codes: bool) -> dict[str, Any]:
     cipher = credential.get("cipher") if isinstance(credential.get("cipher"), dict) else {}
     described: dict[str, Any] = {"id": credential.get("id")}
@@ -350,6 +372,11 @@ class LockUserManagementMixin:
             # Compare as UTC so a naive and an offset-aware value cannot clash.
             if dt_util.as_utc(end) <= dt_util.as_utc(start):
                 raise ServiceValidationError("end must be after start")
+        elif start is not None or end is not None:
+            # startAt/endAt only apply to RangeTime and PeriodTime codes.
+            raise ServiceValidationError(
+                "start and end only apply to time range and recurring codes"
+            )
         if start is not None:
             params["startAt"] = _to_ms(start)
         if end is not None:
@@ -364,7 +391,7 @@ class LockUserManagementMixin:
                 raise ServiceValidationError(
                     "recurring codes need daily_start and daily_end"
                 )
-            params["effectivePeriod"] = {"type": repeat, "value": [str(d) for d in days]}
+            params["effectivePeriod"] = {"type": repeat, "value": _period_days(repeat, days)}
             params.update(_daily_window(daily_start, daily_end))
         else:
             # addTemporaryCredential only applies a schedule to recurring
