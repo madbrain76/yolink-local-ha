@@ -1,0 +1,29 @@
+{
+  "request": {
+    "method": "GarageDoor.getState",
+    "targetDevice": "GarageDoor-1",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "loraInfo": {
+        "devNetType": "C",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "location": {
+          "altitude": 0,
+          "latitude": 0,
+          "longitude": 0
+        },
+        "signal": -47
+      },
+      "time": "2026-10-19T23:58:39.000Z",
+      "version": "0630"
+    },
+    "desc": "Success",
+    "method": "GarageDoor.getState",
+    "msgid": 1795118320311,
+    "time": 1795118320311
+  }
+}

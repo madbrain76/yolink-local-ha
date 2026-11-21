@@ -1835,6 +1835,13 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Get the current state for a device."""
         return self._states.get(device_id, {})
 
+    async def async_toggle(self, device_id: str) -> None:
+        """Send a single, non-retried toggle to a garage door controller."""
+        device = self._devices.get(device_id)
+        if not device:
+            raise ValueError(f"Unknown device: {device_id}")
+        await self._client.call_method(device, "toggle")
+
     async def async_send_command(
         self, device_id: str, params: dict[str, Any]
     ) -> dict[str, Any]:

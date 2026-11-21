@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GarageDoor.toggle",
+    "targetDevice": "GarageDoor-1",
+    "token": "REDACTED"
+  },
+  "response": {
+    "code": "000000",
+    "data": {
+      "loraInfo": {
+        "devNetType": "C",
+        "gatewayId": "REDACTED",
+        "gateways": 1,
+        "location": {
+          "altitude": 0,
+          "latitude": 0,
+          "longitude": 0
+        },
+        "signal": -40
+      },
+      "stateChangedAt": 1795118348457
+    },
+    "desc": "Success",
+    "method": "GarageDoor.toggle",
+    "msgid": 1795118348468,
+    "time": 1795118348468
+  }
+}

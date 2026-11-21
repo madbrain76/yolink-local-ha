@@ -30,4 +30,11 @@ PLATFORMS: list[str] = [
     "switch",
     "siren",
     "valve",
+    "button",
 ]
+
+# Garage door controllers only pulse their relay. They get a toggle button;
+# open/closed comes from whichever sensor the user pairs with it in Home
+# Assistant (for example a template cover). Finger (YS4908) is not enabled:
+# no captures confirm its behavior yet.
+GARAGE_DOOR_DEVICE_TYPES = frozenset({"GarageDoor"})
