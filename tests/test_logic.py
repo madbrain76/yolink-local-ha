@@ -14,15 +14,19 @@ from types import SimpleNamespace
 
 import aiohttp
 import pytest
+import voluptuous as vol
 from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import ServiceCall
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
 import custom_components.yolocal as yolocal_module
 import custom_components.yolocal.api.client as client_module
 import custom_components.yolocal.config_flow as config_flow_module
+import custom_components.yolocal.lock_services as lock_services
 from custom_components.yolocal import _configured_hosts
 from custom_components.yolocal.api.auth import TokenManager
 from custom_components.yolocal.api.client import ApiError, YoLinkClient
@@ -63,6 +67,7 @@ from custom_components.yolocal.lock_users import (
     _describe_credential,
     _encode_secret,
     strict_int,
+    time_of_day,
 )
 from custom_components.yolocal.sensor import (
     YoLocalBatterySensor,
@@ -5796,10 +5801,11 @@ def test_lock_code_readback_skips_malformed_values() -> None:
     assert [code.get("code") for code in result["codes"]] == [None, None, "••••13"]
 
 
-def test_lock_entity_changed_by_follows_attributed_changes() -> None:
-    """Replay captured events through the lock entity itself."""
+def test_lock_entity_publishes_state_and_operator_together() -> None:
+    """Each state Home Assistant receives carries the operator for that state."""
     manual_lock = lock_v2_capture("LockV2-2", "mqtt_0071.json")
     app_unlock = lock_v2_capture("LockV2-2", "mqtt_0002.json")
+    app_lock = lock_v2_capture("LockV2-2", "mqtt_0001.json")
     keypad_unlock = lock_v2_capture("LockV2-2", "mqtt_0075.json")
     echo = lock_v2_capture("LockV2-2", "mqtt_0003.json")
     failed = {
@@ -5812,21 +5818,158 @@ def test_lock_entity_changed_by_follows_attributed_changes() -> None:
         device_id=manual_lock["deviceId"], device_type="LockV2", model="YS7618-UC"
     )
     coordinator._devices[device.device_id] = device
-    coordinator._states[device.device_id] = {
-        "online": True, "state": {"lock": "unlocked"}
-    }
+    coordinator._states[device.device_id] = {"online": True, "state": {"lock": "unlocked"}}
     lock = YoLocalLock(coordinator, device)
-    lock.async_write_ha_state = lambda: None
+    published: list[tuple[bool | None, str | None]] = []
+    lock.async_write_ha_state = lambda: published.append((lock.is_locked, lock.changed_by))
+    coordinator.async_add_listener(lock._handle_coordinator_update)
 
-    def replay(event_name: str, data: dict) -> str | None:
-        lock._handle_device_event(event_name, data)
-        return lock.changed_by
+    def mqtt(payload: dict, msgid: str) -> tuple[bool | None, str | None]:
+        coordinator._on_device_event(
+            DeviceEvent(
+                device_id=device.device_id,
+                event=payload["event"],
+                data=payload["data"],
+                # Without the capture's own envelope time, which would make
+                # the replay look delayed.
+                raw={"deviceId": device.device_id, "event": payload["event"], "msgid": msgid},
+            )
+        )
+        return published[-1]
 
-    assert replay(manual_lock["event"], manual_lock["data"]) == "Manual"
-    # The app unlock only echoes setState: the lock changed, but not by "Manual".
-    assert replay(app_unlock["event"], app_unlock["data"]) is None
-    assert replay(keypad_unlock["event"], keypad_unlock["data"]) == "LocalPassword (0)"
+    def http(lock_state: str) -> tuple[bool | None, str | None]:
+        # A poll or command readback: new state, nobody named.
+        coordinator._update_device_state(
+            device.device_id, {**coordinator._states[device.device_id], "state": {"lock": lock_state}}
+        )
+        return published[-1]
+
+    assert mqtt(manual_lock, "1") == (True, "Manual")
+    # The app unlock only echoes setState. The first state Home Assistant
+    # receives for it must not still say "Manual".
+    count = len(published)
+    assert mqtt(app_unlock, "2") == (False, None)
+    assert len(published) == count + 1
+    assert mqtt(keypad_unlock, "3") == (False, "LocalPassword (0)")
     # A live failed attempt carries the current state but operated nothing.
-    assert replay("LockV2.Alert", failed) == "LocalPassword (0)"
+    assert mqtt({"event": "LockV2.Alert", "data": failed}, "4") == (False, "LocalPassword (0)")
     # A report repeating the state keeps the operator.
-    assert replay(echo["event"], echo["data"]) == "LocalPassword (0)"
+    assert mqtt(echo, "5") == (False, "LocalPassword (0)")
+    # An HTTP-only change clears it; an HTTP read of the same state keeps it.
+    assert mqtt(manual_lock, "6") == (True, "Manual")
+    assert http("locked") == (True, "Manual")
+    assert http("unlocked") == (False, None)
+    assert mqtt(app_lock, "7") == (True, None)
+
+
+
+def registered_lock_actions(monkeypatch) -> dict[str, tuple[object, object]]:
+    """Register the lock actions and return {name: (schema, handler)}."""
+    actions: dict[str, tuple[object, object]] = {}
+
+    def register(name, schema, func, **_kwargs):
+        actions[name] = (vol.Schema(schema), func)
+
+    monkeypatch.setattr(
+        lock_services.entity_platform,
+        "async_get_current_platform",
+        lambda: SimpleNamespace(async_register_entity_service=register),
+        raising=False,
+    )
+    lock_services.async_register_lock_services()
+    return actions
+
+
+def test_lock_action_schemas_validate_raw_daily_times(monkeypatch) -> None:
+    """Malformed windows are refused by the action schema itself, before any coercion."""
+    actions = registered_lock_actions(monkeypatch)
+    pin_schema, _ = actions["add_lock_pin"]
+    code_schema, _ = actions["add_lock_temporary_code"]
+    base_pin = {"entity_id": "lock.back_door", "user_id": 1, "pin": "2468"}
+    base_code = {"code": "2468", "code_type": "recurring", "repeat": "weekly", "days": ["1"]}
+
+    for bad in ("00:00:00:99", "08:30:15", "08:30:00.5", "8:3", "24:00", "٠٨:٣٠", " 08:30", 830, None):
+        with pytest.raises(vol.Invalid):
+            pin_schema({**base_pin, "daily_start": bad, "daily_end": "17:00"})
+        with pytest.raises(vol.Invalid):
+            code_schema({**base_code, "daily_start": "09:00", "daily_end": bad})
+
+    accepted = pin_schema({**base_pin, "daily_start": "08:30:00", "daily_end": time(17, 5)})
+    assert accepted["daily_start"] == time(8, 30)
+    assert accepted["daily_end"] == time(17, 5)
+    # The lenient cv.time is not in any lock action schema.
+    assert cv.time not in {
+        validator
+        for schema, _ in actions.values()
+        for validator in schema.schema.values()
+    }
+
+
+def test_time_of_day_is_strict() -> None:
+    assert time_of_day("8:05") == time(8, 5)
+    assert time_of_day("23:59:00") == time(23, 59)
+    for bad in ("23:59:01", time(1, 2, 3), datetime(2026, 1, 1, 8, 0), "08:30:00:00", "08h30"):
+        with pytest.raises(ValueError):
+            time_of_day(bad)
+
+
+def test_non_recurring_codes_refuse_a_schedule(monkeypatch) -> None:
+    """repeat and days only apply to recurring codes; they are refused, not dropped."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    start = datetime(2026, 12, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+    for extra in ({"repeat": "weekly"}, {"days": ["1"]}):
+        for code_type in ("time_range", "one_time"):
+            window = {"start": start, "end": end} if code_type == "time_range" else {}
+            with pytest.raises(ServiceValidationError, match="only apply to recurring"):
+                asyncio.run(
+                    lock.async_add_temporary_code(
+                        code="2468", code_type=code_type, **window, **extra
+                    )
+                )
+    assert lock.sent == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"area_id": "front_porch"},
+        {"label_id": "locks"},
+        {"device_id": "abc"},
+        {"floor_id": "ground"},
+        {"entity_id": ["lock.back_door", "lock.front_door"]},
+        {"entity_id": "lock.back_door, lock.front_door"},
+        {"entity_id": "all"},
+        {"entity_id": "lock.back_door", "area_id": "front_porch"},
+        {},
+    ],
+)
+def test_lock_deletes_need_exactly_one_lock_entity(monkeypatch, target) -> None:
+    """A slot id is local to one lock, so a delete must name that lock alone."""
+    actions = registered_lock_actions(monkeypatch)
+    deletes = {
+        "delete_lock_credential": {"user_id": 1, "credential_id": 2, "credential_type": "pin"},
+        "delete_lock_user": {"user_id": 1},
+        "delete_lock_temporary_code": {"code_id": 3},
+    }
+    for name, fields in deletes.items():
+        lock = RecordingLockUsers()
+        lock.entity_id = "lock.back_door"
+        _schema, handler = actions[name]
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(handler(lock, ServiceCall("yolocal", name, {**target, **fields})))
+        assert lock.sent == []
+
+
+def test_lock_delete_on_one_lock_is_sent(monkeypatch) -> None:
+    actions = registered_lock_actions(monkeypatch)
+    lock = RecordingLockUsers()
+    lock.entity_id = "lock.back_door"
+    _schema, handler = actions["delete_lock_temporary_code"]
+    asyncio.run(
+        handler(lock, ServiceCall("yolocal", "x", {"entity_id": ["lock.back_door"], "code_id": 3}))
+    )
+    assert lock.sent == [{"command": "delTemporaryCredential", "credentialId": 3}]

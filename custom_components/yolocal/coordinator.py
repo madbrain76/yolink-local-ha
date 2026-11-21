@@ -243,6 +243,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._recent_mqtt_events: dict[str, float] = {}
         # Per-device raw MQTT event listeners (LockV2 lock and event entities)
         self._device_event_listeners: dict[str, list[DeviceEventListener]] = {}
+        # The raw MQTT event whose state is being published, per device, so
+        # entities can read it during that same state update.
+        self._applying_events: dict[str, tuple[str, dict[str, Any]]] = {}
         self._contact_events: dict[str, str] = {}
         self._contacts: dict[str, dict[str, str]] = {}
         self._th_measurements: dict[str, dict[str, list[Any]]] = {}
@@ -648,6 +651,14 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 listeners.remove(listener)
 
         return unsubscribe
+
+    def applying_device_event(self, device_id: str) -> tuple[str, dict[str, Any]] | None:
+        """Return the MQTT event behind the state update now being published.
+
+        None means the update came from a poll or a command readback, which
+        don't say who operated the device.
+        """
+        return self._applying_events.get(device_id)
 
     def _dispatch_device_event(
         self, device: Device, event_name: str, event_data: dict[str, Any]
@@ -1183,7 +1194,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._log_device_unavailable(
                 device_id, "mqtt", "event", prior, normalized_event
             )
-        self._update_device_state(device_id, merged)
+        self._applying_events[device_id] = (event.event, event_data)
+        try:
+            self._update_device_state(device_id, merged)
+        finally:
+            self._applying_events.pop(device_id, None)
         self._dispatch_device_event(device, event.event, event_data)
 
     def _on_thsensor_data_record(self, event: DeviceEvent) -> None:
