@@ -8,20 +8,25 @@ import logging
 import threading
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
 import pytest
+import voluptuous as vol
 from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import ServiceCall
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
 import custom_components.yolocal as yolocal_module
 import custom_components.yolocal.api.client as client_module
 import custom_components.yolocal.config_flow as config_flow_module
+import custom_components.yolocal.lock_services as lock_services
 from custom_components.yolocal import _configured_hosts
 from custom_components.yolocal.api.auth import TokenManager
 from custom_components.yolocal.api.client import ApiError, YoLinkClient
@@ -43,8 +48,25 @@ from custom_components.yolocal.coordinator import (
     device_contact_timestamp,
 )
 from custom_components.yolocal.entity import (
+    YoLocalAttributeEntity,
     YoLocalEntity,
     async_setup_device_entities,
+    device_attributes,
+    refresh_when_missing,
+)
+from custom_components.yolocal.event import (
+    event_changed_by,
+    initial_changed_by,
+    parse_lock_event,
+)
+from custom_components.yolocal.lock import YoLocalLock
+from custom_components.yolocal.lock_users import (
+    LockUserManagementMixin,
+    _decode_secret,
+    _describe_credential,
+    _encode_secret,
+    strict_int,
+    time_of_day,
 )
 from custom_components.yolocal.sensor import (
     YoLocalBatterySensor,
@@ -5248,3 +5270,662 @@ def test_clearing_statistics_without_a_recorder_is_harmless() -> None:
     coordinator = make_coordinator()
     coordinator.async_clear_entity_statistics(["sensor.anything"])
     coordinator.async_clear_entity_statistics([])
+
+
+def make_lock_v2(label: str = "lockv2") -> Device:
+    """Create a LockV2 smart lock device."""
+    return make_device(
+        device_id=make_device_id(label), device_type="LockV2", model="YS7618-UC"
+    )
+
+
+# getState shape with lock/door under `state` and settings beside it, the same
+# layout LockV2 uses in its MQTT reports.
+LOCK_V2_GET_STATE = {
+    "online": True,
+    "state": {"lock": "locked", "door": "closed"},
+    "battery": 4,
+    "alert": {"type": "unlock", "source": "app"},
+    "attributes": {"autoLock": 30, "soundLevel": 2, "rlSet": "left"},
+}
+
+
+def test_lock_v2_get_state_keeps_nested_lock_and_attributes() -> None:
+    """LockV2 getState goes through the MQTT path so settings land under `state`."""
+    coordinator = make_coordinator()
+    device = make_lock_v2()
+    coordinator._devices[device.device_id] = device
+
+    state = coordinator._normalize_http_state(LOCK_V2_GET_STATE, device)
+    coordinator._states[device.device_id] = state
+
+    assert state["state"]["lock"] == "locked"
+    assert state["state"]["door"] == "closed"
+    assert state["state"]["battery"] == 4
+    assert device_attributes(coordinator, device) == {
+        "autoLock": 30,
+        "soundLevel": 2,
+        "rlSet": "left",
+    }
+
+
+def test_lock_user_management_reply_never_reaches_state_cache() -> None:
+    """Credential replies may carry secrets and must not be merged or dispatched."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-users")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"state": {"lock": "locked"}}
+    received: list[str] = []
+    coordinator.register_device_event_listener(
+        device.device_id, lambda name, _data: received.append(name)
+    )
+    event = DeviceEvent(
+        device_id=device.device_id,
+        event="LockV2.userManagement",
+        data={"credentials": [{"cipher": {"secret": "MTIzNA=="}}]},
+        raw={"deviceId": device.device_id, "event": "LockV2.userManagement"},
+    )
+
+    coordinator._on_device_event(event)
+
+    assert coordinator._states[device.device_id] == {"state": {"lock": "locked"}}
+    assert received == []
+
+
+def test_lock_v2_report_is_dispatched_to_device_listeners() -> None:
+    """Entities that follow raw events see each report after the state update."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-report")
+    coordinator._devices[device.device_id] = device
+    seen: list[tuple[str, object]] = []
+
+    def listener(name: str, data: dict[str, object]) -> None:
+        seen.append((name, coordinator._states[device.device_id]["state"]["lock"]))
+
+    unsubscribe = coordinator.register_device_event_listener(device.device_id, listener)
+    event = DeviceEvent(
+        device_id=device.device_id,
+        event="LockV2.Report",
+        data={"state": {"lock": "unlocked"}, "source": "keypad"},
+        raw={"deviceId": device.device_id, "event": "LockV2.Report", "msgid": "1"},
+    )
+
+    coordinator._on_device_event(event)
+    unsubscribe()
+    coordinator._on_device_event(
+        DeviceEvent(
+            device_id=device.device_id,
+            event="LockV2.Report",
+            data={"state": {"lock": "locked"}},
+            raw={"deviceId": device.device_id, "event": "LockV2.Report", "msgid": "2"},
+        )
+    )
+
+    assert seen == [("LockV2.Report", "unlocked")]
+
+
+def test_parse_lock_event_reads_alerts_only_from_alert_events() -> None:
+    """A report echoing the last alert must not look like a new one."""
+    alert, lock_state, attributes = parse_lock_event(
+        "LockV2.Alert",
+        {"alert": {"type": "UnLock", "source": "fingerprint"}, "user": 3},
+    )
+    assert (alert, lock_state, attributes) == (
+        "UnLock",
+        None,
+        {"source": "fingerprint", "user": 3},
+    )
+
+    alert, lock_state, _ = parse_lock_event(
+        "LockV2.Report", {"alert": {"type": "UnLock"}, "state": {"lock": "unlocked"}}
+    )
+    assert (alert, lock_state) == (None, "unlocked")
+
+    _, lock_state, _ = parse_lock_event("Lock.Report", {"state": "jammed"})
+    assert lock_state is None
+
+
+LOCK_V2_CAPTURES = Path(__file__).resolve().parents[1] / "captures/devices"
+
+
+def lock_v2_capture(label: str, filename: str) -> dict:
+    """Return the MQTT payload of a saved LockV2 capture."""
+    return json.loads((LOCK_V2_CAPTURES / label / filename).read_text())["mqtt_payload"]
+
+
+def test_parse_lock_event_reads_user_slot_from_captured_alerts() -> None:
+    """Real alerts carry the slot in alert.userId, and slot 0 is kept."""
+    keypad = lock_v2_capture("LockV2-1", "mqtt_0064.json")
+    assert parse_lock_event(keypad["event"], keypad["data"]) == (
+        "Unlock",
+        "unlocked",
+        {"source": "Password", "user": 3, "credential": 11},
+    )
+
+    local = lock_v2_capture("LockV2-2", "mqtt_0075.json")
+    assert parse_lock_event(local["event"], local["data"]) == (
+        "Unlock",
+        "unlocked",
+        {"source": "LocalPassword", "user": 0, "credential": 0},
+    )
+
+    echo = lock_v2_capture("LockV2-2", "mqtt_0003.json")
+    assert parse_lock_event(echo["event"], echo["data"]) == (None, "unlocked", {})
+
+
+def test_lock_v2_changed_by_ignores_echoed_alert_in_captures() -> None:
+    """An app unlock followed by getState must not report an old failed fingerprint."""
+    events = [
+        lock_v2_capture("LockV2-2", filename)
+        for filename in ("mqtt_0002.json", "mqtt_0003.json", "mqtt_0075.json", "mqtt_0003.json")
+    ]
+    seen = [event_changed_by(event["event"], event["data"]) for event in events]
+
+    # setState echo and the getState repeating an earlier failed fingerprint
+    # name nobody; the real local keypad unlock keeps its slot 0.
+    assert seen == [None, None, "LocalPassword (0)", None]
+
+
+def test_initial_changed_by_skips_echoed_failures() -> None:
+    """Startup attribution comes only from a successful lock or unlock."""
+    failed = lock_v2_capture("LockV2-2", "mqtt_0003.json")["data"]
+    assert initial_changed_by(failed) is None
+    assert (
+        initial_changed_by(
+            {"alert": {"type": "Unlock", "source": "Mechanism", "userId": 0}}
+        )
+        == "Mechanism (0)"
+    )
+    assert initial_changed_by({"alert": {"type": "Lock", "source": "Manual"}}) == "Manual"
+
+
+def test_lock_setting_entities_appear_once_attributes_arrive() -> None:
+    """A lock asleep at startup still gets its setting entities later."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-late")
+    outlet = make_device(device_id=make_device_id("outlet"), device_type="Outlet")
+    coordinator._devices[device.device_id] = device
+
+    def build(coord, dev):
+        attributes = device_attributes(coord, dev)
+        return [
+            YoLocalAttributeEntity(coord, dev, key, key.lower(), key)
+            for key in ("autoLock", "soundLevel")
+            if key in attributes
+        ]
+
+    refresh_needed = refresh_when_missing(build, frozenset({"LockV2"}))
+    existing = build(coordinator, device)
+    assert existing == []
+    assert refresh_needed(coordinator, device, existing) is False
+
+    coordinator._states[device.device_id] = coordinator._normalize_http_state(
+        LOCK_V2_GET_STATE, device
+    )
+    assert refresh_needed(coordinator, device, existing) is True
+    assert refresh_needed(coordinator, device, build(coordinator, device)) is False
+    assert refresh_needed(coordinator, outlet, []) is False
+
+
+def test_lock_attribute_entities_use_snake_case_unique_ids() -> None:
+    """Setting entity ids follow the integration's snake_case convention."""
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-ids")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = coordinator._normalize_http_state(
+        LOCK_V2_GET_STATE, device
+    )
+
+    entity = YoLocalAttributeEntity(
+        coordinator, device, "autoLock", "auto_lock", "Auto-lock delay"
+    )
+
+    assert entity.unique_id == f"{device.device_id}_auto_lock"
+    assert entity.attribute_value == 30
+
+
+def test_lock_credentials_are_masked_unless_requested() -> None:
+    """PINs decode from the hub's base64 and are masked by default."""
+    credential = {"id": 7, "cipher": {"type": "Code", "secret": _encode_secret("482913")}}
+
+    assert _decode_secret(_encode_secret("482913")) == "482913"
+    assert _decode_secret("not base64!") is None
+    assert _describe_credential(credential, include_codes=False) == {
+        "id": 7,
+        "type": "pin",
+        "code": "••••13",
+    }
+    assert _describe_credential(credential, include_codes=True)["code"] == "482913"
+
+
+class RecordingLockUsers(LockUserManagementMixin):
+    """Lock user actions that record the userManagement params they send."""
+
+    def __init__(self) -> None:
+        self._device = make_lock_v2("lockv2-users")
+        self.sent: list[dict] = []
+
+        self.reply: dict = {}
+
+        async def async_user_management(_device_id, params):
+            self.sent.append(params)
+            return self.reply
+
+        self.coordinator = SimpleNamespace(async_user_management=async_user_management)
+
+
+def test_lock_credentials_always_send_a_daily_window() -> None:
+    """addUserCredential requires daily times; omitted means all day (0:0-0:0)."""
+    lock = RecordingLockUsers()
+    asyncio.run(lock.async_add_pin(user_id=0, pin="482913"))
+    asyncio.run(lock.async_enroll_credential(user_id=2, credential_type="fingerprint"))
+    asyncio.run(
+        lock.async_add_pin(
+            user_id=3, pin="1234", daily_start="08:30:00", daily_end="17:05:00"
+        )
+    )
+
+    assert [(p["userId"], p["effectiveStartTime"], p["effectiveEndTime"]) for p in lock.sent] == [
+        (0, "0:0", "0:0"),
+        (2, "0:0", "0:0"),
+        (3, "8:30", "17:5"),
+    ]
+    with pytest.raises(ServiceValidationError):
+        asyncio.run(lock.async_add_pin(user_id=3, pin="1234", daily_start="08:30:00"))
+
+
+def test_recurring_temporary_codes_require_daily_times(monkeypatch) -> None:
+    """PeriodTime codes are refused before sending when the daily window is missing."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    start = datetime(2026, 12, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+
+    with pytest.raises(ServiceValidationError, match="daily_start and daily_end"):
+        asyncio.run(
+            lock.async_add_temporary_code(
+                code="2468", code_type="recurring", start=start, end=end,
+                repeat="weekly", days=["1", "3"],
+            )
+        )
+    assert lock.sent == []
+
+    asyncio.run(
+        lock.async_add_temporary_code(
+            code="2468", code_type="recurring", start=start, end=end,
+            repeat="weekly", days=["1", "3"], daily_start="09:00:00", daily_end="12:00:00",
+        )
+    )
+    assert lock.sent[0]["effectiveStartTime"] == "9:0"
+    assert lock.sent[0]["effectiveEndTime"] == "12:0"
+
+
+def test_lock_codes_must_be_ascii_digits() -> None:
+    """Non-ASCII digits pass str.isdigit() but cannot be encoded for the lock."""
+    lock = RecordingLockUsers()
+    for pin in ("١٢٣٤", "12³4", "12a4", "123"):
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(lock.async_add_pin(user_id=1, pin=pin))
+    assert lock.sent == []
+
+    # Secrets the hub returns that are not plain digits are not shown, even masked.
+    assert _decode_secret(_encode_secret("12*\x00")) is None
+
+
+def test_temporary_code_daily_window_is_kept_or_refused(monkeypatch) -> None:
+    """Daily limits only apply to recurring codes, and only to the minute."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    start = datetime(2026, 12, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+
+    # A time range code cannot carry a daily window, so it is refused, not dropped.
+    with pytest.raises(ServiceValidationError, match="only apply to recurring"):
+        asyncio.run(
+            lock.async_add_temporary_code(
+                code="2468", code_type="time_range", start=start, end=end,
+                daily_start="09:00:00", daily_end="17:00:00",
+            )
+        )
+
+    # 00:00:30-00:00:45 would truncate to 0:0-0:0, which means all day.
+    for daily_start, daily_end in (
+        ("00:00:30", "00:00:45"),
+        (time(0, 0, 30), time(0, 0, 45)),
+        ("09:00:00.5", "17:00"),
+        ("24:00", "17:00"),
+    ):
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(
+                lock.async_add_temporary_code(
+                    code="2468", code_type="recurring", start=start, end=end,
+                    repeat="weekly", days=["1"], daily_start=daily_start, daily_end=daily_end,
+                )
+            )
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(
+                lock.async_add_pin(
+                    user_id=1, pin="2468", daily_start=daily_start, daily_end=daily_end
+                )
+            )
+    assert lock.sent == []
+
+    # Whole minutes, as the time selector sends them, are accepted.
+    asyncio.run(
+        lock.async_add_pin(user_id=1, pin="2468", daily_start=time(0, 0), daily_end="00:01:00")
+    )
+    assert lock.sent[0]["effectiveStartTime"] == "0:0"
+    assert lock.sent[0]["effectiveEndTime"] == "0:1"
+
+
+@pytest.mark.parametrize("bad", [2.7, True, False, "1.5", "-1", "two", "", None, -1])
+def test_lock_ids_are_validated_before_any_request(bad) -> None:
+    """Coercion must not turn a bad id into a different user, credential or code."""
+    lock = RecordingLockUsers()
+    calls = (
+        lambda: lock.async_delete_user(user_id=bad),
+        lambda: lock.async_delete_credential(user_id=bad, credential_id=1, credential_type="pin"),
+        lambda: lock.async_delete_credential(user_id=1, credential_id=bad, credential_type="pin"),
+        lambda: lock.async_delete_temporary_code(code_id=bad),
+        lambda: lock.async_add_pin(user_id=1, pin="2468", uses=bad),
+    )
+    for call in calls:
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(call())
+    assert lock.sent == []
+
+
+def test_lock_ids_accept_whole_numbers_only() -> None:
+    """Whole numbers in any form the UI or YAML sends map to themselves."""
+    assert [strict_int(value) for value in (3, 3.0, "3", " 12 ")] == [3, 3, 3, 12]
+    for bad in (2.5, True, "3.0", "1e3", "٣"):
+        with pytest.raises(ValueError):
+            strict_int(bad)
+
+    lock = RecordingLockUsers()
+    asyncio.run(lock.async_delete_temporary_code(code_id="7"))
+    asyncio.run(lock.async_delete_credential(user_id=2.0, credential_id=0, credential_type="pin"))
+    assert lock.sent == [
+        {"command": "delTemporaryCredential", "credentialId": 7},
+        {"command": "delUserCredential", "userId": 2, "credentialId": 0, "cipherType": "Code"},
+    ]
+
+
+def test_lock_code_readback_skips_malformed_values() -> None:
+    """Only 4-8 ASCII digit codes are shown; anything else is left out, not raised."""
+    assert _decode_secret(_encode_secret("12")) is None
+    assert _decode_secret(_encode_secret("123456789")) is None
+    assert _decode_secret("MTI€") is None
+    assert _decode_secret(_encode_secret("4829")) == "4829"
+
+    lock = RecordingLockUsers()
+    lock.reply = {
+        "credentials": [
+            {"id": 1, "cipher": {"type": "Password", "secret": _encode_secret("12")}},
+            {"id": 2, "cipher": {"type": "Password", "secret": "MTI€"}},
+            {"id": 3, "cipher": {"type": "Password", "secret": _encode_secret("482913")}},
+        ]
+    }
+    result = asyncio.run(lock.async_get_temporary_codes(code_type="one_time"))
+    assert [code.get("code") for code in result["codes"]] == [None, None, "••••13"]
+
+
+def test_lock_entity_publishes_state_and_operator_together() -> None:
+    """Each state Home Assistant receives carries the operator for that state."""
+    manual_lock = lock_v2_capture("LockV2-2", "mqtt_0071.json")
+    app_unlock = lock_v2_capture("LockV2-2", "mqtt_0002.json")
+    app_lock = lock_v2_capture("LockV2-2", "mqtt_0001.json")
+    keypad_unlock = lock_v2_capture("LockV2-2", "mqtt_0075.json")
+    echo = lock_v2_capture("LockV2-2", "mqtt_0003.json")
+    failed = {
+        "alert": {"type": "UnLockFailed", "source": "Fingerprint"},
+        "state": {"lock": "unlocked"},
+    }
+
+    coordinator = make_coordinator()
+    device = make_device(
+        device_id=manual_lock["deviceId"], device_type="LockV2", model="YS7618-UC"
+    )
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True, "state": {"lock": "unlocked"}}
+    lock = YoLocalLock(coordinator, device)
+    published: list[tuple[bool | None, str | None]] = []
+    lock.async_write_ha_state = lambda: published.append((lock.is_locked, lock.changed_by))
+    coordinator.async_add_listener(lock._handle_coordinator_update)
+
+    def mqtt(payload: dict, msgid: str) -> tuple[bool | None, str | None]:
+        coordinator._on_device_event(
+            DeviceEvent(
+                device_id=device.device_id,
+                event=payload["event"],
+                data=payload["data"],
+                # Without the capture's own envelope time, which would make
+                # the replay look delayed.
+                raw={"deviceId": device.device_id, "event": payload["event"], "msgid": msgid},
+            )
+        )
+        return published[-1]
+
+    def http(lock_state: str) -> tuple[bool | None, str | None]:
+        # A poll or command readback: new state, nobody named.
+        coordinator._update_device_state(
+            device.device_id, {**coordinator._states[device.device_id], "state": {"lock": lock_state}}
+        )
+        return published[-1]
+
+    assert mqtt(manual_lock, "1") == (True, "Manual")
+    # The app unlock only echoes setState. The first state Home Assistant
+    # receives for it must not still say "Manual".
+    count = len(published)
+    assert mqtt(app_unlock, "2") == (False, None)
+    assert len(published) == count + 1
+    assert mqtt(keypad_unlock, "3") == (False, "LocalPassword (0)")
+    # A live failed attempt carries the current state but operated nothing.
+    assert mqtt({"event": "LockV2.Alert", "data": failed}, "4") == (False, "LocalPassword (0)")
+    # A report repeating the state keeps the operator.
+    assert mqtt(echo, "5") == (False, "LocalPassword (0)")
+    # An HTTP-only change clears it; an HTTP read of the same state keeps it.
+    assert mqtt(manual_lock, "6") == (True, "Manual")
+    assert http("locked") == (True, "Manual")
+    assert http("unlocked") == (False, None)
+    assert mqtt(app_lock, "7") == (True, None)
+
+
+
+def registered_lock_actions(monkeypatch) -> dict[str, tuple[object, object]]:
+    """Register the lock actions and return {name: (schema, handler)}."""
+    actions: dict[str, tuple[object, object]] = {}
+
+    def register(name, schema, func, **_kwargs):
+        actions[name] = (vol.Schema(schema), func)
+
+    monkeypatch.setattr(
+        lock_services.entity_platform,
+        "async_get_current_platform",
+        lambda: SimpleNamespace(async_register_entity_service=register),
+        raising=False,
+    )
+    lock_services.async_register_lock_services()
+    return actions
+
+
+def test_lock_action_schemas_validate_raw_daily_times(monkeypatch) -> None:
+    """Malformed windows are refused by the action schema itself, before any coercion."""
+    actions = registered_lock_actions(monkeypatch)
+    pin_schema, _ = actions["add_lock_pin"]
+    code_schema, _ = actions["add_lock_temporary_code"]
+    base_pin = {"entity_id": "lock.back_door", "user_id": 1, "pin": "2468"}
+    base_code = {"code": "2468", "code_type": "recurring", "repeat": "weekly", "days": ["1"]}
+
+    for bad in ("00:00:00:99", "08:30:15", "08:30:00.5", "8:3", "24:00", "٠٨:٣٠", " 08:30", 830, None):
+        with pytest.raises(vol.Invalid):
+            pin_schema({**base_pin, "daily_start": bad, "daily_end": "17:00"})
+        with pytest.raises(vol.Invalid):
+            code_schema({**base_code, "daily_start": "09:00", "daily_end": bad})
+
+    accepted = pin_schema({**base_pin, "daily_start": "08:30:00", "daily_end": time(17, 5)})
+    assert accepted["daily_start"] == time(8, 30)
+    assert accepted["daily_end"] == time(17, 5)
+    # The lenient cv.time is not in any lock action schema.
+    assert cv.time not in {
+        validator
+        for schema, _ in actions.values()
+        for validator in schema.schema.values()
+    }
+
+
+def test_time_of_day_is_strict() -> None:
+    assert time_of_day("8:05") == time(8, 5)
+    assert time_of_day("23:59:00") == time(23, 59)
+    for bad in ("23:59:01", time(1, 2, 3), datetime(2026, 1, 1, 8, 0), "08:30:00:00", "08h30"):
+        with pytest.raises(ValueError):
+            time_of_day(bad)
+
+
+def test_non_recurring_codes_refuse_a_schedule(monkeypatch) -> None:
+    """repeat and days only apply to recurring codes; they are refused, not dropped."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    start = datetime(2026, 12, 1, tzinfo=UTC)
+    end = datetime(2026, 12, 31, tzinfo=UTC)
+    for extra in ({"repeat": "weekly"}, {"days": ["1"]}):
+        for code_type in ("time_range", "one_time"):
+            window = {"start": start, "end": end} if code_type == "time_range" else {}
+            with pytest.raises(ServiceValidationError, match="only apply to recurring"):
+                asyncio.run(
+                    lock.async_add_temporary_code(
+                        code="2468", code_type=code_type, **window, **extra
+                    )
+                )
+    assert lock.sent == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"area_id": "front_porch"},
+        {"label_id": "locks"},
+        {"device_id": "abc"},
+        {"floor_id": "ground"},
+        {"entity_id": ["lock.back_door", "lock.front_door"]},
+        {"entity_id": "lock.back_door, lock.front_door"},
+        {"entity_id": "all"},
+        {"entity_id": "lock.back_door", "area_id": "front_porch"},
+        {},
+    ],
+)
+def test_lock_slot_actions_need_exactly_one_lock_entity(monkeypatch, target) -> None:
+    """A slot id is local to one lock, so slot actions must name that lock alone."""
+    actions = registered_lock_actions(monkeypatch)
+    deletes = {
+        "delete_lock_credential": {"user_id": 1, "credential_id": 2, "credential_type": "pin"},
+        "delete_lock_user": {"user_id": 1},
+        "delete_lock_temporary_code": {"code_id": 3},
+        "add_lock_pin": {"user_id": 1, "pin": "2468"},
+        "enroll_lock_credential": {"user_id": 1, "credential_type": "fingerprint"},
+    }
+    for name, fields in deletes.items():
+        lock = RecordingLockUsers()
+        lock.entity_id = "lock.back_door"
+        _schema, handler = actions[name]
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(handler(lock, ServiceCall("yolocal", name, {**target, **fields})))
+        assert lock.sent == []
+
+
+def test_lock_delete_on_one_lock_is_sent(monkeypatch) -> None:
+    actions = registered_lock_actions(monkeypatch)
+    lock = RecordingLockUsers()
+    lock.entity_id = "lock.back_door"
+    _schema, handler = actions["delete_lock_temporary_code"]
+    asyncio.run(
+        handler(lock, ServiceCall("yolocal", "x", {"entity_id": ["lock.back_door"], "code_id": 3}))
+    )
+    assert lock.sent == [{"command": "delTemporaryCredential", "credentialId": 3}]
+
+
+def test_slot_add_on_one_lock_returns_its_response(monkeypatch) -> None:
+    actions = registered_lock_actions(monkeypatch)
+    lock = RecordingLockUsers()
+    lock.entity_id = "lock.back_door"
+    lock.reply = {"credentialId": 4}
+    _schema, handler = actions["add_lock_pin"]
+    response = asyncio.run(
+        handler(lock, ServiceCall("yolocal", "add_lock_pin", {"entity_id": ["lock.back_door"], "user_id": 1, "pin": "2468"}))
+    )
+    assert lock.sent[0]["userId"] == 1
+    assert response is not None
+
+
+@pytest.mark.parametrize(
+    ("repeat", "days", "expected"),
+    [
+        ("weekly", ["3", 0, "6"], ["0", "3", "6"]),
+        ("monthly", [31, "1"], ["1", "31"]),
+        ("weekly", ["7"], None),
+        ("weekly", ["-1"], None),
+        ("weekly", ["funday"], None),
+        ("weekly", [1.5], None),
+        ("weekly", [True], None),
+        ("weekly", ["1", "1"], None),
+        ("monthly", ["0"], None),
+        ("monthly", ["32"], None),
+    ],
+)
+def test_recurring_code_days_follow_the_api(monkeypatch, repeat, days, expected) -> None:
+    """Weekly days are 0-6 (Sunday to Saturday), monthly days 1-31; nothing else is sent."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    call = lock.async_add_temporary_code(
+        code="2468", code_type="recurring",
+        start=datetime(2026, 12, 1, tzinfo=UTC), end=datetime(2026, 12, 31, tzinfo=UTC),
+        repeat=repeat, days=days, daily_start="09:00", daily_end="10:00",
+    )
+    if expected is None:
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(call)
+        assert lock.sent == []
+    else:
+        asyncio.run(call)
+        assert lock.sent[0]["effectivePeriod"] == {"type": repeat, "value": expected}
+
+
+def test_one_time_codes_refuse_start_and_end() -> None:
+    """startAt/endAt only apply to time range and recurring codes."""
+    lock = RecordingLockUsers()
+    for window in ({"start": datetime(2026, 12, 1, tzinfo=UTC)}, {"end": datetime(2026, 12, 2, tzinfo=UTC)}):
+        with pytest.raises(ServiceValidationError, match="only apply to time range"):
+            asyncio.run(lock.async_add_temporary_code(code="2468", code_type="one_time", **window))
+    assert lock.sent == []
+
+
+def test_lock_settings_refuse_fractional_values() -> None:
+    """2.5 seconds of auto-lock must not be sent as 2."""
+    from custom_components.yolocal.number import (
+        YoLocalLockAutoLockNumber,
+        YoLocalLockSoundLevelNumber,
+    )
+
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-settings")
+    coordinator._devices[device.device_id] = device
+    for cls, good in ((YoLocalLockAutoLockNumber, 30.0), (YoLocalLockSoundLevelNumber, 2.0)):
+        entity = cls(coordinator, device)
+        sent: list[int] = []
+
+        async def record(value, sent=sent):
+            sent.append(value)
+
+        entity.async_set_attribute = record
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(entity.async_set_native_value(2.5))
+        asyncio.run(entity.async_set_native_value(good))
+        assert sent == [int(good)]

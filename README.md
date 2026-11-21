@@ -38,6 +38,7 @@ For devices with a Battery entity, an offline device reports 0% so it appears in
 |-------------|-------------|----------|----------------------|
 | DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
 | LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
+| LockV2 | Lock, Event, Binary Sensor, Number, Select, Switch, Sensor | Lock/unlock with who operated it, doorbell and activity events, built-in door sensor, lock settings, user and PIN management actions, battery | YS7618-UC, YS7616-UC
 | Manipulator | Valve, Sensor | Open/closed control, battery | YS4909-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
 | Outlet | Switch, Sensor | On/off state, power | YS6614-UC
@@ -55,6 +56,7 @@ This project includes additional entities and diagnostics, not available in the 
 - All devices: `Firmware`, `Last reported`
 - Battery-powered devices: `Battery`, `Low battery`
 - DoorSensor: `Alert interval`, `Delay`, `Open remind delay`
+- LockV2: `Activity` and `Doorbell` events, `Door` (models with a door sensor), `Auto-lock delay`, `Sound level`, `Door handing`, `Set button`, `Open remind delay`
 - LeakSensor: `Detector error`, `Device temperature`, `Freeze error`, `Reminder`
 - MotionSensor : `Alert interval`, `Device temperature`, `LED alarm`, `No-motion delay`, `Sensitivity`
 - Outlet: `Power`
@@ -69,6 +71,10 @@ Diagnostics entities listed as "bug" are being returned from the Yolink local AP
 This bug would be best fixed by Yolink in their local API implementation, rather than manually blacklisted in this project.
 
 Outlet `Power` is derived from the local API `power` field, which reports deciwatts on the tested YS6614-UC smart plug. The local API `watt` field was observed to remain at `0` and is not exposed.
+
+LockV2 locks also get Home Assistant actions to list users and credentials, add PINs and temporary codes, enroll fingerprints, cards or fobs at the lock, and delete credentials. Codes are masked in responses unless `include_codes` is set. A PIN you pass to an action, or full codes you request, are visible in automation traces and action responses, so treat those like any other secret. Home Assistant also publishes every action's raw input, PIN included, on its event bus as a `call_service` event, where any event listener or recorder can see it, and it can write that input to the debug log when validation fails.
+
+PINs and codes must be 4-8 ASCII digits. PINs, fingerprints, cards and fobs work all day unless you set both `daily_start` and `daily_end`; credentials created in the YoLink app read back with the same all-day window (`0:0`-`0:0`). Recurring temporary codes require `daily_start` and `daily_end`, which the YoLink API marks as required for that type; other temporary codes can't have a daily window, `repeat` or `days`, so setting one is refused. Daily times are hours and minutes (`HH:MM`, or `HH:MM:00`), checked as entered, and anything else, including a time with seconds, is refused rather than truncated. Actions that use a user or credential slot (add PIN, enroll, and the deletes) must target exactly one lock entity: slots are local to each lock, so area, device, floor and label targets, or several locks, are refused. Temporary codes have no slot and can be added to several locks at once. Recurring codes take `days` as 0-6 (Sunday to Saturday) for `weekly` or 1-31 for `monthly`; `start` and `end` only apply to time range and recurring codes. Lock settings such as the auto-lock delay take whole numbers. User, credential and code IDs must be whole numbers: `2.5` or `true` is refused, not converted to another slot. Codes read back from the lock are only shown when they are 4-8 digits.
 
 WaterMeterController meter and usage readings are shown in liters. Recent usage duration is shown in minutes.
 

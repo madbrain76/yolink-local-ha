@@ -15,12 +15,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import LOCK_V2_DEVICE_TYPE
 from .coordinator import (
     NO_BATTERY_SENTINEL,
     YoLocalCoordinator,
     device_contact_timestamp,
 )
-from .entity import YoLocalEntity, async_setup_device_entities
+from .entity import YoLocalEntity, async_setup_device_entities, device_attributes
 
 METER_STEP_FACTOR_SCALE = 100_000
 
@@ -43,6 +44,14 @@ def _device_has_record_interval(coordinator: YoLocalCoordinator, device) -> bool
     )
 
 
+def _lock_has_open_remind(coordinator: YoLocalCoordinator, device) -> bool:
+    """Discover the LockV2 door-left-open reminder once its settings arrive."""
+    return (
+        device.device_type == LOCK_V2_DEVICE_TYPE
+        and "openRemind" in device_attributes(coordinator, device)
+    )
+
+
 def _sensor_discovery_needed(coordinator, device, existing) -> bool:
     """Rebuild entities when an optional diagnostic should appear or retire.
 
@@ -57,7 +66,14 @@ def _sensor_discovery_needed(coordinator, device, existing) -> bool:
     record_present = any(
         isinstance(entity, YoLocalTHRecordIntervalSensor) for entity in existing
     )
-    return battery_wanted != battery_present or record_wanted != record_present
+    open_remind_missing = _lock_has_open_remind(coordinator, device) and not any(
+        isinstance(entity, YoLocalLockOpenRemindSensor) for entity in existing
+    )
+    return (
+        battery_wanted != battery_present
+        or record_wanted != record_present
+        or open_remind_missing
+    )
 
 
 def build_sensor_entities(
@@ -133,6 +149,9 @@ def build_sensor_entities(
                 YoLocalOutletPowerSensor(coordinator, device),
             ]
         )
+    elif device.device_type == LOCK_V2_DEVICE_TYPE:
+        if _lock_has_open_remind(coordinator, device):
+            entities.append(YoLocalLockOpenRemindSensor(coordinator, device))
     elif device.device_type == "WaterMeterController":
         entities.extend(
             YoLocalWaterMeterReadingSensor(coordinator, device, key, name, parent)
@@ -209,6 +228,22 @@ class YoLocalWaterMeterReadingSensor(YoLocalEntity, SensorEntity):
         if not isinstance(factor, (int, float)) or isinstance(factor, bool) or factor <= 0:
             return None
         return value * factor / METER_STEP_FACTOR_SCALE
+
+
+class YoLocalLockOpenRemindSensor(YoLocalEntity, SensorEntity):
+    """Door-left-open reminder setting reported by a LockV2 (0 = off)."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Open remind delay"
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_open_remind_delay"
+
+    @property
+    def native_value(self) -> int | None:
+        value = device_attributes(self.coordinator, self._device).get("openRemind")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class YoLocalBatterySensor(YoLocalEntity, SensorEntity):

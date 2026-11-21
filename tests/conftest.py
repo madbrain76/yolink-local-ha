@@ -32,6 +32,21 @@ def _install_homeassistant_stubs() -> None:
         return func
 
     core.HomeAssistant = HomeAssistant
+
+    class SupportsResponse:
+        NONE = "none"
+        OPTIONAL = "optional"
+        ONLY = "only"
+
+    core.SupportsResponse = SupportsResponse
+
+    class ServiceCall:
+        def __init__(self, domain="", service="", data=None) -> None:
+            self.domain = domain
+            self.service = service
+            self.data = data or {}
+
+    core.ServiceCall = ServiceCall
     core.callback = callback
 
     config_entries = ModuleType("homeassistant.config_entries")
@@ -112,7 +127,16 @@ def _install_homeassistant_stubs() -> None:
     class ConfigEntryNotReady(Exception):
         """Minimal not-ready stub."""
 
+    class HomeAssistantError(Exception):
+        """Minimal generic Home Assistant error stub."""
+
     exceptions.ConfigEntryAuthFailed = ConfigEntryAuthFailed
+    exceptions.HomeAssistantError = HomeAssistantError
+
+    class ServiceValidationError(HomeAssistantError):
+        """Minimal service validation error stub."""
+
+    exceptions.ServiceValidationError = ServiceValidationError
     exceptions.ConfigEntryNotReady = ConfigEntryNotReady
 
     helpers = ModuleType("homeassistant.helpers")
@@ -171,11 +195,45 @@ def _install_homeassistant_stubs() -> None:
         def available(self) -> bool:
             return True
 
+        def _handle_coordinator_update(self) -> None:
+            # Like Home Assistant: a coordinator update writes the entity state.
+            self.async_write_ha_state()
+
     update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
     update_coordinator.CoordinatorEntity = CoordinatorEntity
 
     entity_platform = ModuleType("homeassistant.helpers.entity_platform")
     entity_platform.AddEntitiesCallback = object
+
+    config_validation = ModuleType("homeassistant.helpers.config_validation")
+
+    def cv_string(value):
+        if value is None or isinstance(value, (dict, list)):
+            raise ValueError("expected a string")
+        return str(value)
+
+    def cv_boolean(value):
+        if isinstance(value, bool):
+            return value
+        if str(value).lower() in ("true", "on", "yes", "1"):
+            return True
+        if str(value).lower() in ("false", "off", "no", "0"):
+            return False
+        raise ValueError("expected a boolean")
+
+    def cv_time(value):
+        # Mimics Home Assistant's lenient parsing, which the lock actions avoid.
+        from datetime import time
+
+        parts = str(value).split(":")
+        return time(int(parts[0]), int(parts[1]))
+
+    config_validation.string = cv_string
+    config_validation.boolean = cv_boolean
+    config_validation.datetime = lambda value: value
+    config_validation.ensure_list = lambda value: value if isinstance(value, list) else [value]
+    config_validation.time = cv_time
+    helpers.config_validation = config_validation
 
     entity = ModuleType("homeassistant.helpers.entity")
 
@@ -183,6 +241,7 @@ def _install_homeassistant_stubs() -> None:
         """Minimal entity stub."""
 
     class EntityCategory:
+        CONFIG = "config"
         DIAGNOSTIC = "diagnostic"
 
     entity.Entity = Entity
@@ -354,6 +413,29 @@ def _install_homeassistant_stubs() -> None:
     binary_sensor.BinarySensorEntity = BinarySensorEntity
     binary_sensor.BinarySensorDeviceClass = BinarySensorDeviceClass
 
+    number = ModuleType("homeassistant.components.number")
+
+    class NumberEntity:
+        @property
+        def name(self):
+            return getattr(self, "_attr_name", None)
+
+    class NumberMode:
+        AUTO = "auto"
+        BOX = "box"
+        SLIDER = "slider"
+
+    number.NumberEntity = NumberEntity
+    number.NumberMode = NumberMode
+
+    lock = ModuleType("homeassistant.components.lock")
+
+    class LockEntity:
+        async def async_remove(self) -> None:
+            return None
+
+    lock.LockEntity = LockEntity
+
     switch = ModuleType("homeassistant.components.switch")
 
     class SwitchEntity:
@@ -366,6 +448,18 @@ def _install_homeassistant_stubs() -> None:
     switch.SwitchEntity = SwitchEntity
     switch.SwitchDeviceClass = SwitchDeviceClass
 
+
+    event = ModuleType("homeassistant.components.event")
+
+    class EventEntity:
+        async def async_remove(self) -> None:
+            return None
+
+    class EventDeviceClass:
+        DOORBELL = "doorbell"
+
+    event.EventEntity = EventEntity
+    event.EventDeviceClass = EventDeviceClass
 
     valve = ModuleType("homeassistant.components.valve")
 
@@ -431,7 +525,11 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.sensor"] = sensor
     sys.modules["homeassistant.components.binary_sensor"] = binary_sensor
     sys.modules["homeassistant.components.switch"] = switch
+    sys.modules["homeassistant.components.lock"] = lock
+    sys.modules["homeassistant.components.number"] = number
+    sys.modules["homeassistant.helpers.config_validation"] = config_validation
     sys.modules["homeassistant.components.valve"] = valve
+    sys.modules["homeassistant.components.event"] = event
     sys.modules["homeassistant.const"] = const
 
 
@@ -453,12 +551,93 @@ def _install_runtime_dependency_stubs() -> None:
                 and self.default == other.default
             )
 
+    class Invalid(Exception):
+        """Validation failure."""
+
+    def _validate(validator, value):
+        if isinstance(validator, list):
+            if not isinstance(value, list):
+                raise Invalid("expected a list")
+            return [_validate(validator[0], item) for item in value]
+        if isinstance(validator, Schema):
+            return validator(value)
+        try:
+            return validator(value)
+        except Invalid:
+            raise
+        except (ValueError, TypeError) as err:
+            raise Invalid(str(err)) from err
+
     class Schema:
-        def __init__(self, schema) -> None:
+        """Small working subset of voluptuous: dict schemas of validators."""
+
+        def __init__(self, schema, extra=None) -> None:
             self.schema = schema
 
+        def __call__(self, data):
+            if not isinstance(self.schema, dict):
+                return _validate(self.schema, data)
+            if not isinstance(data, dict):
+                raise Invalid("expected a dict")
+            result = dict(data)  # keys outside the schema (targets) pass through
+            for key, validator in self.schema.items():
+                name = key.key if isinstance(key, _SchemaKey) else key
+                if name in data:
+                    result[name] = _validate(validator, data[name])
+                elif isinstance(key, Required):
+                    raise Invalid(f"required key not provided: {name}")
+                elif key.default is not None:
+                    result[name] = key.default() if callable(key.default) else key.default
+            return result
+
+    class Required(_SchemaKey):
+        pass
+
+    def All(*validators):
+        def validate(value):
+            for validator in validators:
+                value = _validate(validator, value)
+            return value
+
+        return validate
+
+    def Coerce(kind):
+        return lambda value: kind(value)
+
+    def In(container):
+        def validate(value):
+            if value not in container:
+                raise Invalid(f"{value!r} is not one of {container}")
+            return value
+
+        return validate
+
+    def Match(pattern):
+        import re
+
+        def validate(value):
+            if not isinstance(value, str) or re.match(pattern, value) is None:
+                raise Invalid(f"{value!r} does not match {pattern}")
+            return value
+
+        return validate
+
+    def Range(min=None, max=None):
+        def validate(value):
+            if (min is not None and value < min) or (max is not None and value > max):
+                raise Invalid(f"{value!r} is out of range")
+            return value
+
+        return validate
+
+    voluptuous.Invalid = Invalid
     voluptuous.Schema = Schema
-    voluptuous.Required = _SchemaKey
+    voluptuous.All = All
+    voluptuous.Coerce = Coerce
+    voluptuous.In = In
+    voluptuous.Match = Match
+    voluptuous.Range = Range
+    voluptuous.Required = Required
     voluptuous.Optional = _SchemaKey
     sys.modules["voluptuous"] = voluptuous
 
