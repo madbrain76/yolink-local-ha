@@ -5947,13 +5947,15 @@ def test_non_recurring_codes_refuse_a_schedule(monkeypatch) -> None:
         {},
     ],
 )
-def test_lock_deletes_need_exactly_one_lock_entity(monkeypatch, target) -> None:
-    """A slot id is local to one lock, so a delete must name that lock alone."""
+def test_lock_slot_actions_need_exactly_one_lock_entity(monkeypatch, target) -> None:
+    """A slot id is local to one lock, so slot actions must name that lock alone."""
     actions = registered_lock_actions(monkeypatch)
     deletes = {
         "delete_lock_credential": {"user_id": 1, "credential_id": 2, "credential_type": "pin"},
         "delete_lock_user": {"user_id": 1},
         "delete_lock_temporary_code": {"code_id": 3},
+        "add_lock_pin": {"user_id": 1, "pin": "2468"},
+        "enroll_lock_credential": {"user_id": 1, "credential_type": "fingerprint"},
     }
     for name, fields in deletes.items():
         lock = RecordingLockUsers()
@@ -5973,3 +5975,84 @@ def test_lock_delete_on_one_lock_is_sent(monkeypatch) -> None:
         handler(lock, ServiceCall("yolocal", "x", {"entity_id": ["lock.back_door"], "code_id": 3}))
     )
     assert lock.sent == [{"command": "delTemporaryCredential", "credentialId": 3}]
+
+
+def test_slot_add_on_one_lock_returns_its_response(monkeypatch) -> None:
+    actions = registered_lock_actions(monkeypatch)
+    lock = RecordingLockUsers()
+    lock.entity_id = "lock.back_door"
+    lock.reply = {"credentialId": 4}
+    _schema, handler = actions["add_lock_pin"]
+    response = asyncio.run(
+        handler(lock, ServiceCall("yolocal", "add_lock_pin", {"entity_id": ["lock.back_door"], "user_id": 1, "pin": "2468"}))
+    )
+    assert lock.sent[0]["userId"] == 1
+    assert response is not None
+
+
+@pytest.mark.parametrize(
+    ("repeat", "days", "expected"),
+    [
+        ("weekly", ["3", 0, "6"], ["0", "3", "6"]),
+        ("monthly", [31, "1"], ["1", "31"]),
+        ("weekly", ["7"], None),
+        ("weekly", ["-1"], None),
+        ("weekly", ["funday"], None),
+        ("weekly", [1.5], None),
+        ("weekly", [True], None),
+        ("weekly", ["1", "1"], None),
+        ("monthly", ["0"], None),
+        ("monthly", ["32"], None),
+    ],
+)
+def test_recurring_code_days_follow_the_api(monkeypatch, repeat, days, expected) -> None:
+    """Weekly days are 0-6 (Sunday to Saturday), monthly days 1-31; nothing else is sent."""
+    monkeypatch.setattr(
+        "custom_components.yolocal.lock_users.dt_util.as_utc", lambda value: value, raising=False
+    )
+    lock = RecordingLockUsers()
+    call = lock.async_add_temporary_code(
+        code="2468", code_type="recurring",
+        start=datetime(2026, 12, 1, tzinfo=UTC), end=datetime(2026, 12, 31, tzinfo=UTC),
+        repeat=repeat, days=days, daily_start="09:00", daily_end="10:00",
+    )
+    if expected is None:
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(call)
+        assert lock.sent == []
+    else:
+        asyncio.run(call)
+        assert lock.sent[0]["effectivePeriod"] == {"type": repeat, "value": expected}
+
+
+def test_one_time_codes_refuse_start_and_end() -> None:
+    """startAt/endAt only apply to time range and recurring codes."""
+    lock = RecordingLockUsers()
+    for window in ({"start": datetime(2026, 12, 1, tzinfo=UTC)}, {"end": datetime(2026, 12, 2, tzinfo=UTC)}):
+        with pytest.raises(ServiceValidationError, match="only apply to time range"):
+            asyncio.run(lock.async_add_temporary_code(code="2468", code_type="one_time", **window))
+    assert lock.sent == []
+
+
+def test_lock_settings_refuse_fractional_values() -> None:
+    """2.5 seconds of auto-lock must not be sent as 2."""
+    from custom_components.yolocal.number import (
+        YoLocalLockAutoLockNumber,
+        YoLocalLockSoundLevelNumber,
+    )
+
+    coordinator = make_coordinator()
+    device = make_lock_v2("lockv2-settings")
+    coordinator._devices[device.device_id] = device
+    for cls, good in ((YoLocalLockAutoLockNumber, 30.0), (YoLocalLockSoundLevelNumber, 2.0)):
+        entity = cls(coordinator, device)
+        sent: list[int] = []
+
+        async def record(value, sent=sent):
+            sent.append(value)
+
+        entity.async_set_attribute = record
+        with pytest.raises(ServiceValidationError):
+            asyncio.run(entity.async_set_native_value(2.5))
+        asyncio.run(entity.async_set_native_value(good))
+        assert sent == [int(good)]
