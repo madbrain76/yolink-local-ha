@@ -6,13 +6,13 @@ from typing import Any
 
 from homeassistant.components.lock import LockEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import LOCK_V2_DEVICE_TYPE
 from .coordinator import YoLocalCoordinator
 from .entity import YoLocalEntity, async_setup_device_entities
-from .event import event_changed_by, initial_changed_by, parse_lock_event
+from .event import event_changed_by, initial_changed_by
 from .lock_services import async_register_lock_services
 from .lock_users import LockUserManagementMixin
 
@@ -45,7 +45,7 @@ class YoLocalLock(LockUserManagementMixin, YoLocalEntity, LockEntity):
         """Initialize the lock."""
         super().__init__(coordinator, device)
         self._changed_by: str | None = None
-        # Last lock state seen in an event, to notice a change nobody claimed.
+        # Last published lock state, to notice a change nobody claimed.
         self._last_lock_state: str | None = None
         if self._is_v2:
             self._changed_by = initial_changed_by(self.nested_device_state)
@@ -68,33 +68,30 @@ class YoLocalLock(LockUserManagementMixin, YoLocalEntity, LockEntity):
             return None
         return state == "locked"
 
-    async def async_added_to_hass(self) -> None:
-        """Follow live events to know who last operated the lock."""
-        await super().async_added_to_hass()
-        if not self._is_v2:
-            return
-        self.async_on_remove(
-            self.coordinator.register_device_event_listener(
-                self._device.device_id, self._handle_device_event
-            )
-        )
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Publish the lock state together with who changed it."""
+        if self._is_v2:
+            self._update_changed_by()
+        super()._handle_coordinator_update()
 
-    def _handle_device_event(self, event_name: str, data: dict[str, Any]) -> None:
-        _alert_type, lock_state, _attributes = parse_lock_event(event_name, data)
-        changed_by = event_changed_by(event_name, data)
-        if changed_by is None and (lock_state is None or lock_state == self._last_lock_state):
-            # No new operator and no state change: keep the last one.
-            changed_by = self._changed_by
-        # Otherwise the lock changed state without saying who did it (an app
-        # or HA command only echoes setState), so the previous operator no
-        # longer applies and changed_by becomes None.
-        if lock_state is not None:
-            self._last_lock_state = lock_state
-        if changed_by != self._changed_by:
-            self._changed_by = changed_by
-            # The coordinator has already written the new lock state, so write
-            # again or the state would carry the previous operator.
-            self.async_write_ha_state()
+    def _update_changed_by(self) -> None:
+        current = self.state_value("lock")
+        event = self.coordinator.applying_device_event(self._device.device_id)
+        operator = event_changed_by(*event) if event is not None else None
+        if operator is not None:
+            self._changed_by = operator
+        elif (
+            current is not None
+            and self._last_lock_state is not None
+            and current != self._last_lock_state
+        ):
+            # The state changed without saying who did it: an app or Home
+            # Assistant command (which only echoes setState), a poll or a
+            # command readback. The previous operator no longer applies.
+            self._changed_by = None
+        if current is not None:
+            self._last_lock_state = current
 
     @property
     def changed_by(self) -> str | None:

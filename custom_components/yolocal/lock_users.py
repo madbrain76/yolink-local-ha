@@ -8,7 +8,9 @@ and masked in action responses unless explicitly requested.
 from __future__ import annotations
 
 import base64
+import re
 from datetime import datetime
+from datetime import time as dt_time
 from typing import Any
 
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
@@ -118,32 +120,45 @@ def _from_ms(value: Any) -> str | None:
     return dt_util.utc_from_timestamp(value / 1000).isoformat()
 
 
-def _hm(value: Any) -> str:
-    """Format a time (or 'HH:MM[:SS]' string) as YoLink's 'H:m'.
+_TIME_OF_DAY = re.compile(r"([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?")
 
-    The API takes hours and minutes only. Seconds are refused rather than
-    dropped: truncating 00:00:30-00:00:45 would send 0:0-0:0, the all-day
-    window.
+
+def time_of_day(value: Any) -> dt_time:
+    """Parse a daily time strictly, from the raw action input.
+
+    Accepts a time, or "H:MM" / "HH:MM" / "HH:MM:00" with ASCII digits and
+    nothing else. Home Assistant's cv.time is not used: it can drop extra
+    fields before a stricter check sees them. The API takes hours and
+    minutes only, so seconds are refused rather than truncated (truncating
+    00:00:30-00:00:45 would send 0:0-0:0, the all-day window). Raises
+    ValueError, which voluptuous reports as invalid input.
     """
-    if hasattr(value, "hour"):
-        hour, minute = value.hour, value.minute
-        extra = (getattr(value, "second", 0), getattr(value, "microsecond", 0))
-    else:
-        parts = str(value).strip().split(":")
-        try:
-            if len(parts) not in (2, 3) or not all(_is_ascii_digits(p) for p in parts):
-                raise ValueError
-            hour, minute = int(parts[0]), int(parts[1])
-            extra = (int(parts[2]) if len(parts) == 3 else 0, 0)
-        except ValueError as err:
-            raise ServiceValidationError(f"Invalid time of day: {value}") from err
-        if not (0 <= hour <= 23 and 0 <= minute <= 59 and extra[0] <= 59):
-            raise ServiceValidationError(f"Invalid time of day: {value}")
-    if any(extra):
-        raise ServiceValidationError(
-            f"Times of day are set in hours and minutes; remove the seconds from {value}"
-        )
-    return f"{hour}:{minute}"
+    if isinstance(value, datetime):
+        raise ValueError(f"expected a time of day, not a date and time: {value!r}")
+    if isinstance(value, dt_time):
+        if value.second or value.microsecond:
+            raise ValueError(f"times of day are hours and minutes; remove the seconds from {value}")
+        return value.replace(tzinfo=None)
+    if not isinstance(value, str):
+        raise ValueError(f"expected a time of day, got {value!r}")
+    match = _TIME_OF_DAY.fullmatch(value)
+    if match is None:
+        raise ValueError(f"invalid time of day: {value!r}")
+    hour, minute = int(match[1]), int(match[2])
+    if hour > 23 or minute > 59:
+        raise ValueError(f"invalid time of day: {value!r}")
+    if match[3] is not None and match[3] != "00":
+        raise ValueError(f"times of day are hours and minutes; remove the seconds from {value}")
+    return dt_time(hour, minute)
+
+
+def _hm(value: Any) -> str:
+    """Format a daily time as YoLink's 'H:m', validating it strictly."""
+    try:
+        parsed = time_of_day(value)
+    except ValueError as err:
+        raise ServiceValidationError(str(err)) from err
+    return f"{parsed.hour}:{parsed.minute}"
 
 
 def _describe_credential(credential: dict[str, Any], include_codes: bool) -> dict[str, Any]:
@@ -352,12 +367,14 @@ class LockUserManagementMixin:
             params["effectivePeriod"] = {"type": repeat, "value": [str(d) for d in days]}
             params.update(_daily_window(daily_start, daily_end))
         else:
+            # addTemporaryCredential only applies a schedule to recurring
+            # codes; refuse one here rather than drop it.
             if daily_start is not None or daily_end is not None:
-                # addTemporaryCredential only applies a daily window to
-                # recurring codes; refuse it here rather than drop it.
                 raise ServiceValidationError(
                     "daily_start and daily_end only apply to recurring codes"
                 )
+            if repeat is not None or days:
+                raise ServiceValidationError("repeat and days only apply to recurring codes")
             params["effectivePeriod"] = {"type": "disable"}
 
         await self._user_management(params)
