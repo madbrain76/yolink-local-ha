@@ -16,6 +16,7 @@ import aiohttp
 import pytest
 from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
@@ -36,6 +37,7 @@ from custom_components.yolocal.binary_sensor import (
     YoLocalWaterFlowSensor,
     YoLocalWaterMeterAlarmSensor,
 )
+from custom_components.yolocal.button import build_button_entities
 from custom_components.yolocal.const import DOMAIN
 from custom_components.yolocal.coordinator import (
     CONTACT_STORE_VERSION,
@@ -5248,3 +5250,101 @@ def test_clearing_statistics_without_a_recorder_is_harmless() -> None:
     coordinator = make_coordinator()
     coordinator.async_clear_entity_statistics(["sensor.anything"])
     coordinator.async_clear_entity_statistics([])
+
+
+GARAGE_CAPTURES = Path(__file__).resolve().parents[1] / "captures/devices/GarageDoor-1"
+
+
+def make_garage_toggle():
+    """Return a garage toggle button whose coordinator records toggles."""
+    coordinator = make_coordinator()
+    device = make_device(device_id=make_device_id("garage"), device_type="GarageDoor")
+    coordinator._devices[device.device_id] = device
+    (button,) = build_button_entities(coordinator, device)
+    return coordinator, device, button
+
+
+def test_only_garage_door_controllers_get_a_toggle_button() -> None:
+    """GarageDoor gets one toggle button; other devices, Finger included, get none."""
+    coordinator = make_coordinator()
+    garage = make_device(device_id=make_device_id("garage"), device_type="GarageDoor")
+    assert [b.unique_id for b in build_button_entities(coordinator, garage)] == [
+        f"{garage.device_id}_toggle"
+    ]
+    for device_type in ("Finger", "DoorSensor", "Outlet", "LockV2"):
+        other = make_device(device_id=make_device_id(device_type), device_type=device_type)
+        assert build_button_entities(coordinator, other) == []
+
+
+def test_garage_toggle_sends_the_captured_request_once() -> None:
+    """A press sends exactly the captured GarageDoor.toggle request, without retry."""
+    capture = json.loads((GARAGE_CAPTURES / "toggle.json").read_text())
+    coordinator = make_coordinator()
+    device = make_device(device_id="GarageDoor-1", device_type="GarageDoor")
+    device.token = "REDACTED"
+    coordinator._devices[device.device_id] = device
+    (button,) = build_button_entities(coordinator, device)
+
+    sent: list[dict] = []
+
+    async def request(payload: dict, retry_transport: bool = False) -> dict:
+        sent.append(payload)
+        return capture["response"]
+
+    # The real client builds the payload; only the HTTP request is faked.
+    client = YoLinkClient.__new__(YoLinkClient)
+    client._request = request
+    coordinator._client = client
+    asyncio.run(button.async_press())
+
+    assert sent == [capture["request"]]
+    assert capture["response"]["code"] == "000000"
+
+
+def test_garage_toggle_ignores_a_press_while_one_is_in_flight() -> None:
+    """A second press during a pending toggle must not send another pulse."""
+    coordinator, device, button = make_garage_toggle()
+    toggles: list[str] = []
+    release = asyncio.Event()
+
+    async def async_toggle(device_id: str) -> None:
+        toggles.append(device_id)
+        await release.wait()
+
+    coordinator.async_toggle = async_toggle
+
+    async def scenario() -> None:
+        first = asyncio.create_task(button.async_press())
+        await asyncio.sleep(0)
+        await button.async_press()
+        release.set()
+        await first
+        await button.async_press()  # the next press after it finished is sent
+
+    asyncio.run(scenario())
+    assert toggles == [device.device_id, device.device_id]
+
+
+def test_garage_toggle_reports_a_rejected_toggle() -> None:
+    """A hub error becomes a Home Assistant error and leaves the button usable."""
+    coordinator, _device, button = make_garage_toggle()
+    calls = 0
+
+    async def async_toggle(_device_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ApiError(code="000201", desc="unreachable", method="GarageDoor.toggle")
+
+    coordinator.async_toggle = async_toggle
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(button.async_press())
+    asyncio.run(button.async_press())
+    assert calls == 2
+
+
+def test_garage_door_capture_has_no_sensor_link() -> None:
+    """The captured device list carries no parentDeviceId, hence no pairing here."""
+    capture = json.loads((GARAGE_CAPTURES / "device_list.json").read_text())
+    assert [entry["type"] for entry in capture["devices"]] == ["GarageDoor", "DoorSensor"]
+    assert all("parentDeviceId" not in entry for entry in capture["devices"])

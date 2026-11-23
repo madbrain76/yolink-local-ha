@@ -37,6 +37,7 @@ For devices with a Battery entity, an offline device reports 0% so it appears in
 | Device Type | Entity Type | Features | Models               |
 |-------------|-------------|----------|----------------------|
 | DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
+| GarageDoor | Button | Toggle (pulses the opener relay; no door position) | YS4906-UC
 | LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
 | Manipulator | Valve, Sensor | Open/closed control, battery | YS4909-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
@@ -69,6 +70,8 @@ Diagnostics entities listed as "bug" are being returned from the Yolink local AP
 This bug would be best fixed by Yolink in their local API implementation, rather than manually blacklisted in this project.
 
 Outlet `Power` is derived from the local API `power` field, which reports deciwatts on the tested YS6614-UC smart plug. The local API `watt` field was observed to remain at `0` and is not exposed.
+
+GarageDoor controllers only pulse the opener's relay and report no door position, and the local API doesn't report which sensor is paired with them in the YoLink app. So the integration exposes a `Toggle` button: each press sends one `GarageDoor.toggle`, which is never retried, and a press while one is still being sent is ignored. A pulse can start, stop or reverse the door depending on the opener, so anything built on this button, such as a cover combined with a door sensor, has to make sure it never sends a second pulse before the sensor has reported the result of the first.
 
 WaterMeterController meter and usage readings are shown in liters. Recent usage duration is shown in minutes.
 

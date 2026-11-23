@@ -1,0 +1,21 @@
+{
+  "code": "000000",
+  "devices": [
+    {
+      "appEui": "REDACTED",
+      "deviceId": "GarageDoor-1",
+      "name": "GarageDoor-1",
+      "token": "REDACTED",
+      "type": "GarageDoor"
+    },
+    {
+      "appEui": "REDACTED",
+      "deviceId": "TiltSensor-2",
+      "name": "TiltSensor-2",
+      "token": "REDACTED",
+      "type": "DoorSensor"
+    }
+  ],
+  "method": "Home.getDeviceList",
+  "note": "Home.getDeviceList reply, reduced to the controller and the tilt sensor paired with it in the YoLink app; no entry carries a link"
+}
