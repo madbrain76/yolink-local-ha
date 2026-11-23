@@ -136,12 +136,20 @@ class YoLinkClient:
                 "Authorization": f"Bearer {token}",
             }
 
+            # Redirects can replay a non-idempotent device command.
             try:
                 async with self._session.post(
                     url,
                     json=payload,
                     headers=headers,
+                    allow_redirects=False,
                 ) as resp:
+                    if 300 <= resp.status < 400:
+                        raise ApiError(
+                            code=str(resp.status),
+                            desc="Unexpected HTTP redirect from YoLink hub",
+                            method=str(payload.get("method") or ""),
+                        )
                     resp.raise_for_status()
                     result = await resp.json()
             except (TimeoutError, aiohttp.ClientConnectionError):

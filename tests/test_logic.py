@@ -147,9 +147,10 @@ def make_coordinator() -> YoLocalCoordinator:
 class FakeApiResponse:
     """Minimal async response object for YoLinkClient tests."""
 
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(self, payload: dict[str, object], status: int = 200) -> None:
         """Initialize the fake response."""
         self._payload = payload
+        self.status = status
 
     def raise_for_status(self) -> None:
         """No-op status validation."""
@@ -353,6 +354,33 @@ def test_read_request_fails_over_to_secondary_host() -> None:
     assert session.posts[2]["url"] == "http://secondary.local:1080/open/yolink/token"
     assert session.posts[3]["url"] == "http://secondary.local:1080/open/yolink/v2/api"
     assert client.host == "secondary.local"
+
+
+@pytest.mark.parametrize("status", [302, 307, 308])
+@pytest.mark.parametrize("method", ["Home.getDeviceList", "GarageDoor.toggle"])
+def test_device_api_rejects_http_redirects(status: int, method: str) -> None:
+    """Reads and commands reject redirects without replay or host failover."""
+    session = FakeSession([FakeApiResponse({"code": "000000"}, status=status)])
+    client = YoLinkClient(
+        "primary.local",
+        FakeTokenManager(),
+        session,
+        hosts=["primary.local", "secondary.local"],
+    )
+    if method == "Home.getDeviceList":
+        request = client.get_devices()
+    else:
+        device = make_device(device_id=make_device_id("garage"), device_type="GarageDoor")
+        request = client.call_method(device, "toggle")
+
+    with pytest.raises(ApiError, match="Unexpected HTTP redirect") as exc:
+        asyncio.run(request)
+
+    assert exc.value.code == str(status)
+    assert exc.value.method == method
+    assert len(session.posts) == 1
+    assert session.posts[0]["allow_redirects"] is False
+    assert client.host == "primary.local"
 
 
 def test_token_manager_fetches_host_specific_tokens() -> None:
