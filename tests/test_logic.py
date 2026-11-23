@@ -17,15 +17,22 @@ import pytest
 import voluptuous as vol
 from capture_yolink_payloads import sanitize_value
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import ServiceCall
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.core import Context, ServiceCall
+from homeassistant.exceptions import (
+    HomeAssistantError,
+    ServiceValidationError,
+    Unauthorized,
+    UnknownUser,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import target as target_stub
 
 import custom_components.yolocal as yolocal_module
 import custom_components.yolocal.api.client as client_module
 import custom_components.yolocal.config_flow as config_flow_module
+import custom_components.yolocal.coordinator as coordinator_module
 import custom_components.yolocal.lock_services as lock_services
 from custom_components.yolocal import _configured_hosts
 from custom_components.yolocal.api.auth import TokenManager
@@ -5863,28 +5870,66 @@ def test_lock_entity_publishes_state_and_operator_together() -> None:
 
 
 
-def registered_lock_actions(monkeypatch) -> dict[str, tuple[object, object]]:
-    """Register the lock actions and return {name: (schema, handler)}."""
-    actions: dict[str, tuple[object, object]] = {}
+class LockActionsHarness:
+    """The lock actions as registered, with fake locks, users and targets."""
 
-    def register(name, schema, func, **_kwargs):
-        actions[name] = (vol.Schema(schema), func)
+    def __init__(self, monkeypatch, locks=("lock.back_door", "lock.front_door")) -> None:
+        self.locks = {}
+        for entity_id in locks:
+            lock = RecordingLockUsers()
+            lock.entity_id = entity_id
+            lock._is_v2 = True
+            lock.available = True
+            lock.async_set_context = lambda _context: None
+            self.locks[entity_id] = lock
+        self.users: dict[str, bool] = {}
+        self.writes: dict[str, tuple] = {}
 
-    monkeypatch.setattr(
-        lock_services.entity_platform,
-        "async_get_current_platform",
-        lambda: SimpleNamespace(async_register_entity_service=register),
-        raising=False,
-    )
-    lock_services.async_register_lock_services()
-    return actions
+        async def async_get_user(user_id):
+            if user_id not in self.users:
+                return None
+            return SimpleNamespace(is_admin=self.users[user_id])
+
+        def async_register(domain, service, handler, schema=None, supports_response=None):
+            self.writes[service] = (schema, handler)
+
+        self.hass = SimpleNamespace(
+            services=SimpleNamespace(async_register=async_register),
+            registered_entity_services={},
+            auth=SimpleNamespace(async_get_user=async_get_user),
+            entity_platforms_stub=[SimpleNamespace(domain="lock", entities=self.locks)],
+        )
+        monkeypatch.setattr(target_stub, "indirect", {}, raising=False)
+        lock_services.async_register_lock_services(self.hass)
+
+    def schema(self, name):
+        if name in self.writes:
+            return self.writes[name][0]
+        return vol.Schema(self.hass.registered_entity_services[name]["schema"])
+
+    def write(self, name, data, *, user_id=None, return_response=False):
+        schema, handler = self.writes[name]
+        call = ServiceCall(
+            "yolocal", name, schema(dict(data)),
+            context=Context(user_id=user_id), return_response=return_response,
+        )
+        return asyncio.run(handler(call))
+
+    def read(self, name, entity_id, data, *, user_id=None):
+        func = self.hass.registered_entity_services[name]["func"]
+        call = ServiceCall("yolocal", name, self.schema(name)({"entity_id": entity_id, **data}),
+                           context=Context(user_id=user_id), return_response=True)
+        return asyncio.run(func(self.locks[entity_id], call))
+
+    def sent(self):
+        return {entity_id: lock.sent for entity_id, lock in self.locks.items() if lock.sent}
 
 
 def test_lock_action_schemas_validate_raw_daily_times(monkeypatch) -> None:
     """Malformed windows are refused by the action schema itself, before any coercion."""
-    actions = registered_lock_actions(monkeypatch)
-    pin_schema, _ = actions["add_lock_pin"]
-    code_schema, _ = actions["add_lock_temporary_code"]
+    actions = LockActionsHarness(monkeypatch)
+    pin_schema = actions.schema("add_lock_pin")
+    code_schema = actions.schema("add_lock_temporary_code")
     base_pin = {"entity_id": "lock.back_door", "user_id": 1, "pin": "2468"}
     base_code = {"code": "2468", "code_type": "recurring", "repeat": "weekly", "days": ["1"]}
 
@@ -5898,10 +5943,9 @@ def test_lock_action_schemas_validate_raw_daily_times(monkeypatch) -> None:
     assert accepted["daily_start"] == time(8, 30)
     assert accepted["daily_end"] == time(17, 5)
     # The lenient cv.time is not in any lock action schema.
+    names = [*actions.writes, *actions.hass.registered_entity_services]
     assert cv.time not in {
-        validator
-        for schema, _ in actions.values()
-        for validator in schema.schema.values()
+        validator for name in names for validator in actions.schema(name).schema.values()
     }
 
 
@@ -5933,61 +5977,113 @@ def test_non_recurring_codes_refuse_a_schedule(monkeypatch) -> None:
     assert lock.sent == []
 
 
+SLOT_WRITES = {
+    "delete_lock_credential": {"user_id": 1, "credential_id": 2, "credential_type": "pin"},
+    "delete_lock_user": {"user_id": 1},
+    "delete_lock_temporary_code": {"code_id": 3},
+    "add_lock_pin": {"user_id": 1, "pin": "2468"},
+    "enroll_lock_credential": {"user_id": 1, "credential_type": "fingerprint"},
+}
+WRITES = {**SLOT_WRITES, "add_lock_temporary_code": {"code": "13579", "code_type": "one_time"}}
+
+
 @pytest.mark.parametrize(
     "target",
     [
-        {"area_id": "front_porch"},
+        {"area_id": "porch"},
         {"label_id": "locks"},
-        {"device_id": "abc"},
-        {"floor_id": "ground"},
         {"entity_id": ["lock.back_door", "lock.front_door"]},
-        {"entity_id": "lock.back_door, lock.front_door"},
         {"entity_id": "all"},
-        {"entity_id": "lock.back_door", "area_id": "front_porch"},
+        {"entity_id": "lock.no_such_lock"},
+        {"area_id": "attic"},
         {},
     ],
 )
-def test_lock_slot_actions_need_exactly_one_lock_entity(monkeypatch, target) -> None:
-    """A slot id is local to one lock, so slot actions must name that lock alone."""
-    actions = registered_lock_actions(monkeypatch)
-    deletes = {
-        "delete_lock_credential": {"user_id": 1, "credential_id": 2, "credential_type": "pin"},
-        "delete_lock_user": {"user_id": 1},
-        "delete_lock_temporary_code": {"code_id": 3},
-        "add_lock_pin": {"user_id": 1, "pin": "2468"},
-        "enroll_lock_credential": {"user_id": 1, "credential_type": "fingerprint"},
-    }
-    for name, fields in deletes.items():
-        lock = RecordingLockUsers()
-        lock.entity_id = "lock.back_door"
-        _schema, handler = actions[name]
+def test_slot_writes_need_exactly_one_lock(monkeypatch, target) -> None:
+    """Slots are local to each lock, so these must resolve to exactly one lock."""
+    actions = LockActionsHarness(monkeypatch)
+    target_stub.indirect.update(
+        {"porch": ["lock.back_door", "lock.front_door"], "locks": ["lock.back_door", "lock.front_door"]}
+    )
+    for name, fields in SLOT_WRITES.items():
         with pytest.raises(ServiceValidationError):
-            asyncio.run(handler(lock, ServiceCall("yolocal", name, {**target, **fields})))
-        assert lock.sent == []
+            actions.write(name, {**target, **fields})
+    assert actions.sent() == {}
 
 
-def test_lock_delete_on_one_lock_is_sent(monkeypatch) -> None:
-    actions = registered_lock_actions(monkeypatch)
-    lock = RecordingLockUsers()
-    lock.entity_id = "lock.back_door"
-    _schema, handler = actions["delete_lock_temporary_code"]
-    asyncio.run(
-        handler(lock, ServiceCall("yolocal", "x", {"entity_id": ["lock.back_door"], "code_id": 3}))
+@pytest.mark.parametrize("name", sorted(WRITES))
+def test_writes_to_an_unavailable_lock_fail(monkeypatch, name) -> None:
+    """Home Assistant would skip an unavailable lock and report success; we refuse."""
+    actions = LockActionsHarness(monkeypatch)
+    actions.locks["lock.back_door"].available = False
+    target_stub.indirect["porch"] = ["lock.back_door", "lock.front_door"]
+    for target in ({"entity_id": "lock.back_door"}, {"area_id": "porch"}):
+        with pytest.raises(ServiceValidationError, match="unavailable"):
+            actions.write(name, {**target, **WRITES[name]})
+    assert actions.sent() == {}
+
+
+def test_writes_refuse_non_lockv2(monkeypatch) -> None:
+    actions = LockActionsHarness(monkeypatch)
+    actions.locks["lock.back_door"]._is_v2 = False
+    with pytest.raises(ServiceValidationError, match="LockV2"):
+        actions.write("delete_lock_user", {"entity_id": "lock.back_door", "user_id": 1})
+    assert actions.sent() == {}
+
+
+def test_slot_write_resolving_to_one_lock_is_sent(monkeypatch) -> None:
+    actions = LockActionsHarness(monkeypatch)
+    target_stub.indirect["back_porch"] = ["lock.back_door"]
+    actions.write("delete_lock_temporary_code", {"area_id": "back_porch", "code_id": 3})
+    actions.locks["lock.back_door"].reply = {"credentialId": 4}
+    response = actions.write(
+        "add_lock_pin", {"entity_id": "lock.back_door", "user_id": 1, "pin": "2468"}, return_response=True
     )
-    assert lock.sent == [{"command": "delTemporaryCredential", "credentialId": 3}]
+    assert actions.sent() == {
+        "lock.back_door": [
+            {"command": "delTemporaryCredential", "credentialId": 3},
+            actions.locks["lock.back_door"].sent[1],
+        ]
+    }
+    assert actions.locks["lock.back_door"].sent[1]["userId"] == 1
+    assert set(response) == {"lock.back_door"}
 
 
-def test_slot_add_on_one_lock_returns_its_response(monkeypatch) -> None:
-    actions = registered_lock_actions(monkeypatch)
-    lock = RecordingLockUsers()
-    lock.entity_id = "lock.back_door"
-    lock.reply = {"credentialId": 4}
-    _schema, handler = actions["add_lock_pin"]
-    response = asyncio.run(
-        handler(lock, ServiceCall("yolocal", "add_lock_pin", {"entity_id": ["lock.back_door"], "user_id": 1, "pin": "2468"}))
-    )
-    assert lock.sent[0]["userId"] == 1
-    assert response is not None
+def test_temporary_code_goes_to_every_targeted_lock(monkeypatch) -> None:
+    actions = LockActionsHarness(monkeypatch)
+    target_stub.indirect["porch"] = ["lock.back_door", "lock.front_door"]
+    actions.write("add_lock_temporary_code", {"area_id": "porch", **WRITES["add_lock_temporary_code"]})
+    assert set(actions.sent()) == {"lock.back_door", "lock.front_door"}
+
+
+@pytest.mark.parametrize("name", sorted(WRITES))
+def test_credential_writes_are_admin_only(monkeypatch, name) -> None:
+    actions = LockActionsHarness(monkeypatch)
+    actions.users.update({"member": False, "admin": True})
+    data = {"entity_id": "lock.back_door", **WRITES[name]}
+    for user_id, error in (("member", Unauthorized), ("ghost", UnknownUser)):
+        with pytest.raises(error):
+            actions.write(name, data, user_id=user_id)
+    assert actions.sent() == {}
+    actions.write(name, data, user_id="admin")
+    actions.write(name, data)  # automations and scripts have no user
+    assert len(actions.sent()["lock.back_door"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [("get_lock_user_credentials", {"user_id": 1}), ("get_lock_temporary_codes", {})],
+)
+def test_unmasked_reads_are_admin_only(monkeypatch, name, data) -> None:
+    actions = LockActionsHarness(monkeypatch)
+    actions.users.update({"member": False, "admin": True})
+    actions.locks["lock.back_door"].reply = {"credentials": []}
+    actions.read(name, "lock.back_door", data, user_id="member")  # masked: allowed
+    with pytest.raises(Unauthorized):
+        actions.read(name, "lock.back_door", {**data, "include_codes": True}, user_id="member")
+    actions.read(name, "lock.back_door", {**data, "include_codes": True}, user_id="admin")
+    registered = actions.hass.registered_entity_services
+    assert registered[name]["entity_domain"] == "lock"
 
 
 @pytest.mark.parametrize(
@@ -6056,3 +6152,106 @@ def test_lock_settings_refuse_fractional_values() -> None:
             asyncio.run(entity.async_set_native_value(2.5))
         asyncio.run(entity.async_set_native_value(good))
         assert sent == [int(good)]
+
+
+def settings_harness(monkeypatch, readbacks):
+    """A LockV2 whose getState answers come from `readbacks` (dicts or error codes)."""
+    monkeypatch.setattr(coordinator_module, "SETTINGS_READBACK_DELAY", 0)
+    coordinator = make_coordinator()
+    device = make_lock_v2("settings")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = coordinator._normalize_http_state(
+        {**LOCK_V2_GET_STATE, "attributes": {"autoLock": 10, "soundLevel": 2, "rlSet": "left"}}, device
+    )
+    answers = list(readbacks)
+    calls = []
+
+    async def call_method(_device, method, params=None):
+        calls.append((method, params))
+        return {}
+
+    async def get_state(_device):
+        calls.append(("getState", None))
+        answer = answers.pop(0)
+        if isinstance(answer, str):
+            raise ApiError(code=answer, desc="Device is busy, try again later.", method="LockV2.getState")
+        return answer
+
+    coordinator._client = SimpleNamespace(call_method=call_method, get_state=get_state)
+    return coordinator, device, calls
+
+
+def reported(auto_lock):
+    return {**LOCK_V2_GET_STATE, "attributes": {"autoLock": auto_lock, "soundLevel": 2, "rlSet": "left"}}
+
+
+def test_setting_shown_only_after_the_lock_confirms_it(monkeypatch) -> None:
+    """Busy (020104) readbacks are retried; the value appears once the lock reports it."""
+    coordinator, device, calls = settings_harness(monkeypatch, ["020104", "020104", reported(30)])
+    asyncio.run(coordinator.async_set_attributes(device.device_id, {"autoLock": 30}))
+    assert device_attributes(coordinator, device)["autoLock"] == 30
+    assert [method for method, _ in calls] == ["setAttributes", "getState", "getState", "getState"]
+
+
+@pytest.mark.parametrize(
+    "readbacks",
+    [
+        ["020104"] * 10,  # busy until the bound
+        [reported(10)] * 10,  # the lock keeps reporting the old value
+        ["000201", reported(10), "020104", reported(10), reported(10)],
+    ],
+)
+def test_unconfirmed_setting_is_reported_not_shown(monkeypatch, readbacks) -> None:
+    coordinator, device, calls = settings_harness(monkeypatch, readbacks)
+    with pytest.raises(HomeAssistantError, match="didn't confirm"):
+        asyncio.run(coordinator.async_set_attributes(device.device_id, {"autoLock": 30}))
+    assert device_attributes(coordinator, device)["autoLock"] == 10
+    assert sum(1 for method, _ in calls if method == "getState") == coordinator_module.SETTINGS_READBACK_ATTEMPTS
+
+
+def test_setting_readback_error_is_raised(monkeypatch) -> None:
+    coordinator, device, _calls = settings_harness(monkeypatch, ["010203"])
+    with pytest.raises(ApiError):
+        asyncio.run(coordinator.async_set_attributes(device.device_id, {"autoLock": 30}))
+    assert device_attributes(coordinator, device)["autoLock"] == 10
+
+
+def test_activity_keeps_a_genuine_unlock_after_an_http_poll() -> None:
+    """Unlocked -> missed MQTT lock -> HTTP poll says locked -> real unlock alert fires."""
+    from custom_components.yolocal.event import YoLocalLockActivityEvent
+
+    app_unlock = lock_v2_capture("LockV2-2", "mqtt_0002.json")
+    keypad_unlock = lock_v2_capture("LockV2-2", "mqtt_0075.json")
+    echo = lock_v2_capture("LockV2-2", "mqtt_0003.json")
+
+    coordinator = make_coordinator()
+    device = make_device(device_id=app_unlock["deviceId"], device_type="LockV2", model="YS7618-UC")
+    coordinator._devices[device.device_id] = device
+    coordinator._states[device.device_id] = {"online": True, "state": {"lock": "locked"}}
+    activity = YoLocalLockActivityEvent(coordinator, device)
+    fired: list[tuple[str, str | None]] = []
+    activity._fire = lambda event_type, attributes=None: fired.append(
+        (event_type, (attributes or {}).get("source"))
+    )
+    activity.async_write_ha_state = lambda: None
+    coordinator.async_add_listener(activity._handle_coordinator_update)
+    coordinator.register_device_event_listener(device.device_id, activity._handle_device_event)
+
+    def mqtt(payload, msgid):
+        coordinator._on_device_event(
+            DeviceEvent(
+                device_id=device.device_id, event=payload["event"], data=payload["data"],
+                raw={"deviceId": device.device_id, "event": payload["event"], "msgid": msgid},
+            )
+        )
+
+    mqtt(app_unlock, "1")
+    assert fired == [("unlocked", None)]
+    # The MQTT lock event is missed; a poll finds the lock locked.
+    coordinator._update_device_state(device.device_id, {"online": True, "state": {"lock": "locked"}})
+    assert fired == [("unlocked", None)]
+    mqtt(keypad_unlock, "2")
+    assert fired == [("unlocked", None), ("unlocked", "LocalPassword")]
+    # Its getState echo is still suppressed.
+    mqtt(echo, "3")
+    assert fired == [("unlocked", None), ("unlocked", "LocalPassword")]

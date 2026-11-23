@@ -13,7 +13,6 @@ from .const import LOCK_V2_DEVICE_TYPE
 from .coordinator import YoLocalCoordinator
 from .entity import YoLocalEntity, async_setup_device_entities
 from .event import event_changed_by, initial_changed_by
-from .lock_services import async_register_lock_services
 from .lock_users import LockUserManagementMixin
 
 LOCK_DEVICE_TYPES = frozenset({"Lock", LOCK_V2_DEVICE_TYPE})
@@ -26,7 +25,6 @@ async def async_setup_entry(
 ) -> None:
     """Set up YoLink locks from a config entry."""
     await async_setup_device_entities(hass, entry, async_add_entities, build_lock_entities)
-    async_register_lock_services()
 
 
 def build_lock_entities(coordinator: YoLocalCoordinator, device) -> list[YoLocalLock]:

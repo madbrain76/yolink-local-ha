@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.core import ServiceCall, SupportsResponse
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.components.lock import DOMAIN as LOCK_DOMAIN
+from homeassistant.const import ATTR_ENTITY_ID, ENTITY_MATCH_ALL
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
+from homeassistant.exceptions import ServiceValidationError, Unauthorized, UnknownUser
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_platform
+from homeassistant.helpers import target as target_helpers
+from homeassistant.helpers.service import async_register_platform_entity_service
 
+from .const import DOMAIN
 from .lock_users import (
     CREDENTIAL_TYPES,
     ENROLLABLE_TYPES,
@@ -32,58 +38,133 @@ CODE = vol.All(cv.string, vol.Match(r"^[0-9]{4,8}\Z"))
 DAILY_TIME = time_of_day
 
 
-INDIRECT_TARGETS = ("area_id", "device_id", "floor_id", "label_id")
+async def require_admin(hass: HomeAssistant, call: ServiceCall) -> None:
+    """Refuse non-admin users, as Home Assistant's admin_only services do.
 
-
-def require_single_lock_target(entity: Any, call: ServiceCall) -> None:
-    """Refuse a slot action unless it names exactly this one lock entity.
-
-    User, credential and code ids are slots local to each lock, so the same
-    id on another lock is a different person or credential. Area, device,
-    floor and label targets, "all", or several entities could send it to
-    more than one lock, so only a single entity_id is accepted. (Temporary
-    codes have no slot and may still go to several locks.)
+    Calls without a user (automations, scripts) are allowed, like there.
     """
-    data = call.data
-    if any(data.get(key) for key in INDIRECT_TARGETS):
+    if not call.context.user_id:
+        return
+    user = await hass.auth.async_get_user(call.context.user_id)
+    if user is None:
+        raise UnknownUser(context=call.context)
+    if not user.is_admin:
+        raise Unauthorized(context=call.context)
+
+
+def resolve_lockv2_targets(
+    hass: HomeAssistant, call: ServiceCall, *, single: bool
+) -> list[Any]:
+    """Resolve a write action's target to available yolocal LockV2 locks.
+
+    Home Assistant's entity-action helpers skip unavailable or unmatched
+    targets and still report success, which would make a revocation that
+    reached no lock look done. So targets are resolved here, and the call
+    fails unless it reaches at least one available LockV2 (exactly one for
+    slot actions, since user and credential slots are local to each lock).
+    """
+    service = call.service
+    registered = {
+        entity_id: entity
+        for platform in entity_platform.async_get_platforms(hass, DOMAIN)
+        if platform.domain == LOCK_DOMAIN
+        for entity_id, entity in platform.entities.items()
+    }
+    if call.data.get(ATTR_ENTITY_ID) == ENTITY_MATCH_ALL:
+        wanted = set(registered)
+    else:
+        selected = target_helpers.async_extract_referenced_entity_ids(
+            hass, target_helpers.TargetSelection(call.data)
+        )
+        wanted = selected.referenced | selected.indirectly_referenced
+    locks = [registered[entity_id] for entity_id in sorted(wanted) if entity_id in registered]
+
+    if unavailable := [lock.entity_id for lock in locks if not lock.available]:
         raise ServiceValidationError(
-            "This action uses lock-specific user and credential slots, so target one lock entity, not an area, device, floor or label"
+            f"{service}: {', '.join(unavailable)} is unavailable; nothing was sent"
         )
-    raw = data.get("entity_id")
-    entity_ids = raw.split(",") if isinstance(raw, str) else list(raw or [])
-    entity_ids = [str(entity_id).strip() for entity_id in entity_ids if str(entity_id).strip()]
-    if entity_ids != [entity.entity_id]:
-        raise ServiceValidationError("This action uses lock-specific user and credential slots, so target exactly one lock entity")
+    if not_v2 := [lock.entity_id for lock in locks if not getattr(lock, "_is_v2", False)]:
+        raise ServiceValidationError(
+            f"{service} is only supported on YoLink LockV2 locks, not {', '.join(not_v2)}"
+        )
+    if not locks:
+        raise ServiceValidationError(f"{service} matched no YoLink lock; nothing was sent")
+    if single and len(locks) != 1:
+        raise ServiceValidationError(
+            f"{service} uses lock-specific user and credential slots, so it must target "
+            f"exactly one lock (matched {len(locks)}); nothing was sent"
+        )
+    return locks
 
 
-def _single_lock_action(
-    method: str, fields: tuple[str, ...]
-) -> Callable[[Any, ServiceCall], Awaitable[Any]]:
-    async def handle(entity: Any, call: ServiceCall) -> Any:
-        require_single_lock_target(entity, call)
-        return await getattr(entity, method)(
-            **{field: call.data[field] for field in fields if field in call.data}
-        )
+def _write_action(
+    hass: HomeAssistant, method: str, *, single: bool
+) -> Callable[[ServiceCall], Awaitable[Any]]:
+    async def handle(call: ServiceCall) -> Any:
+        await require_admin(hass, call)
+        locks = resolve_lockv2_targets(hass, call, single=single)
+        fields = {key: value for key, value in call.data.items() if key not in ENTITY_FIELDS}
+        responses = {}
+        for lock in locks:
+            lock.async_set_context(call.context)
+            responses[lock.entity_id] = await getattr(lock, method)(**fields)
+        return responses if call.return_response else None
 
     return handle
 
 
-def async_register_lock_services() -> None:
-    """Register entity actions for the current lock platform."""
-    platform = entity_platform.async_get_current_platform()
-    register = platform.async_register_entity_service
+def _read_action(
+    hass: HomeAssistant, method: str
+) -> Callable[[Any, ServiceCall], Awaitable[Any]]:
+    async def handle(entity: Any, call: ServiceCall) -> Any:
+        # Masked metadata keeps normal entity permissions; full codes need admin.
+        if call.data.get("include_codes"):
+            await require_admin(hass, call)
+        fields = {key: value for key, value in call.data.items() if key not in ENTITY_FIELDS}
+        return await getattr(entity, method)(**fields)
 
-    register("get_lock_users", {}, "async_get_users", supports_response=SupportsResponse.ONLY)
-    register(
+    return handle
+
+
+ENTITY_FIELDS = ("entity_id", "area_id", "device_id", "floor_id", "label_id")
+
+
+@callback
+def async_register_lock_services(hass: HomeAssistant) -> None:
+    """Register the lock actions once, for every yolocal lock entity."""
+    read = partial(
+        async_register_platform_entity_service, hass, DOMAIN, entity_domain=LOCK_DOMAIN
+    )
+
+    def write(service: str, schema: dict, method: str, *, single: bool, response: bool) -> None:
+        hass.services.async_register(
+            DOMAIN,
+            service,
+            _write_action(hass, method, single=single),
+            schema=cv.make_entity_service_schema(schema),
+            supports_response=SupportsResponse.OPTIONAL if response else SupportsResponse.NONE,
+        )
+
+    read("get_lock_users", schema={}, func="async_get_users", supports_response=SupportsResponse.ONLY)
+    read(
         "get_lock_user_credentials",
-        {
+        schema={
             vol.Required("user_id"): USER_ID,
             vol.Optional("include_codes", default=False): cv.boolean,
         },
-        "async_get_user_credentials",
+        func=_read_action(hass, "async_get_user_credentials"),
         supports_response=SupportsResponse.ONLY,
     )
-    register(
+    read(
+        "get_lock_temporary_codes",
+        schema={
+            vol.Optional("code_type"): vol.In(sorted(TEMP_CODE_TYPES)),
+            vol.Optional("include_codes", default=False): cv.boolean,
+        },
+        func=_read_action(hass, "async_get_temporary_codes"),
+        supports_response=SupportsResponse.ONLY,
+    )
+    write(
         "add_lock_pin",
         {
             vol.Required("user_id"): USER_ID,
@@ -92,46 +173,40 @@ def async_register_lock_services() -> None:
             vol.Optional("daily_start"): DAILY_TIME,
             vol.Optional("daily_end"): DAILY_TIME,
         },
-        _single_lock_action(
-            "async_add_pin", ("user_id", "pin", "uses", "daily_start", "daily_end")
-        ),
-        supports_response=SupportsResponse.OPTIONAL,
+        "async_add_pin",
+        single=True,
+        response=True,
     )
-    register(
+    write(
         "enroll_lock_credential",
         {
             vol.Required("user_id"): USER_ID,
             vol.Required("credential_type"): vol.In(sorted(ENROLLABLE_TYPES)),
         },
-        _single_lock_action("async_enroll_credential", ("user_id", "credential_type")),
-        supports_response=SupportsResponse.OPTIONAL,
+        "async_enroll_credential",
+        single=True,
+        response=True,
     )
-    register(
+    write(
         "delete_lock_credential",
         {
             vol.Required("user_id"): USER_ID,
             vol.Required("credential_id"): SLOT_ID,
             vol.Required("credential_type"): vol.In(sorted(CREDENTIAL_TYPES)),
         },
-        _single_lock_action(
-            "async_delete_credential", ("user_id", "credential_id", "credential_type")
-        ),
+        "async_delete_credential",
+        single=True,
+        response=False,
     )
-    register(
+    write(
         "delete_lock_user",
         {vol.Required("user_id"): USER_ID},
-        _single_lock_action("async_delete_user", ("user_id",)),
+        "async_delete_user",
+        single=True,
+        response=False,
     )
-    register(
-        "get_lock_temporary_codes",
-        {
-            vol.Optional("code_type"): vol.In(sorted(TEMP_CODE_TYPES)),
-            vol.Optional("include_codes", default=False): cv.boolean,
-        },
-        "async_get_temporary_codes",
-        supports_response=SupportsResponse.ONLY,
-    )
-    register(
+    # A temporary code has no slot, so it may go to several locks.
+    write(
         "add_lock_temporary_code",
         {
             vol.Required("code"): CODE,
@@ -144,9 +219,13 @@ def async_register_lock_services() -> None:
             vol.Optional("daily_end"): DAILY_TIME,
         },
         "async_add_temporary_code",
+        single=False,
+        response=False,
     )
-    register(
+    write(
         "delete_lock_temporary_code",
         {vol.Required("code_id"): SLOT_ID},
-        _single_lock_action("async_delete_temporary_code", ("code_id",)),
+        "async_delete_temporary_code",
+        single=True,
+        response=False,
     )

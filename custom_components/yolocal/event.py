@@ -6,7 +6,7 @@ from typing import Any
 
 from homeassistant.components.event import EventDeviceClass, EventEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import LOCK_V2_DEVICE_TYPE
@@ -182,6 +182,20 @@ class YoLocalLockActivityEvent(_YoLocalLockEvent):
     def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
         super().__init__(coordinator, device)
         self._last_lock_state = self._current_lock_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        # A poll or command readback (no MQTT event behind the update) can
+        # change the lock state without an event reaching this entity. Track
+        # it, or a later genuine alert back to the previous state would look
+        # like a duplicate echo and be dropped. Event-driven updates are left
+        # to _handle_device_event, which runs right after them and compares
+        # against the state before the event.
+        if self.coordinator.applying_device_event(self._device.device_id) is None:
+            current = self._current_lock_state()
+            if current is not None:
+                self._last_lock_state = current
+        super()._handle_coordinator_update()
 
     def _current_lock_state(self) -> str | None:
         value = self.state_value("lock")

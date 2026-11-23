@@ -40,12 +40,21 @@ def _install_homeassistant_stubs() -> None:
 
     core.SupportsResponse = SupportsResponse
 
+    class Context:
+        def __init__(self, user_id=None) -> None:
+            self.user_id = user_id
+
     class ServiceCall:
-        def __init__(self, domain="", service="", data=None) -> None:
+        def __init__(
+            self, domain="", service="", data=None, *, context=None, return_response=False
+        ) -> None:
             self.domain = domain
             self.service = service
             self.data = data or {}
+            self.context = context or Context()
+            self.return_response = return_response
 
+    core.Context = Context
     core.ServiceCall = ServiceCall
     core.callback = callback
 
@@ -137,6 +146,17 @@ def _install_homeassistant_stubs() -> None:
         """Minimal service validation error stub."""
 
     exceptions.ServiceValidationError = ServiceValidationError
+
+    class Unauthorized(HomeAssistantError):
+        def __init__(self, context=None, **_kwargs) -> None:
+            super().__init__("Unauthorized")
+            self.context = context
+
+    class UnknownUser(Unauthorized):
+        pass
+
+    exceptions.Unauthorized = Unauthorized
+    exceptions.UnknownUser = UnknownUser
     exceptions.ConfigEntryNotReady = ConfigEntryNotReady
 
     helpers = ModuleType("homeassistant.helpers")
@@ -204,6 +224,10 @@ def _install_homeassistant_stubs() -> None:
 
     entity_platform = ModuleType("homeassistant.helpers.entity_platform")
     entity_platform.AddEntitiesCallback = object
+    # hass.entity_platforms_stub: list of objects with .domain and .entities
+    entity_platform.async_get_platforms = lambda hass, _integration: list(
+        getattr(hass, "entity_platforms_stub", [])
+    )
 
     config_validation = ModuleType("homeassistant.helpers.config_validation")
 
@@ -233,6 +257,13 @@ def _install_homeassistant_stubs() -> None:
     config_validation.datetime = lambda value: value
     config_validation.ensure_list = lambda value: value if isinstance(value, list) else [value]
     config_validation.time = cv_time
+
+    def make_entity_service_schema(schema):
+        # Entity target keys pass through the stub Schema unchanged.
+        return sys.modules["voluptuous"].Schema(schema)
+
+    config_validation.make_entity_service_schema = make_entity_service_schema
+    config_validation.config_entry_only_config_schema = lambda domain: None
     helpers.config_validation = config_validation
 
     entity = ModuleType("homeassistant.helpers.entity")
@@ -435,6 +466,7 @@ def _install_homeassistant_stubs() -> None:
             return None
 
     lock.LockEntity = LockEntity
+    lock.DOMAIN = "lock"
 
     switch = ModuleType("homeassistant.components.switch")
 
@@ -493,6 +525,8 @@ def _install_homeassistant_stubs() -> None:
 
     const = ModuleType("homeassistant.const")
     const.PERCENTAGE = "%"
+    const.ATTR_ENTITY_ID = "entity_id"
+    const.ENTITY_MATCH_ALL = "all"
 
     class UnitOfTemperature:
         CELSIUS = "C"
@@ -539,6 +573,57 @@ def _install_homeassistant_stubs() -> None:
     sys.modules["homeassistant.components.valve"] = valve
     sys.modules["homeassistant.components.button"] = button
     sys.modules["homeassistant.components.event"] = event
+    helpers_typing = ModuleType("homeassistant.helpers.typing")
+    helpers_typing.ConfigType = dict
+
+    # Target resolution: entity_ids are taken as given; tests can set
+    # target_stub.indirect to map area/device/label ids to entity ids.
+    target = ModuleType("homeassistant.helpers.target")
+
+    class TargetSelection:
+        def __init__(self, config) -> None:
+            def as_list(value):
+                if value is None:
+                    return []
+                return [value] if isinstance(value, str) else list(value)
+
+            self.entity_ids = set(as_list(config.get("entity_id")))
+            self.indirect_ids = {
+                key: set(as_list(config.get(key)))
+                for key in ("area_id", "device_id", "floor_id", "label_id")
+            }
+
+    class SelectedEntities:
+        def __init__(self, referenced, indirectly_referenced) -> None:
+            self.referenced = referenced
+            self.indirectly_referenced = indirectly_referenced
+
+    target.indirect = {}
+
+    def async_extract_referenced_entity_ids(hass, selection, expand_group=True, **_kwargs):
+        indirect = set()
+        for ids in selection.indirect_ids.values():
+            for target_id in ids:
+                indirect |= set(target.indirect.get(target_id, ()))
+        return SelectedEntities(set(selection.entity_ids), indirect)
+
+    target.TargetSelection = TargetSelection
+    target.SelectedEntities = SelectedEntities
+    target.async_extract_referenced_entity_ids = async_extract_referenced_entity_ids
+
+    service = ModuleType("homeassistant.helpers.service")
+
+    def async_register_platform_entity_service(hass, service_domain, service_name, **kwargs):
+        hass.registered_entity_services[service_name] = kwargs
+
+    service.async_register_platform_entity_service = async_register_platform_entity_service
+
+    sys.modules["homeassistant.helpers.typing"] = helpers_typing
+    sys.modules["homeassistant.helpers.target"] = target
+    sys.modules["homeassistant.helpers.service"] = service
+    helpers.typing = helpers_typing
+    helpers.target = target
+    helpers.service = service
     sys.modules["homeassistant.const"] = const
 
 

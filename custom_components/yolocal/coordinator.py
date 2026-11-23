@@ -14,6 +14,7 @@ from typing import Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.recorder import DATA_INSTANCE
@@ -47,6 +48,10 @@ type DeviceEventListener = Callable[[str, dict[str, Any]], None]
 FLAT_HTTP_STATE_DEVICE_TYPES = frozenset({"WaterMeterController", LOCK_V2_DEVICE_TYPE})
 
 TRANSIENT_DEVICE_UNREACHABLE = "000201"
+# Returned by LockV2 getState while it is still processing (seen in captures).
+DEVICE_BUSY = "020104"
+SETTINGS_READBACK_ATTEMPTS = 5
+SETTINGS_READBACK_DELAY = 1.0
 STALE_REPORT_AGE = timedelta(hours=12)
 MQTT_EVENT_MAX_DELAY = timedelta(minutes=30)
 SET_STATE_TRANSPORT_RETRY_DELAY = 2.0
@@ -193,6 +198,15 @@ def _diagnostic_online(value: Any) -> str:
 def _went_offline(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     """Return True only for a new explicit offline state."""
     return bool(previous.get("online", True)) and not bool(current.get("online", True))
+
+
+def _attributes_match(state: dict[str, Any], requested: dict[str, Any]) -> bool:
+    """Return True if a device state reports every requested attribute value."""
+    nested = state.get("state") if isinstance(state.get("state"), dict) else {}
+    reported = nested.get("attributes")
+    if not isinstance(reported, dict):
+        return False
+    return all(reported.get(key) == value for key, value in requested.items())
 
 
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
@@ -1914,32 +1928,35 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     raise
                 await asyncio.sleep(1)
 
-        # Reflect the change immediately; the getState below confirms it.
-        current = self._states.get(device_id, {})
-        nested = current.get("state") if isinstance(current.get("state"), dict) else {}
-        existing_attrs = nested.get("attributes")
-        merged_attrs = {
-            **(existing_attrs if isinstance(existing_attrs, dict) else {}),
-            **attributes,
-        }
-        self._update_device_state(
-            device_id, {**current, "state": {**nested, "attributes": merged_attrs}}
-        )
-        try:
-            state = await self._async_get_state_with_retry(device)
+        # Show only what the lock reports back. The lock can answer getState
+        # with 020104 (busy) right after a change, or still report the old
+        # value, so the readback is retried within a bound.
+        readback: dict[str, Any] | None = None
+        for attempt in range(1, SETTINGS_READBACK_ATTEMPTS + 1):
+            try:
+                state = await self._client.get_state(device)
+            except ApiError as err:
+                if err.code not in (TRANSIENT_DEVICE_UNREACHABLE, DEVICE_BUSY):
+                    raise
+                state = None
             if state is not None:
-                self._update_device_state(
-                    device_id,
-                    self._merge_command_http_state(
-                        device_id, self._normalize_http_state(state, device)
-                    ),
+                readback = self._merge_command_http_state(
+                    device_id, self._normalize_http_state(state, device)
                 )
-        except Exception:
-            _LOGGER.warning(
-                "Failed to refresh state after setAttributes for %s",
-                device.name,
-                exc_info=True,
-            )
+                if _attributes_match(readback, attributes):
+                    self._update_device_state(device_id, readback)
+                    return
+            if attempt < SETTINGS_READBACK_ATTEMPTS:
+                await asyncio.sleep(SETTINGS_READBACK_DELAY)
+
+        if readback is not None:
+            # Show what the lock actually reports, not the requested value.
+            self._update_device_state(device_id, readback)
+        raise HomeAssistantError(
+            f"{device.name} accepted the change but didn't confirm it "
+            f"({', '.join(f'{key}={value}' for key, value in attributes.items())}); "
+            "the value shown is the last one the lock reported"
+        )
 
     async def async_user_management(
         self, device_id: str, params: dict[str, Any]
