@@ -1,0 +1,433 @@
+"""User, PIN and temporary-code management for YoLink LockV2 locks.
+
+Mixed into the lock entity and exposed as Home Assistant entity actions
+(see lock_services.py). Secrets are base64-encoded on the wire, never logged,
+and masked in action responses unless explicitly requested.
+"""
+
+from __future__ import annotations
+
+import base64
+import re
+from datetime import datetime
+from datetime import time as dt_time
+from typing import Any
+
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.util import dt as dt_util
+
+from .api import ApiError
+from .const import LOCK_V2_DEVICE_TYPE
+
+MAX_USER_ID = 11  # YoLink LockV2 supports user slots 0-11
+PIN_MIN_LENGTH = 4
+PIN_MAX_LENGTH = 8
+ENROLLABLE_TYPES = {"fingerprint": "Fingerprint", "card": "Card", "fob": "Fob"}
+CREDENTIAL_TYPES = {**ENROLLABLE_TYPES, "pin": "Code"}
+TEMP_CODE_TYPES = {"one_time": "OneTime", "time_range": "RangeTime", "recurring": "PeriodTime"}
+TEMP_CODE_TYPES_REVERSE = {v: k for k, v in TEMP_CODE_TYPES.items()}
+REPEAT_TYPES = {"weekly", "monthly"}
+# addUserCredential requires a daily window. Credentials created in the YoLink
+# app read back as 0:0-0:0, which the lock treats as all day.
+ALL_DAY = {"effectiveStartTime": "0:0", "effectiveEndTime": "0:0"}
+
+
+def _encode_secret(code: str) -> str:
+    return base64.b64encode(code.encode("ascii")).decode("ascii")
+
+
+def _decode_secret(secret: Any) -> str | None:
+    if not isinstance(secret, str):
+        return None
+    try:
+        code = base64.b64decode(secret, validate=True).decode("ascii")
+    except ValueError:
+        # binascii.Error, UnicodeDecodeError, and the ValueError b64decode
+        # raises for non-ASCII input are all ValueErrors.
+        return None
+    # Only report a well-formed code: the hub can return padded or obscured
+    # secrets, and a short value would be shown in full by the mask.
+    return code if _is_valid_code(code) else None
+
+
+def _is_valid_code(code: str) -> bool:
+    return _is_ascii_digits(code) and PIN_MIN_LENGTH <= len(code) <= PIN_MAX_LENGTH
+
+
+def _is_ascii_digits(code: str) -> bool:
+    # str.isdigit() also accepts non-ASCII digits (e.g. Arabic-Indic or
+    # superscripts), which cannot be encoded for the lock.
+    return code.isascii() and code.isdigit()
+
+
+# What a credential's code reads as without include_codes. It reveals no
+# digits and not the length: masked reads are open to non-admin users, and
+# even the last two digits of a 4-digit PIN would give away half of it.
+MASKED_CODE = "••••"
+
+
+def _mask(code: str | None) -> str | None:
+    return MASKED_CODE if code else None
+
+
+def _validate_code(code: str, label: str) -> str:
+    code = str(code).strip()
+    if not _is_valid_code(code):
+        raise ServiceValidationError(
+            f"{label} must be {PIN_MIN_LENGTH}-{PIN_MAX_LENGTH} digits"
+        )
+    return code
+
+
+def strict_int(value: Any) -> int:
+    """Return value as an int without changing which number it is.
+
+    int() would turn 2.7 into slot 2 and True into slot 1, so booleans,
+    fractional numbers and non-digit strings are rejected (ValueError, which
+    voluptuous also reports as invalid) instead of coerced.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"expected a whole number, got {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if _is_ascii_digits(text):
+            return int(text)
+    raise ValueError(f"expected a whole number, got {value!r}")
+
+
+def _validate_id(value: Any, label: str, maximum: int | None = None) -> int:
+    try:
+        number = strict_int(value)
+    except ValueError as err:
+        raise ServiceValidationError(f"{label} must be a whole number") from err
+    if number < 0 or (maximum is not None and number > maximum):
+        limit = f"between 0 and {maximum}" if maximum is not None else "0 or more"
+        raise ServiceValidationError(f"{label} must be {limit}")
+    return number
+
+
+def _validate_user_id(user_id: Any) -> int:
+    return _validate_id(user_id, "user_id", MAX_USER_ID)
+
+
+def _to_ms(value: datetime) -> int:
+    return int(dt_util.as_utc(value).timestamp() * 1000)
+
+
+def _from_ms(value: Any) -> str | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    return dt_util.utc_from_timestamp(value / 1000).isoformat()
+
+
+_TIME_OF_DAY = re.compile(r"([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?")
+
+
+def time_of_day(value: Any) -> dt_time:
+    """Parse a daily time strictly, from the raw action input.
+
+    Accepts a time, or "H:MM" / "HH:MM" / "HH:MM:00" with ASCII digits and
+    nothing else. Home Assistant's cv.time is not used: it can drop extra
+    fields before a stricter check sees them. The API takes hours and
+    minutes only, so seconds are refused rather than truncated (truncating
+    00:00:30-00:00:45 would send 0:0-0:0, the all-day window). Raises
+    ValueError, which voluptuous reports as invalid input.
+    """
+    if isinstance(value, datetime):
+        raise ValueError(f"expected a time of day, not a date and time: {value!r}")
+    if isinstance(value, dt_time):
+        if value.second or value.microsecond:
+            raise ValueError(f"times of day are hours and minutes; remove the seconds from {value}")
+        return value.replace(tzinfo=None)
+    if not isinstance(value, str):
+        raise ValueError(f"expected a time of day, got {value!r}")
+    match = _TIME_OF_DAY.fullmatch(value)
+    if match is None:
+        raise ValueError(f"invalid time of day: {value!r}")
+    hour, minute = int(match[1]), int(match[2])
+    if hour > 23 or minute > 59:
+        raise ValueError(f"invalid time of day: {value!r}")
+    if match[3] is not None and match[3] != "00":
+        raise ValueError(f"times of day are hours and minutes; remove the seconds from {value}")
+    return dt_time(hour, minute)
+
+
+def _hm(value: Any) -> str:
+    """Format a daily time as YoLink's 'H:m', validating it strictly."""
+    try:
+        parsed = time_of_day(value)
+    except ValueError as err:
+        raise ServiceValidationError(str(err)) from err
+    return f"{parsed.hour}:{parsed.minute}"
+
+
+# YoLink numbers weekdays 0-6 (Sunday to Saturday) and month days 1-31.
+PERIOD_DAY_RANGES = {"weekly": (0, 6), "monthly": (1, 31)}
+
+
+def _period_days(repeat: str, days: list[Any]) -> list[str]:
+    """Validate recurring-code days for the repeat type, refusing anything else."""
+    low, high = PERIOD_DAY_RANGES[repeat]
+    numbers: list[int] = []
+    for day in days:
+        try:
+            number = strict_int(day)
+        except ValueError as err:
+            raise ServiceValidationError(f"days must be whole numbers, got {day!r}") from err
+        if not low <= number <= high:
+            names = "0-6 (Sunday to Saturday)" if repeat == "weekly" else "1-31"
+            raise ServiceValidationError(f"{repeat} days must be {names}, got {day!r}")
+        if number in numbers:
+            raise ServiceValidationError(f"day {number} is listed twice")
+        numbers.append(number)
+    return [str(number) for number in sorted(numbers)]
+
+
+def _describe_credential(credential: dict[str, Any], include_codes: bool) -> dict[str, Any]:
+    cipher = credential.get("cipher") if isinstance(credential.get("cipher"), dict) else {}
+    described: dict[str, Any] = {"id": credential.get("id")}
+    cipher_type = cipher.get("type")
+    if cipher_type:
+        described["type"] = "pin" if str(cipher_type).lower() in ("code", "password") else str(cipher_type).lower()
+    code = _decode_secret(cipher.get("secret"))
+    if code is not None:
+        described["code"] = code if include_codes else _mask(code)
+    if start := _from_ms(credential.get("startAt")):
+        described["start"] = start
+    if end := _from_ms(credential.get("endAt")):
+        described["end"] = end
+    period = credential.get("effectivePeriod")
+    if isinstance(period, dict) and period.get("type") not in (None, "disable"):
+        described["repeat"] = period.get("type")
+        if period.get("value"):
+            described["days"] = period.get("value")
+    for key, name in (
+        ("effectiveStartTime", "daily_start"),
+        ("effectiveEndTime", "daily_end"),
+        ("effectiveTimes", "uses"),
+    ):
+        if credential.get(key) not in (None, ""):
+            described[name] = credential[key]
+    return described
+
+
+class LockUserManagementMixin:
+    """Entity actions for managing users, PINs and temporary codes."""
+
+    async def _user_management(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self._device.device_type != LOCK_V2_DEVICE_TYPE:
+            raise ServiceValidationError(
+                f"{self._device.name} does not support user management"
+            )
+        try:
+            result = await self.coordinator.async_user_management(
+                self._device.device_id, params
+            )
+        except ApiError as err:
+            # err never includes the request params, so no secret leaks here.
+            raise HomeAssistantError(
+                f"{self._device.name} rejected {params.get('command')}: {err.code} {err.desc}"
+            ) from err
+        return result if isinstance(result, dict) else {}
+
+    # --- users and their credentials --------------------------------------
+
+    async def async_get_users(self) -> dict[str, Any]:
+        result = await self._user_management({"command": "getUserList"})
+        users = result.get("users") if isinstance(result.get("users"), list) else []
+        return {"users": [u.get("id") for u in users if isinstance(u, dict)]}
+
+    async def async_get_user_credentials(
+        self, user_id: int, include_codes: bool = False
+    ) -> dict[str, Any]:
+        user_id = _validate_user_id(user_id)
+        result = await self._user_management(
+            {"command": "getUserCredentials", "userId": user_id}
+        )
+        credentials = result.get("credentials")
+        return {
+            "user_id": user_id,
+            "credentials": [
+                _describe_credential(c, include_codes)
+                for c in (credentials if isinstance(credentials, list) else [])
+                if isinstance(c, dict)
+            ],
+        }
+
+    async def async_add_pin(
+        self,
+        user_id: int,
+        pin: str,
+        uses: int = 0,
+        daily_start: Any = None,
+        daily_end: Any = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "command": "addUserCredential",
+            "userId": _validate_user_id(user_id),
+            "cipher": {"type": "Code", "secret": _encode_secret(_validate_code(pin, "PIN"))},
+            "effectivePeriod": {"type": "disable"},
+            "effectiveTimes": _validate_id(uses, "uses", 255),
+            **(_daily_window(daily_start, daily_end) or ALL_DAY),
+        }
+        result = await self._user_management(params)
+        return {"credentials": _credential_ids(result)}
+
+    async def async_enroll_credential(
+        self, user_id: int, credential_type: str
+    ) -> dict[str, Any]:
+        cipher_type = ENROLLABLE_TYPES.get(str(credential_type).lower())
+        if cipher_type is None:
+            raise ServiceValidationError(
+                f"credential_type must be one of {sorted(ENROLLABLE_TYPES)}"
+            )
+        result = await self._user_management(
+            {
+                "command": "addUserCredential",
+                "userId": _validate_user_id(user_id),
+                "cipher": {"type": cipher_type},
+                "effectivePeriod": {"type": "disable"},
+                "effectiveTimes": 0,
+                **ALL_DAY,
+            }
+        )
+        return {"credentials": _credential_ids(result)}
+
+    async def async_delete_credential(
+        self, user_id: int, credential_id: int, credential_type: str
+    ) -> None:
+        cipher_type = CREDENTIAL_TYPES.get(str(credential_type).lower())
+        if cipher_type is None:
+            raise ServiceValidationError(
+                f"credential_type must be one of {sorted(CREDENTIAL_TYPES)}"
+            )
+        await self._user_management(
+            {
+                "command": "delUserCredential",
+                "userId": _validate_user_id(user_id),
+                "credentialId": _validate_id(credential_id, "credential_id"),
+                "cipherType": cipher_type,
+            }
+        )
+
+    async def async_delete_user(self, user_id: int) -> None:
+        await self._user_management(
+            {"command": "delUser", "userId": _validate_user_id(user_id)}
+        )
+
+    # --- temporary codes ---------------------------------------------------
+
+    async def async_get_temporary_codes(
+        self, code_type: str | None = None, include_codes: bool = False
+    ) -> dict[str, Any]:
+        if code_type is None:
+            wanted = list(TEMP_CODE_TYPES.values())
+        else:
+            if code_type not in TEMP_CODE_TYPES:
+                raise ServiceValidationError(
+                    f"code_type must be one of {sorted(TEMP_CODE_TYPES)}"
+                )
+            wanted = [TEMP_CODE_TYPES[code_type]]
+        codes: list[dict[str, Any]] = []
+        for yolink_type in wanted:
+            result = await self._user_management(
+                {"command": "getTemporaryCredentials", "type": yolink_type}
+            )
+            credentials = result.get("credentials")
+            for credential in credentials if isinstance(credentials, list) else []:
+                if isinstance(credential, dict):
+                    codes.append(
+                        {
+                            "code_type": TEMP_CODE_TYPES_REVERSE[yolink_type],
+                            **_describe_credential(credential, include_codes),
+                        }
+                    )
+        return {"codes": codes}
+
+    async def async_add_temporary_code(
+        self,
+        code: str,
+        code_type: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        repeat: str | None = None,
+        days: list[str] | None = None,
+        daily_start: Any = None,
+        daily_end: Any = None,
+    ) -> None:
+        yolink_type = TEMP_CODE_TYPES.get(code_type)
+        if yolink_type is None:
+            raise ServiceValidationError(
+                f"code_type must be one of {sorted(TEMP_CODE_TYPES)}"
+            )
+        params: dict[str, Any] = {
+            "command": "addTemporaryCredential",
+            "type": yolink_type,
+            "cipher": {"type": "Password", "secret": _encode_secret(_validate_code(code, "Code"))},
+        }
+
+        if yolink_type in ("RangeTime", "PeriodTime"):
+            if start is None or end is None:
+                raise ServiceValidationError(f"{code_type} codes need a start and an end")
+            # Compare as UTC so a naive and an offset-aware value cannot clash.
+            if dt_util.as_utc(end) <= dt_util.as_utc(start):
+                raise ServiceValidationError("end must be after start")
+        elif start is not None or end is not None:
+            # startAt/endAt only apply to RangeTime and PeriodTime codes.
+            raise ServiceValidationError(
+                "start and end only apply to time range and recurring codes"
+            )
+        if start is not None:
+            params["startAt"] = _to_ms(start)
+        if end is not None:
+            params["endAt"] = _to_ms(end)
+
+        if yolink_type == "PeriodTime":
+            if repeat not in REPEAT_TYPES:
+                raise ServiceValidationError("recurring codes need repeat: weekly or monthly")
+            if not days:
+                raise ServiceValidationError("recurring codes need at least one day")
+            if daily_start is None or daily_end is None:
+                raise ServiceValidationError(
+                    "recurring codes need daily_start and daily_end"
+                )
+            params["effectivePeriod"] = {"type": repeat, "value": _period_days(repeat, days)}
+            params.update(_daily_window(daily_start, daily_end))
+        else:
+            # addTemporaryCredential only applies a schedule to recurring
+            # codes; refuse one here rather than drop it.
+            if daily_start is not None or daily_end is not None:
+                raise ServiceValidationError(
+                    "daily_start and daily_end only apply to recurring codes"
+                )
+            if repeat is not None or days:
+                raise ServiceValidationError("repeat and days only apply to recurring codes")
+            params["effectivePeriod"] = {"type": "disable"}
+
+        await self._user_management(params)
+
+    async def async_delete_temporary_code(self, code_id: int) -> None:
+        await self._user_management(
+            {"command": "delTemporaryCredential", "credentialId": _validate_id(code_id, "code_id")}
+        )
+
+
+def _daily_window(daily_start: Any, daily_end: Any) -> dict[str, str]:
+    if (daily_start is None) != (daily_end is None):
+        raise ServiceValidationError("daily_start and daily_end must be set together")
+    if daily_start is None:
+        return {}
+    return {"effectiveStartTime": _hm(daily_start), "effectiveEndTime": _hm(daily_end)}
+
+
+def _credential_ids(result: dict[str, Any]) -> list[dict[str, Any]]:
+    credentials = result.get("credentials")
+    return [
+        _describe_credential(c, include_codes=False)
+        for c in (credentials if isinstance(credentials, list) else [])
+        if isinstance(c, dict)
+    ]

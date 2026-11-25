@@ -14,6 +14,7 @@ from typing import Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.recorder import DATA_INSTANCE
@@ -34,12 +35,23 @@ from .const import (
     DEVICE_DISCOVERY_INTERVAL,
     DOMAIN,
     EVENT_DATA_RECORD,
+    LOCK_V2_DEVICE_TYPE,
     UPDATE_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 type DeviceRegistryListener = Callable[[list[Device], list[Device]], None]
+type DeviceEventListener = Callable[[str, dict[str, Any]], None]
+
+# Device types whose HTTP getState payload is shaped like their MQTT reports
+# and is therefore normalized through the MQTT path.
+FLAT_HTTP_STATE_DEVICE_TYPES = frozenset({"WaterMeterController", LOCK_V2_DEVICE_TYPE})
+
 TRANSIENT_DEVICE_UNREACHABLE = "000201"
+# Returned by LockV2 getState while it is still processing (seen in captures).
+DEVICE_BUSY = "020104"
+SETTINGS_READBACK_ATTEMPTS = 5
+SETTINGS_READBACK_DELAY = 1.0
 STALE_REPORT_AGE = timedelta(hours=12)
 MQTT_EVENT_MAX_DELAY = timedelta(minutes=30)
 SET_STATE_TRANSPORT_RETRY_DELAY = 2.0
@@ -188,6 +200,15 @@ def _went_offline(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     return bool(previous.get("online", True)) and not bool(current.get("online", True))
 
 
+def _attributes_match(state: dict[str, Any], requested: dict[str, Any]) -> bool:
+    """Return True if a device state reports every requested attribute value."""
+    nested = state.get("state") if isinstance(state.get("state"), dict) else {}
+    reported = nested.get("attributes")
+    if not isinstance(reported, dict):
+        return False
+    return all(reported.get(key) == value for key, value in requested.items())
+
+
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     """Coordinator for YoLink Local devices.
 
@@ -234,6 +255,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._shutdown = False
         self._hub_health_failures = 0
         self._recent_mqtt_events: dict[str, float] = {}
+        # Per-device raw MQTT event listeners (LockV2 lock and event entities)
+        self._device_event_listeners: dict[str, list[DeviceEventListener]] = {}
+        # The raw MQTT event whose state is being published, per device, so
+        # entities can read it during that same state update.
+        self._applying_events: dict[str, tuple[str, dict[str, Any]]] = {}
         self._contact_events: dict[str, str] = {}
         self._contacts: dict[str, dict[str, str]] = {}
         self._th_measurements: dict[str, dict[str, list[Any]]] = {}
@@ -626,6 +652,37 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 self._device_registry_listeners.remove(listener)
 
         return unsubscribe
+
+    def register_device_event_listener(
+        self, device_id: str, listener: DeviceEventListener
+    ) -> Callable[[], None]:
+        """Subscribe to raw MQTT events (event name, data) for one device."""
+        listeners = self._device_event_listeners.setdefault(device_id, [])
+        listeners.append(listener)
+
+        def unsubscribe() -> None:
+            if listener in listeners:
+                listeners.remove(listener)
+
+        return unsubscribe
+
+    def applying_device_event(self, device_id: str) -> tuple[str, dict[str, Any]] | None:
+        """Return the MQTT event behind the state update now being published.
+
+        None means the update came from a poll or a command readback, which
+        don't say who operated the device.
+        """
+        return self._applying_events.get(device_id)
+
+    def _dispatch_device_event(
+        self, device: Device, event_name: str, event_data: dict[str, Any]
+    ) -> None:
+        """Hand a raw MQTT event to the entities that subscribed to its device."""
+        for listener in list(self._device_event_listeners.get(device.device_id, ())):
+            try:
+                listener(event_name, event_data)
+            except Exception:
+                _LOGGER.exception("Device event listener failed for %s", device.name)
 
     def _create_background_task(
         self,
@@ -1102,6 +1159,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             )
             return
 
+        if event.event.endswith(".userManagement"):
+            # User/credential replies carry no device state (and may include
+            # credential secrets); never merge them into the state cache.
+            return
+
         if device.device_type == "THSensor" and event.event == "THSensor.DataRecord":
             self._on_thsensor_data_record(event)
             return
@@ -1146,7 +1208,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             self._log_device_unavailable(
                 device_id, "mqtt", "event", prior, normalized_event
             )
-        self._update_device_state(device_id, merged)
+        self._applying_events[device_id] = (event.event, event_data)
+        try:
+            self._update_device_state(device_id, merged)
+        finally:
+            self._applying_events.pop(device_id, None)
+        self._dispatch_device_event(device, event.event, event_data)
 
     def _on_thsensor_data_record(self, event: DeviceEvent) -> None:
         """Apply recorded measurements without confusing sample and receipt times."""
@@ -1354,7 +1421,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Normalize an HTTP getState payload to the coordinator's canonical shape."""
         normalized_state = (
             self._normalize_mqtt_event(device, state)
-            if device is not None and device.device_type == "WaterMeterController"
+            if device is not None and device.device_type in FLAT_HTTP_STATE_DEVICE_TYPES
             else self._sanitize_state_payload(state)
         )
         normalized_state.setdefault("online", True)
@@ -1841,6 +1908,64 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if not device:
             raise ValueError(f"Unknown device: {device_id}")
         await self._client.call_method(device, "toggle")
+
+    async def async_set_attributes(
+        self, device_id: str, attributes: dict[str, Any]
+    ) -> None:
+        """Change device settings via <type>.setAttributes, then refresh state."""
+        device = self._devices.get(device_id)
+        if not device:
+            raise ValueError(f"Unknown device: {device_id}")
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._client.call_method(device, "setAttributes", attributes)
+                break
+            except ApiError as err:
+                # Settings writes are idempotent, so the transient hub-to-device
+                # failure is retried the same way setState is.
+                if err.code != TRANSIENT_DEVICE_UNREACHABLE or attempt == attempts:
+                    raise
+                await asyncio.sleep(1)
+
+        # Show only what the lock reports back. The lock can answer getState
+        # with 020104 (busy) right after a change, or still report the old
+        # value, so the readback is retried within a bound.
+        readback: dict[str, Any] | None = None
+        for attempt in range(1, SETTINGS_READBACK_ATTEMPTS + 1):
+            try:
+                state = await self._client.get_state(device)
+            except ApiError as err:
+                if err.code not in (TRANSIENT_DEVICE_UNREACHABLE, DEVICE_BUSY):
+                    raise
+                state = None
+            if state is not None:
+                readback = self._merge_command_http_state(
+                    device_id, self._normalize_http_state(state, device)
+                )
+                if _attributes_match(readback, attributes):
+                    self._update_device_state(device_id, readback)
+                    return
+            if attempt < SETTINGS_READBACK_ATTEMPTS:
+                await asyncio.sleep(SETTINGS_READBACK_DELAY)
+
+        if readback is not None:
+            # Show what the lock actually reports, not the requested value.
+            self._update_device_state(device_id, readback)
+        raise HomeAssistantError(
+            f"{device.name} accepted the change but didn't confirm it "
+            f"({', '.join(f'{key}={value}' for key, value in attributes.items())}); "
+            "the value shown is the last one the lock reported"
+        )
+
+    async def async_user_management(
+        self, device_id: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run one <type>.userManagement sub-command (never retried)."""
+        device = self._devices.get(device_id)
+        if not device:
+            raise ValueError(f"Unknown device: {device_id}")
+        return await self._client.call_method(device, "userManagement", params)
 
     async def async_send_command(
         self, device_id: str, params: dict[str, Any]

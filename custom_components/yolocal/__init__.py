@@ -8,6 +8,8 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
 from .api import AuthenticationError
 from .const import (
@@ -22,6 +24,7 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import YoLocalCoordinator, create_coordinator
+from .lock_services import async_register_lock_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +41,15 @@ def _configured_hosts(entry: ConfigEntry) -> list[str]:
 def _entry_title(entry: ConfigEntry) -> str:
     """Return a config entry title showing configured hub hosts."""
     return f"YoLink Hub ({', '.join(_configured_hosts(entry))})"
+
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the integration's actions once, independent of config entries."""
+    async_register_lock_services(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

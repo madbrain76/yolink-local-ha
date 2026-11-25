@@ -39,6 +39,7 @@ For devices with a Battery entity, an offline device reports 0% so it appears in
 | DoorSensor | Binary Sensor | Open/closed state, battery | YS7704-UC
 | GarageDoor | Button | Toggle (pulses the opener relay; no door position) | YS4906-UC
 | LeakSensor | Binary Sensor | Leak detected, battery | YS7903-UC
+| LockV2 | Lock, Event, Binary Sensor, Number, Select, Switch, Sensor | Lock/unlock with who operated it, doorbell and activity events, built-in door sensor, lock settings, user and PIN management actions, battery | YS7618-UC, YS7616-UC
 | Manipulator | Valve, Sensor | Open/closed control, battery | YS4909-UC
 | MotionSensor | Binary Sensor | Motion detected, battery | YS7804-UC
 | Outlet | Switch, Sensor | On/off state, power | YS6614-UC
@@ -56,6 +57,7 @@ This project includes additional entities and diagnostics, not available in the 
 - All devices: `Firmware`, `Last reported`
 - Battery-powered devices: `Battery`, `Low battery`
 - DoorSensor: `Alert interval`, `Delay`, `Open remind delay`
+- LockV2: `Activity` and `Doorbell` events, `Door` (models with a door sensor), `Auto-lock delay`, `Sound level`, `Door handing`, `Set button`, `Open remind delay`
 - LeakSensor: `Detector error`, `Device temperature`, `Freeze error`, `Reminder`
 - MotionSensor : `Alert interval`, `Device temperature`, `LED alarm`, `No-motion delay`, `Sensitivity`
 - Outlet: `Power`
@@ -72,6 +74,17 @@ This bug would be best fixed by Yolink in their local API implementation, rather
 Outlet `Power` is derived from the local API `power` field, which reports deciwatts on the tested YS6614-UC smart plug. The local API `watt` field was observed to remain at `0` and is not exposed.
 
 GarageDoor controllers only pulse the opener's relay and report no door position, and the local API doesn't report which sensor is paired with them in the YoLink app. So the integration exposes a `Toggle` button: each press sends one `GarageDoor.toggle`, which is never retried, and a press while one is still being sent is ignored. A pulse can start, stop or reverse the door depending on the opener, so anything built on this button, such as a cover combined with a door sensor, has to make sure it never sends a second pulse before the sensor has reported the result of the first.
+
+LockV2 locks also get Home Assistant actions to list users and credentials, add PINs and temporary codes, enroll fingerprints, cards or fobs at the lock, and delete credentials. Codes are hidden in responses (shown as `••••`, with no digits or length) unless `include_codes` is set. A PIN you pass to an action, or full codes you request, are visible in automation traces and action responses, so treat those like any other secret. Home Assistant also publishes every action's raw input, PIN included, on its event bus as a `call_service` event, and it can write that input to the debug log when validation fails. By default the recorder stores that event in the database, so a PIN you add stays there in plain text until it is purged (10 days by default) and is included in backups taken meanwhile. To keep PINs out of the database, exclude the event from the recorder:
+
+```yaml
+recorder:
+  exclude:
+    event_types:
+      - call_service
+```
+
+PINs and codes must be 4-8 ASCII digits. PINs, fingerprints, cards and fobs work all day unless you set both `daily_start` and `daily_end`; credentials created in the YoLink app read back with the same all-day window (`0:0`-`0:0`). Recurring temporary codes require `daily_start` and `daily_end`, which the YoLink API marks as required for that type; other temporary codes can't have a daily window, `repeat` or `days`, so setting one is refused. Daily times are hours and minutes (`HH:MM`, or `HH:MM:00`), checked as entered, and anything else, including a time with seconds, is refused rather than truncated. Adding, enrolling and deleting credentials, adding temporary codes, and reading codes with `include_codes: true` need a Home Assistant admin user (automations and scripts are allowed); listing users and masked credentials keeps normal permissions. A write action fails, and sends nothing, unless every lock its target matches is an available LockV2. Actions that use a user or credential slot (add PIN, enroll, and the deletes) must match exactly one lock, since slots are local to each lock; temporary codes have no slot and can go to several locks at once. Recurring codes take `days` as 0-6 (Sunday to Saturday) for `weekly` or 1-31 for `monthly`; `start` and `end` only apply to time range and recurring codes. Lock settings such as the auto-lock delay take whole numbers, and a new value is shown only once the lock reports it back. The readback is retried for a few seconds while the lock answers busy (`020104`); if it never confirms, the action fails and the last reported value stays shown. User, credential and code IDs must be whole numbers: `2.5` or `true` is refused, not converted to another slot. Codes read back from the lock are only shown when they are 4-8 digits.
 
 WaterMeterController meter and usage readings are shown in liters. Recent usage duration is shown in minutes.
 
