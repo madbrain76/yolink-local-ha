@@ -60,10 +60,14 @@ def _is_ascii_digits(code: str) -> bool:
     return code.isascii() and code.isdigit()
 
 
+# What a credential's code reads as without include_codes. It reveals no
+# digits and not the length: masked reads are open to non-admin users, and
+# even the last two digits of a 4-digit PIN would give away half of it.
+MASKED_CODE = "••••"
+
+
 def _mask(code: str | None) -> str | None:
-    if not code:
-        return None
-    return "•" * max(len(code) - 2, 0) + code[-2:]
+    return MASKED_CODE if code else None
 
 
 def _validate_code(code: str, label: str) -> str:

@@ -5627,7 +5627,7 @@ def test_lock_credentials_are_masked_unless_requested() -> None:
     assert _describe_credential(credential, include_codes=False) == {
         "id": 7,
         "type": "pin",
-        "code": "••••13",
+        "code": "••••",
     }
     assert _describe_credential(credential, include_codes=True)["code"] == "482913"
 
@@ -5805,7 +5805,7 @@ def test_lock_code_readback_skips_malformed_values() -> None:
         ]
     }
     result = asyncio.run(lock.async_get_temporary_codes(code_type="one_time"))
-    assert [code.get("code") for code in result["codes"]] == [None, None, "••••13"]
+    assert [code.get("code") for code in result["codes"]] == [None, None, "••••"]
 
 
 def test_lock_entity_publishes_state_and_operator_together() -> None:
@@ -6255,3 +6255,17 @@ def test_activity_keeps_a_genuine_unlock_after_an_http_poll() -> None:
     # Its getState echo is still suppressed.
     mqtt(echo, "3")
     assert fired == [("unlocked", None), ("unlocked", "LocalPassword")]
+
+
+@pytest.mark.parametrize("pin", ["4821", "48213", "48219357"])
+def test_masked_codes_reveal_no_digits_or_length(pin) -> None:
+    """Masked reads are open to non-admins, so they must not hint at the PIN."""
+    described = _describe_credential(
+        {"id": 1, "cipher": {"type": "Password", "secret": _encode_secret(pin)}}, include_codes=False
+    )
+    assert described["code"] == "••••"
+    assert not any(digit in described["code"] for digit in "0123456789")
+    full = _describe_credential(
+        {"id": 1, "cipher": {"type": "Password", "secret": _encode_secret(pin)}}, include_codes=True
+    )
+    assert full["code"] == pin
